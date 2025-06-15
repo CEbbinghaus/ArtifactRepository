@@ -1,0 +1,9 @@
+[package]
+name = "client"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+chrono = "0.4.41"
+hex = "0.4.3"
+sha2 = "0.10.9"
