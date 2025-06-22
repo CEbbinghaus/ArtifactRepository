@@ -1,23 +1,95 @@
 #![allow(dead_code)]
-
 use chrono::{DateTime, Utc};
+use clap::{Parser, Subcommand};
 use sha2::{digest::FixedOutput, Digest, Sha512};
 use std::{
-    env,
+    collections::HashMap,
     fmt::Display,
-    fs::{create_dir, File},
-    io::{BufRead, BufReader, Write},
-    path::PathBuf,
+    fs::{create_dir, create_dir_all, read_dir, File},
+    io::{BufRead, BufReader, BufWriter, Read, Write},
+    ops::Deref,
+    path::PathBuf, str::from_utf8,
 };
 
 const INDEX_KEY: &str = "index";
 const TREE_KEY: &str = "tree";
 const BLOB_KEY: &str = "blob";
 
+fn read_header_from_file(reader: &mut BufReader<File>) -> Option<(ObjectType, u64)> {
+    let mut vec = Vec::new();
+    reader.read_until(b'\0', &mut vec).ok()?;
+
+    let string = from_utf8(&vec[..vec.len() - 1]).ok()?;
+
+    let (object_type, size) = string.split_once(' ')?;
+
+    Some((ObjectType::from_str(object_type)?, size.parse().ok()?))
+}
+
+#[derive(Clone)]
 struct Hash {
     // Sha512 Hash value
     hash: [u8; 64],
     hash_string: String,
+}
+
+impl<T: Object> Deref for Hashed<T> {
+    type Target = T;
+
+    fn deref(&self) -> &Self::Target {
+        &self.inner
+    }
+}
+
+impl Hash {
+    fn get_parts(&self) -> (&str, &str) {
+        (&self.hash_string[..2], &self.hash_string[2..])
+    }
+
+    fn get_path(&self, cache_dir: &PathBuf) -> PathBuf {
+        let (dir, file) = self.get_parts();
+        cache_dir.join(dir).join(file)
+    }
+
+    fn from_path(file: &PathBuf) -> Option<Self> {
+        let filename = file.file_name()?;
+        let directory = file.parent()?.file_name()?;
+
+        if directory.len() != 2 {
+            return None;
+        }
+
+        if filename.len() != 126 {
+            return None;
+        }
+
+        Some(Self::from(
+            &(directory.to_str()?.to_owned() + filename.to_str()?),
+        ))
+    }
+}
+
+impl From<&String> for Hash {
+    fn from(value: &String) -> Self {
+        value.as_str().into()
+    }
+}
+
+impl From<&str> for Hash {
+    fn from(value: &str) -> Self {
+        let value: &str = value.into();
+
+        assert!(value.len() == 128);
+
+        let hash = hex::decode(value).unwrap();
+
+        assert!(hash.len() == 64);
+
+        Self {
+            hash: hash.try_into().unwrap(),
+            hash_string: value.to_owned(),
+        }
+    }
 }
 
 impl From<[u8; 64]> for Hash {
@@ -35,18 +107,42 @@ impl From<Sha512> for Hash {
     }
 }
 
+impl std::fmt::Debug for Hash {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_tuple("Hash").field(&self.hash_string).finish()
+    }
+}
+
 impl Display for Hash {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}", self.hash_string)
     }
 }
 
+#[derive(Debug)]
 struct Hashed<T: Object> {
     inner: T,
     hash: Hash,
 }
 
 impl<T: Object> Hashed<T> {
+    // fn from_hash(cache: &PathBuf, hash: Hash) -> Self {
+    //     let (dir, file) = hash.get_parts();
+
+    //     let file_path = cache.join(dir).join(file);
+
+    //     assert!(file_path.exists());
+
+    //     let reader = T::read_file_and_verify_type(&file_path);
+
+    //     drop(reader);
+
+    //     Self {
+    //         inner: T::from_file(cache, &file_path),
+    //         hash,
+    //     }
+    // }
+
     fn from_object(value: T) -> Self {
         Self {
             hash: value.get_hash(),
@@ -56,12 +152,208 @@ impl<T: Object> Hashed<T> {
 }
 
 trait Object {
-    fn get_object_type() -> ObjectType;
+    fn get_object_type(&self) -> ObjectType;
     fn get_hash(&self) -> Hash;
     fn get_prefix(&self) -> String;
     fn write_to(&self, path: &PathBuf);
+
+    // fn from_file(cache: &PathBuf, file: &PathBuf) -> Self;
+
+    // fn read_file_and_verify_type(path: &PathBuf) -> BufReader<File> {
+    //     let f = File::open(file_path).unwrap();
+    //     let mut reader = BufReader::new(f);
+
+    //     let mut data = Vec::new();
+    //     reader.read_until(0, &mut data);
+
+    //     if data.last() == Some(&0) {
+    //         data.pop();
+    //     }
+
+    //     let name = String::from_utf8(data).unwrap();
+
+    //     let (typ, size) = name.split_once(' ').unwrap();
+
+    //     let object_type = ObjectType::from_str(typ);
+
+    //     assert!(object_type == T::get_object_type());
+
+    //     reader
+    // }
 }
 
+struct CacheObject<'a> {
+    cache: &'a PathBuf,
+    object_type: ObjectType,
+    hash: Hash,
+    size: u64,
+    file: PathBuf,
+}
+
+impl<'a> CacheObject<'a> {
+    fn from_file(cache: &'a PathBuf, file_path: &PathBuf) -> Self {
+        let file = File::open(file_path).unwrap();
+        let mut file = BufReader::new(file);
+
+        let mut data = Vec::new();
+        file.read_until(b'\0', &mut data).unwrap();
+
+        if data.last() == Some(&0) {
+            data.pop();
+        }
+
+        let data = String::from_utf8(data).expect("data to be a valid u8");
+
+        let (object_type, size) = data.split_once(' ').unwrap();
+
+        let object_type = ObjectType::from_str(object_type).unwrap();
+
+        let hash = Hash::from_path(file_path).unwrap();
+
+        Self {
+            cache,
+            file: file_path.clone(),
+            size: size.parse().unwrap(),
+            object_type,
+            hash,
+        }
+    }
+
+    fn to_index(&self) -> Hashed<Index> {
+        assert!(self.object_type == ObjectType::Index);
+
+        let file = File::open(&self.file).unwrap();
+        let mut file: BufReader<File> = BufReader::new(file);
+
+        let mut data = Vec::new();
+        file.read_until(b'\0', &mut data).unwrap();
+
+        let mut metadata = HashMap::new();
+
+        let mut string_data = String::new();
+
+        file.read_to_string(&mut string_data)
+            .expect("Index to only contain string");
+
+        let lines = string_data.split('\n').collect::<Vec<&str>>();
+
+        for line in lines {
+            let (key, value) = line.split_once(':').unwrap();
+
+            _ = metadata.insert(key, value.trim());
+        }
+
+        let timestamp = DateTime::parse_from_rfc3339(metadata["timestamp"]).unwrap();
+
+        let tree_hash = Hash::from(metadata["tree"]);
+
+        let tree_object = CacheObject::from_file(self.cache, &tree_hash.get_path(self.cache));
+
+        assert!(tree_object.get_object_type() == ObjectType::Tree);
+
+        Hashed {
+            hash: self.hash.clone(),
+            inner: Index {
+                timestamp: timestamp.into(),
+                tree: tree_object.to_tree(Mode::Tree, &""),
+            },
+        }
+    }
+
+    fn to_tree(&self, mode: Mode, path: &str) -> Hashed<Tree> {
+        assert!(self.object_type == ObjectType::Tree);
+
+        println!("Reading tree {}", self.hash);
+
+        let file = File::open(&self.file).unwrap();
+        let mut file: BufReader<File> = BufReader::new(file);
+
+        // Read out the file header
+        let (_, _) = read_header_from_file(&mut file).expect("File header to be correct");
+
+        let mut vec = Vec::new();
+
+        loop {
+            let mut buffer = Vec::new();
+            let bytes = file.read_until(0, &mut buffer).expect("To have a file header");
+
+            if bytes == 0 {
+                break;
+            }
+
+            let string = from_utf8(&buffer[..buffer.len() - 1]).expect("valid utf8");
+
+            let (mode, name) = string.split_once(' ').expect("space");
+
+            let mode = Mode::from_str(mode).expect("valid mode");
+
+            let mut hash: [u8; 64] = [0; 64];
+            file.read_exact(&mut hash).expect("file to contain hash");
+
+            let hash = Hash::from(hash);
+
+            let object_file = hash.get_path(&self.cache);
+            
+            let cache_object = CacheObject::from_file(&self.cache, &object_file);
+
+            vec.push(match cache_object.object_type {
+                ObjectType::Blob => TreeObject::Blob(cache_object.to_blob(mode, name)),
+                ObjectType::Tree => TreeObject::Tree(cache_object.to_tree(mode, name)),
+                ObjectType::Index => panic!("Invalid ObjectType in tree"),
+            })
+        }
+
+        Hashed {
+            hash: self.hash.clone(),
+            inner: Tree {
+                mode,
+                path: path.to_owned(),
+                contents: vec,
+            }
+        }
+    }
+
+    fn to_blob(&self, mode: Mode, path: &str) -> Hashed<Blob> {
+        assert!(self.object_type == ObjectType::Blob);
+
+        let file = File::open(&self.file).unwrap();
+        let mut file: BufReader<File> = BufReader::new(file);
+
+        // Read out the file header
+        let (_, size) = read_header_from_file(&mut file).expect("File header to be correct");
+
+        Hashed {
+            hash: self.hash.clone(),
+
+            inner: Blob {
+                mode,
+                path: path.to_string(),
+                file: self.file.clone(),
+                size,
+            }
+        }
+    }
+}
+
+impl<'a> Object for CacheObject<'a> {
+    fn get_object_type(&self) -> ObjectType {
+        self.object_type.clone()
+    }
+
+    fn get_hash(&self) -> Hash {
+        self.hash.clone()
+    }
+
+    fn get_prefix(&self) -> String {
+        format!("{} {}\0", self.object_type.to_str(), self.size)
+    }
+
+    fn write_to(&self, _: &PathBuf) {
+        unimplemented!("Should probably fix this")
+    }
+}
+
+#[derive(Debug)]
 struct Index {
     timestamp: DateTime<Utc>,
     tree: Hashed<Tree>,
@@ -76,7 +368,7 @@ impl Index {
         )
     }
 
-    fn from_path(path: PathBuf) -> Index {
+    fn from_path(path: &PathBuf) -> Index {
         assert!(path.is_dir());
         Index {
             timestamp: Utc::now(),
@@ -86,7 +378,7 @@ impl Index {
 }
 
 impl Object for Index {
-    fn get_object_type() -> ObjectType {
+    fn get_object_type(&self) -> ObjectType {
         ObjectType::Index
     }
 
@@ -107,71 +399,93 @@ impl Object for Index {
         file.write_all(self.get_prefix().as_bytes()).unwrap();
         file.write_all(self.get_body().as_bytes()).unwrap();
     }
+
+    // fn from_file(cache: &PathBuf, index: &PathBuf) -> Index {
+    //     let mut reader = Index::read_file_and_verify_type(index);
+
+    //     let mut line = String::new();
+
+    //     let kv: HashMap<&str, &str> = HashMap::new();
+
+    //     while reader.read_line(&mut line).is_ok() {
+    //         let (key, value) = line.split_once(':').unwrap();
+
+    //         kv.insert(key, value.trim())
+    //     }
+
+    //     let timestamp = DateTime<Utc>::from_utf8(kv["timestamp"]);
+
+    //     Index {
+    //         timestamp: ,
+    //         tree: Hashed::from_hash(cache, kv["tree"].into())
+    //     }
+    // }
 }
 
 trait WithPath {
-    fn get_path_component(&self) -> String;
+    fn get_path_component(&self) -> &String;
+    fn get_mode(&self) -> &Mode;
 }
 
+#[derive(Debug)]
 struct Tree {
-    path: PathBuf,
-    contents: Vec<(Mode, TreeObject)>,
+    mode: Mode,
+    path: String,
+    contents: Vec<TreeObject>,
 }
 
 impl Tree {
-    fn get_body(&self) -> String {
-        let mut value = String::new();
+    fn get_body(&self) -> Vec<u8> {
+        let mut value = Vec::new();
 
-        for (mode, object) in self.contents.iter() {
-            value += format!("{} ", mode).as_str();
-            value += object.to_tree_string().as_str();
+        for object in self.contents.iter() {
+            value.extend_from_slice(&mut object.to_tree_bytes());
         }
 
         value
     }
 
-    fn from_dir(path: PathBuf) -> Self {
+    fn from_dir(path: &PathBuf) -> Self {
         assert!(path.is_dir());
 
         Self {
+            mode: Mode::Tree,
             contents: std::fs::read_dir(&path)
                 .unwrap()
                 .map(|entry| {
                     let path = entry.unwrap().path();
                     if path.is_dir() {
-                        (
-                            Mode::Tree,
-                            TreeObject::Tree(Hashed::from_object(Tree::from_dir(path))),
-                        )
+                        TreeObject::Tree(Hashed::from_object(Tree::from_dir(&path)))
                     } else {
-                        // TODO: Select mode correctly
-                        (
-                            Mode::Normal,
-                            TreeObject::Blob(Hashed::from_object(Blob::from_path(path))),
-                        )
+                        TreeObject::Blob(Hashed::from_object(Blob::from_path(&path)))
                     }
                 })
                 .collect(),
-            path,
+            path: path.file_name().unwrap().to_string_lossy().to_string(),
         }
     }
 }
 
 impl WithPath for Tree {
-    fn get_path_component(&self) -> String {
-        self.path.file_name().unwrap().to_string_lossy().to_string()
+    fn get_path_component(&self) -> &String {
+        &self.path
+    }
+
+    fn get_mode(&self) -> &Mode {
+        &self.mode
     }
 }
 
 impl Object for Tree {
-    fn get_object_type() -> ObjectType {
+    fn get_object_type(&self) -> ObjectType {
         ObjectType::Tree
     }
 
     fn get_hash(&self) -> Hash {
         let body = self.get_body();
         let mut hasher = Sha512::new();
-        write!(hasher, "{}{}", self.get_prefix(), body).unwrap();
+        write!(hasher, "{}", self.get_prefix()).unwrap();
+        hasher.write_all(&body).expect("Body to be added to the hasher");
         Hash::from(hasher)
     }
 
@@ -179,38 +493,59 @@ impl Object for Tree {
         let mut file = File::create(path).unwrap();
 
         file.write_all(self.get_prefix().as_bytes()).unwrap();
-        file.write_all(self.get_body().as_bytes()).unwrap();
+        file.write_all(&self.get_body()).unwrap();
     }
 
     fn get_prefix(&self) -> String {
         format!("{} {}\0", TREE_KEY, self.get_body().len())
     }
+
+    // fn from_file(cache: &PathBuf, file: &PathBuf) -> Self {
+    //     let mut reader = Object::read_file_and_verify_type(file);
+
+    //     let mut line = String::new();
+
+    //     while reader.read_line(&mut line).is_ok() {
+    //         let (detail, hash) = line.split_once('\0').unwrap();
+
+    //     }
+    // }
 }
 
+#[derive(Debug)]
 struct Blob {
+    mode: Mode,
+    path: String,
     file: PathBuf,
     size: u64,
 }
 
 impl Blob {
-    fn from_path(path: PathBuf) -> Self {
+    fn from_path(path: &PathBuf) -> Self {
         assert!(path.is_file());
 
         Self {
+            // TODO: Support other types
+            mode: Mode::Normal,
+            path: path.file_name().unwrap().to_string_lossy().to_string(),
             size: path.metadata().unwrap().len(),
-            file: path,
+            file: path.clone(),
         }
     }
 }
 
 impl WithPath for Blob {
-    fn get_path_component(&self) -> String {
-        self.file.file_name().unwrap().to_string_lossy().to_string()
+    fn get_path_component(&self) -> &String {
+        &self.path
+    }
+    
+    fn get_mode(&self) -> &Mode {
+        &self.mode
     }
 }
 
 impl Object for Blob {
-    fn get_object_type() -> ObjectType {
+    fn get_object_type(&self) -> ObjectType {
         ObjectType::Blob
     }
 
@@ -242,11 +577,24 @@ impl Object for Blob {
     }
 }
 
+#[derive(Debug)]
 enum Mode {
     Tree = 040000,
     Normal = 100644,
     Executable = 100755,
     SymbolicLink = 120000,
+}
+
+impl Mode {
+    fn from_str(value: &str) -> Option<Self> {
+        match value {
+            "040000" => Some(Mode::Tree),
+            "100644" => Some(Mode::Normal),
+            "100755" => Some(Mode::Executable),
+            "120000" => Some(Mode::SymbolicLink),
+            _ => None
+        }
+    }
 }
 
 impl Display for Mode {
@@ -264,25 +612,59 @@ impl Display for Mode {
     }
 }
 
+#[derive(Debug)]
 enum TreeObject {
     Tree(Hashed<Tree>),
     Blob(Hashed<Blob>),
 }
 
+trait ObjectWithPath: WithPath + Object {}
+
 impl TreeObject {
-    fn to_tree_string(&self) -> String {
+    fn to_tree_bytes(&self) -> Vec<u8> {
         match self {
-            Self::Tree(tree) => format!("{}\0{}", tree.inner.get_path_component(), tree.hash),
-            Self::Blob(blob) => format!("{}\0{}", blob.inner.get_path_component(), blob.hash),
+            Self::Tree(tree) => get_bytes_from_thing(tree.deref(), &tree.hash),
+            Self::Blob(blob) => get_bytes_from_thing(blob.deref(), &blob.hash),
         }
     }
 }
 
-#[derive(Debug)]
+fn get_bytes_from_thing<T: WithPath>(object: &T, hash: &Hash) -> Vec<u8> {
+    let mut path = Vec::new();
+
+    path.extend_from_slice(&mut object.get_mode().to_string().as_bytes());
+    path.push(b' ');
+    path.extend_from_slice(&mut object.get_path_component().as_bytes());
+    path.push(0);
+    path.extend_from_slice(&hash.hash);
+
+    path
+}
+
+#[derive(Debug, Clone, PartialEq)]
 enum ObjectType {
     Blob,
     Tree,
     Index,
+}
+
+impl ObjectType {
+    fn from_str(value: &str) -> Option<Self> {
+        match value {
+            BLOB_KEY => Some(Self::Blob),
+            TREE_KEY => Some(Self::Tree),
+            INDEX_KEY => Some(Self::Index),
+            _ => None,
+        }
+    }
+
+    fn to_str(&self) -> &'static str {
+        match self {
+            Self::Blob => BLOB_KEY,
+            Self::Index => INDEX_KEY,
+            Self::Tree => TREE_KEY,
+        }
+    }
 }
 
 impl<T: Object> Hashed<T> {
@@ -293,15 +675,15 @@ impl<T: Object> Hashed<T> {
 
         let dir = &dir.join(dir_name);
 
-        create_dir(dir).unwrap();
+        let _ = create_dir(dir);
 
         let file_name = &hash[2..];
 
         let path = &dir.join(file_name);
 
         if !path.exists() {
-            println!("writing {:?} {:?}", T::get_object_type(), path);
-            self.inner.write_to(path);
+            // println!("writing {:?} {:?}", T::get_object_type(), path);
+            self.write_to(path);
         }
     }
 }
@@ -309,13 +691,13 @@ impl<T: Object> Hashed<T> {
 fn write_index_to_folder(dir: &PathBuf, index: &Hashed<Index>) {
     index.write_if_not_exists(dir);
 
-    write_tree_to_folder(dir, &index.inner.tree);
+    write_tree_to_folder(dir, &index.tree);
 }
 
 fn write_tree_to_folder(dir: &PathBuf, tree: &Hashed<Tree>) {
     tree.write_if_not_exists(dir);
 
-    for (_, element) in tree.inner.contents.iter() {
+    for element in tree.contents.iter() {
         match element {
             TreeObject::Tree(tree) => write_tree_to_folder(dir, tree),
             TreeObject::Blob(blob) => blob.write_if_not_exists(dir),
@@ -323,29 +705,149 @@ fn write_tree_to_folder(dir: &PathBuf, tree: &Hashed<Tree>) {
     }
 }
 
-fn main() {
-    let args: Vec<String> = env::args().collect();
+#[derive(Parser)]
+#[command(version, about, long_about = None)]
+struct Cli {
+    #[arg(short, long, value_name = "Cache")]
+    cache: PathBuf,
 
-    if args.len() < 3 {
-        eprintln!("Not enough arguments");
-    }
+    #[arg(short, long, action = clap::ArgAction::Count)]
+    debug: u8,
 
-    let src_dir = PathBuf::from(&args[1]);
-    let cache_dir = PathBuf::from(&args[2]);
+    #[command(subcommand)]
+    command: Commands,
+}
 
-    println!("src: {:?}", src_dir);
-    println!("cache: {:?}", cache_dir);
+#[derive(Subcommand)]
+enum Commands {
+    Commit {
+        #[arg(short, long)]
+        directory: PathBuf,
+    },
 
-    assert!(src_dir.exists());
-    assert!(src_dir.is_dir());
+    Restore {
+        #[arg(short, long)]
+        directory: PathBuf,
+        #[arg(short, long)]
+        index: String,
+    },
 
-    if cache_dir.exists() {
-        assert!(cache_dir.is_dir());
+    Cat {
+        #[arg(long)]
+        hash: String,
+    },
+}
+
+fn commit_directory(cache: &PathBuf, path: &PathBuf) {
+    assert!(path.exists());
+    assert!(path.is_dir());
+
+    if cache.exists() {
+        assert!(cache.is_dir());
     } else {
-        create_dir(&cache_dir).unwrap();
+        create_dir(&cache).unwrap();
     }
 
-    let index = Hashed::from_object(Index::from_path(src_dir));
+    let index = Hashed::from_object(Index::from_path(path));
 
-    write_index_to_folder(&cache_dir, &index);
+    println!("Finished generating Index");
+
+    write_index_to_folder(&cache, &index);
+
+    println!("{}", index.hash);
+}
+
+fn restore_directory(cache: &PathBuf, path: &PathBuf, index: &String) {
+    if !path.exists() {
+        create_dir_all(path).expect("Directory Creation to work");
+    }
+
+    if !path.is_dir() {
+        panic!("Path provided must be a valid directory");
+    }
+
+    if read_dir(path).unwrap().any(|_| true) {
+        panic!("Path provided must be an empty directory");
+    }
+
+    let index_hash = Hash::from(index);
+
+    let index_path = index_hash.get_path(cache);
+    let index_cache = Hashed::from_object(CacheObject::from_file(cache, &index_path));
+
+    let index = index_cache.to_index();
+
+    println!("{index:?}");
+    
+    write_tree(&index.tree, path);
+}
+
+fn write_tree(tree: &Tree, path: &PathBuf) {
+
+    for item in tree.contents.iter() {
+        if let TreeObject::Tree(tree) = item {
+            let tree_path = path.join(&tree.path);
+
+            create_dir(&tree_path).expect("Directory creation to work");
+
+            write_tree(&tree, &tree_path);
+            continue;
+        }
+
+        let TreeObject::Blob(blob) = item else {
+            unreachable!();
+        };
+
+        let blob_path = path.join(&blob.path);
+
+        let file = File::create(blob_path).expect("File to be created");
+        let mut writer = BufWriter::new(file);
+
+        let cache_file = File::open(&blob.file).unwrap();
+        let mut reader = BufReader::new(cache_file);
+
+        let _ = read_header_from_file(&mut reader);
+
+        let mut data: [u8; 1024] = [0; 1024];
+        while let Ok(num) = reader.read(&mut data) {
+            if num == 0 {
+                break;
+            }
+            writer.write(&data[..num]).unwrap();
+        }
+    }
+}
+
+fn cat_object(cache: &PathBuf, hash: &String) {
+    let hash = Hash::from(hash);
+
+    let object_path = hash.get_path(cache);
+
+    let object = Hashed::from_object(CacheObject::from_file(cache, &object_path));
+
+    let file = File::open(&object_path).unwrap();
+    let mut file: BufReader<File> = BufReader::new(file);
+
+    let mut data = Vec::new();
+    file.read_until(b'\0', &mut data).unwrap();
+
+    let mut stdout = std::io::stdout();
+    let mut data: [u8; 1024] = [0; 1024];
+    while let Ok(num) = file.read(&mut data) {
+        if num == 0 {
+            break;
+        }
+        stdout.write(&data[..num]).unwrap();
+    }
+    println!();
+}
+
+fn main() {
+    let cli = Cli::parse();
+
+    match cli.command {
+        Commands::Commit { directory } => commit_directory(&cli.cache, &directory),
+        Commands::Restore { directory, index } => restore_directory(&cli.cache, &directory, &index),
+        Commands::Cat { hash } => cat_object(&cli.cache, &hash),
+    }
 }
