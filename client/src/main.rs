@@ -1,36 +1,20 @@
 #![allow(dead_code)]
+use common::{read_header_from_file, Hash, Mode, ObjectType, BLOB_KEY, INDEX_KEY, TREE_KEY};
 use chrono::{DateTime, Utc};
 use clap::{Parser, Subcommand};
-use sha2::{digest::FixedOutput, Digest, Sha512};
+use sha2::{Digest, Sha512};
 use std::{
     collections::HashMap,
-    fmt::Display,
     fs::{create_dir, create_dir_all, read_dir, File},
     io::{BufRead, BufReader, BufWriter, Read, Write},
     ops::Deref,
     path::PathBuf, str::from_utf8,
 };
 
-const INDEX_KEY: &str = "index";
-const TREE_KEY: &str = "tree";
-const BLOB_KEY: &str = "blob";
-
-fn read_header_from_file(reader: &mut BufReader<File>) -> Option<(ObjectType, u64)> {
-    let mut vec = Vec::new();
-    reader.read_until(b'\0', &mut vec).ok()?;
-
-    let string = from_utf8(&vec[..vec.len() - 1]).ok()?;
-
-    let (object_type, size) = string.split_once(' ')?;
-
-    Some((ObjectType::from_str(object_type)?, size.parse().ok()?))
-}
-
-#[derive(Clone)]
-struct Hash {
-    // Sha512 Hash value
-    hash: [u8; 64],
-    hash_string: String,
+#[derive(Debug)]
+struct Hashed<T: Object> {
+    inner: T,
+    hash: Hash,
 }
 
 impl<T: Object> Deref for Hashed<T> {
@@ -39,90 +23,6 @@ impl<T: Object> Deref for Hashed<T> {
     fn deref(&self) -> &Self::Target {
         &self.inner
     }
-}
-
-impl Hash {
-    fn get_parts(&self) -> (&str, &str) {
-        (&self.hash_string[..2], &self.hash_string[2..])
-    }
-
-    fn get_path(&self, cache_dir: &PathBuf) -> PathBuf {
-        let (dir, file) = self.get_parts();
-        cache_dir.join(dir).join(file)
-    }
-
-    fn from_path(file: &PathBuf) -> Option<Self> {
-        let filename = file.file_name()?;
-        let directory = file.parent()?.file_name()?;
-
-        if directory.len() != 2 {
-            return None;
-        }
-
-        if filename.len() != 126 {
-            return None;
-        }
-
-        Some(Self::from(
-            &(directory.to_str()?.to_owned() + filename.to_str()?),
-        ))
-    }
-}
-
-impl From<&String> for Hash {
-    fn from(value: &String) -> Self {
-        value.as_str().into()
-    }
-}
-
-impl From<&str> for Hash {
-    fn from(value: &str) -> Self {
-        let value: &str = value.into();
-
-        assert!(value.len() == 128);
-
-        let hash = hex::decode(value).unwrap();
-
-        assert!(hash.len() == 64);
-
-        Self {
-            hash: hash.try_into().unwrap(),
-            hash_string: value.to_owned(),
-        }
-    }
-}
-
-impl From<[u8; 64]> for Hash {
-    fn from(value: [u8; 64]) -> Self {
-        Self {
-            hash_string: hex::encode(&value),
-            hash: value,
-        }
-    }
-}
-
-impl From<Sha512> for Hash {
-    fn from(value: Sha512) -> Self {
-        Self::from(Into::<[u8; 64]>::into(value.finalize_fixed()))
-    }
-}
-
-impl std::fmt::Debug for Hash {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_tuple("Hash").field(&self.hash_string).finish()
-    }
-}
-
-impl Display for Hash {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", self.hash_string)
-    }
-}
-
-#[derive(Debug)]
-struct Hashed<T: Object> {
-    inner: T,
-    hash: Hash,
 }
 
 impl<T: Object> Hashed<T> {
@@ -461,7 +361,10 @@ impl Tree {
                     }
                 })
                 .collect(),
-            path: path.file_name().unwrap().to_string_lossy().to_string(),
+            path: match path.file_name() {
+                Some(v) => v.to_string_lossy().to_string(),
+                None => panic!("{path:?} did not have a filename")
+            },
         }
     }
 }
@@ -578,41 +481,6 @@ impl Object for Blob {
 }
 
 #[derive(Debug)]
-enum Mode {
-    Tree = 040000,
-    Normal = 100644,
-    Executable = 100755,
-    SymbolicLink = 120000,
-}
-
-impl Mode {
-    fn from_str(value: &str) -> Option<Self> {
-        match value {
-            "040000" => Some(Mode::Tree),
-            "100644" => Some(Mode::Normal),
-            "100755" => Some(Mode::Executable),
-            "120000" => Some(Mode::SymbolicLink),
-            _ => None
-        }
-    }
-}
-
-impl Display for Mode {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "{}",
-            match self {
-                Self::Normal => "100644",
-                Self::Tree => "040000",
-                Self::Executable => "100755",
-                Self::SymbolicLink => "120000",
-            }
-        )
-    }
-}
-
-#[derive(Debug)]
 enum TreeObject {
     Tree(Hashed<Tree>),
     Blob(Hashed<Blob>),
@@ -641,35 +509,9 @@ fn get_bytes_from_thing<T: WithPath>(object: &T, hash: &Hash) -> Vec<u8> {
     path
 }
 
-#[derive(Debug, Clone, PartialEq)]
-enum ObjectType {
-    Blob,
-    Tree,
-    Index,
-}
-
-impl ObjectType {
-    fn from_str(value: &str) -> Option<Self> {
-        match value {
-            BLOB_KEY => Some(Self::Blob),
-            TREE_KEY => Some(Self::Tree),
-            INDEX_KEY => Some(Self::Index),
-            _ => None,
-        }
-    }
-
-    fn to_str(&self) -> &'static str {
-        match self {
-            Self::Blob => BLOB_KEY,
-            Self::Index => INDEX_KEY,
-            Self::Tree => TREE_KEY,
-        }
-    }
-}
-
 impl<T: Object> Hashed<T> {
     fn write_if_not_exists(&self, dir: &PathBuf) {
-        let hash = &self.hash.hash_string;
+        let hash = &self.hash.to_string();
 
         let dir_name = &hash[..2];
 
@@ -699,7 +541,7 @@ fn write_tree_to_folder(dir: &PathBuf, tree: &Hashed<Tree>) {
 
     for element in tree.contents.iter() {
         match element {
-            TreeObject::Tree(tree) => write_tree_to_folder(dir, tree),
+            TreeObject::Tree(tree) => write_tree_to_folder(dir, &tree),
             TreeObject::Blob(blob) => blob.write_if_not_exists(dir),
         }
     }
@@ -748,7 +590,11 @@ fn commit_directory(cache: &PathBuf, path: &PathBuf) {
         create_dir(&cache).unwrap();
     }
 
-    let index = Hashed::from_object(Index::from_path(path));
+    let Ok(path) = path.canonicalize() else {
+        panic!("unable to canonicalize {path:?}");
+    };
+
+    let index = Hashed::from_object(Index::from_path(&path));
 
     println!("Finished generating Index");
 
@@ -823,17 +669,14 @@ fn cat_object(cache: &PathBuf, hash: &String) {
 
     let object_path = hash.get_path(cache);
 
-    let object = Hashed::from_object(CacheObject::from_file(cache, &object_path));
-
     let file = File::open(&object_path).unwrap();
-    let mut file: BufReader<File> = BufReader::new(file);
+    let mut reader: BufReader<File> = BufReader::new(file);
 
-    let mut data = Vec::new();
-    file.read_until(b'\0', &mut data).unwrap();
+    read_header_from_file(&mut reader).expect("file to contain a valid header");
 
     let mut stdout = std::io::stdout();
     let mut data: [u8; 1024] = [0; 1024];
-    while let Ok(num) = file.read(&mut data) {
+    while let Ok(num) = reader.read(&mut data) {
         if num == 0 {
             break;
         }
