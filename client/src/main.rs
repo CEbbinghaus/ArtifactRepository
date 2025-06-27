@@ -1,15 +1,17 @@
 #![allow(dead_code)]
-use common::{read_header_from_file, Hash, Mode, ObjectType, BLOB_KEY, INDEX_KEY, TREE_KEY};
 use chrono::{DateTime, Utc};
 use clap::{Parser, Subcommand};
+use common::{read_header_from_file, Hash, Mode, ObjectType, BLOB_KEY, INDEX_KEY, TREE_KEY};
 use sha2::{Digest, Sha512};
 use std::{
     collections::HashMap,
     fs::{create_dir, create_dir_all, read_dir, File},
     io::{BufRead, BufReader, BufWriter, Read, Write},
     ops::Deref,
-    path::PathBuf, str::from_utf8,
+    path::PathBuf,
+    str::from_utf8,
 };
+use ureq::SendBody;
 
 #[derive(Debug)]
 struct Hashed<T: Object> {
@@ -175,7 +177,9 @@ impl<'a> CacheObject<'a> {
 
         loop {
             let mut buffer = Vec::new();
-            let bytes = file.read_until(0, &mut buffer).expect("To have a file header");
+            let bytes = file
+                .read_until(0, &mut buffer)
+                .expect("To have a file header");
 
             if bytes == 0 {
                 break;
@@ -193,7 +197,7 @@ impl<'a> CacheObject<'a> {
             let hash = Hash::from(hash);
 
             let object_file = hash.get_path(&self.cache);
-            
+
             let cache_object = CacheObject::from_file(&self.cache, &object_file);
 
             vec.push(match cache_object.object_type {
@@ -209,7 +213,7 @@ impl<'a> CacheObject<'a> {
                 mode,
                 path: path.to_owned(),
                 contents: vec,
-            }
+            },
         }
     }
 
@@ -230,7 +234,7 @@ impl<'a> CacheObject<'a> {
                 path: path.to_string(),
                 file: self.file.clone(),
                 size,
-            }
+            },
         }
     }
 }
@@ -363,7 +367,7 @@ impl Tree {
                 .collect(),
             path: match path.file_name() {
                 Some(v) => v.to_string_lossy().to_string(),
-                None => panic!("{path:?} did not have a filename")
+                None => panic!("{path:?} did not have a filename"),
             },
         }
     }
@@ -388,7 +392,9 @@ impl Object for Tree {
         let body = self.get_body();
         let mut hasher = Sha512::new();
         write!(hasher, "{}", self.get_prefix()).unwrap();
-        hasher.write_all(&body).expect("Body to be added to the hasher");
+        hasher
+            .write_all(&body)
+            .expect("Body to be added to the hasher");
         Hash::from(hasher)
     }
 
@@ -441,7 +447,7 @@ impl WithPath for Blob {
     fn get_path_component(&self) -> &String {
         &self.path
     }
-    
+
     fn get_mode(&self) -> &Mode {
         &self.mode
     }
@@ -588,6 +594,15 @@ enum Commands {
         hash: String,
     },
 
+    Push {
+        #[arg(long)]
+        url: String,
+
+        #[arg(long)]
+        hash: Option<String>,
+    },
+}
+
 fn get_total_size(index: &Hashed<Tree>) -> u128 {
     let mut total = 0;
 
@@ -617,7 +632,10 @@ fn commit_directory(cache: &PathBuf, path: &PathBuf) {
 
     let index = Hashed::from_object(Index::from_path(&path));
 
-    println!("Finished generating Index for {} bytes of data", get_total_size(&index.tree));
+    println!(
+        "Finished generating Index for {} bytes of data",
+        get_total_size(&index.tree)
+    );
 
     write_index_to_folder(&cache, &index);
 
@@ -645,12 +663,11 @@ fn restore_directory(cache: &PathBuf, path: &PathBuf, index: &String) {
     let index = index_cache.to_index();
 
     println!("{index:?}");
-    
+
     write_tree(&index.tree, path);
 }
 
 fn write_tree(tree: &Tree, path: &PathBuf) {
-
     for item in tree.contents.iter() {
         if let TreeObject::Tree(tree) = item {
             let tree_path = path.join(&tree.path);
@@ -706,6 +723,66 @@ fn cat_object(cache: &PathBuf, hash: &String) {
     println!();
 }
 
+fn push_cache(cache: &PathBuf, url: &String, hash: Option<Hash>) {
+    if let Some(hash) = hash {
+        let file = hash.get_path(cache);
+        upload_object(&hash, &file, url);
+        return;
+    }
+
+    for entry in read_dir(cache).unwrap().filter_map(|x| x.ok()) {
+        let Ok(metadata) = entry.metadata() else {
+            continue;
+        };
+
+        if metadata.is_file() {
+            continue;
+        }
+
+        let prefix = entry.file_name();
+
+        for entry in read_dir(entry.path()).unwrap().filter_map(|x| x.ok()) {
+            let Ok(metadata) = entry.metadata() else {
+                continue;
+            };
+
+            if !metadata.is_file() {
+                continue;
+            }
+
+            let name = format!(
+                "{}{}",
+                prefix.to_string_lossy(),
+                entry.file_name().to_string_lossy()
+            );
+            let hash = Hash::from(&name);
+
+            upload_object(&hash, &entry.path(), url);
+        }
+    }
+}
+
+fn upload_object(hash: &Hash, file: &PathBuf, url: &String) {
+    let file = File::open(file).expect("File to exist");
+    let mut reader = BufReader::new(file);
+
+    let (object_type, object_size) =
+        read_header_from_file(&mut reader).expect("file to be a valid object");
+
+    let url = format!("{url}/object/{hash}");
+
+    println!("Sending put request to {url}");
+
+    let response = ureq::put(url)
+        .header("Object-Type", object_type.to_str())
+        .header("Object-Size", object_size.to_string())
+        .send(SendBody::from_reader(&mut reader));
+
+    if let Err(err) = response {
+        eprintln!("There was an error sending request {err:?}")
+    }
+}
+
 fn main() {
     let cli = Cli::parse();
 
@@ -713,5 +790,6 @@ fn main() {
         Commands::Commit { directory } => commit_directory(&cli.cache, &directory),
         Commands::Restore { directory, index } => restore_directory(&cli.cache, &directory, &index),
         Commands::Cat { hash } => cat_object(&cli.cache, &hash),
+        Commands::Push { url, hash } => push_cache(&cli.cache, &url, hash.as_ref().map(Hash::from)),
     }
 }

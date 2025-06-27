@@ -1,13 +1,26 @@
+use axum::{
+    body::{Body, BodyDataStream},
+    debug_handler,
+    extract::{Path as AxumPath, Request, State},
+    http::{HeaderMap, StatusCode},
+    response::Response,
+    routing::{get, put},
+    Router,
+};
 use common::{get_object_prefix, read_header_from_file, read_header_from_slice, Hash, ObjectType};
 use lazy_static::lazy_static;
 use sha2::{Digest, Sha512};
-use tokio_stream::StreamExt;
-use tokio_util::{bytes::{Buf, BytesMut}, codec::{Decoder, FramedRead}};
 use std::{
-    collections::HashSet, fs::{self, create_dir, remove_file, File}, io::{BufReader, BufWriter, Write}, path::{Path, PathBuf}, sync::RwLock
+    collections::HashSet,
+    fs::{self, create_dir, remove_file, File},
+    io::{BufReader, BufWriter, Write},
+    path::{Path, PathBuf},
+    sync::RwLock,
 };
-use axum::{
-    body::{Body, BodyDataStream}, debug_handler, extract::{Path as AxumPath, Request, State}, http::{HeaderMap, StatusCode}, response::Response, routing::{get, put}, Router
+use tokio_stream::StreamExt;
+use tokio_util::{
+    bytes::{Buf, BytesMut},
+    codec::{Decoder, FramedRead},
 };
 
 lazy_static! {
@@ -80,7 +93,7 @@ fn read_cache<P: AsRef<Path>>(path: P) {
 
 #[derive(Clone)]
 struct ServerState {
-    cache_path: PathBuf
+    cache_path: PathBuf,
 }
 
 enum ErrorResult {
@@ -92,8 +105,14 @@ enum ErrorResult {
 impl ErrorResult {
     fn get_response(&self) -> (StatusCode, String) {
         match self {
-            ErrorResult::HashDoesntMatch => (StatusCode::BAD_REQUEST, "Hash provided does not match the hash of the content".into()),
-            ErrorResult::LengthDoesntMatch => (StatusCode::BAD_REQUEST, "Length provided does not match the body length".into()),
+            ErrorResult::HashDoesntMatch => (
+                StatusCode::BAD_REQUEST,
+                "Hash provided does not match the hash of the content".into(),
+            ),
+            ErrorResult::LengthDoesntMatch => (
+                StatusCode::BAD_REQUEST,
+                "Length provided does not match the body length".into(),
+            ),
             ErrorResult::InternalError(value) => (StatusCode::INTERNAL_SERVER_ERROR, value.clone()),
         }
     }
@@ -105,8 +124,17 @@ impl From<std::io::Error> for ErrorResult {
     }
 }
 
-async fn read_body_to_file(path: &PathBuf, hash: &Hash, object_type: ObjectType, object_size: u64, body: BodyDataStream) -> Result<(), ErrorResult> {
-    assert!(!path.exists(), "Race condition. Someone else has somehow created this file before us");
+async fn read_body_to_file(
+    path: &PathBuf,
+    hash: &Hash,
+    object_type: ObjectType,
+    object_size: u64,
+    body: BodyDataStream,
+) -> Result<(), ErrorResult> {
+    assert!(
+        !path.exists(),
+        "Race condition. Someone else has somehow created this file before us"
+    );
 
     let mut body = body;
 
@@ -116,17 +144,16 @@ async fn read_body_to_file(path: &PathBuf, hash: &Hash, object_type: ObjectType,
     let prefix = get_object_prefix(object_type, object_size);
 
     writer.write_all(prefix.as_bytes())?;
-    
 
     let mut hasher = Sha512::new();
     hasher.write_all(prefix.as_bytes())?;
 
-    let mut length: u64 = 0; 
+    let mut length: u64 = 0;
 
     while let Some(chunk) = body.next().await {
         let chunk = match chunk {
             Ok(v) => v,
-            Err(err) => return Err(ErrorResult::InternalError(err.to_string()))
+            Err(err) => return Err(ErrorResult::InternalError(err.to_string())),
         };
 
         hasher.write_all(&chunk)?;
@@ -153,7 +180,12 @@ async fn read_body_to_file(path: &PathBuf, hash: &Hash, object_type: ObjectType,
 }
 
 #[debug_handler]
-async fn put_object(AxumPath(object_id): AxumPath<String>, State(state): State<ServerState>, headers: HeaderMap, request: Request<Body>) -> Result<StatusCode, (StatusCode, String)> {
+async fn put_object(
+    AxumPath(object_id): AxumPath<String>,
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    request: Request<Body>,
+) -> Result<StatusCode, (StatusCode, String)> {
     let Some(hash) = Hash::from_string(&object_id) else {
         return Err((StatusCode::BAD_REQUEST, "Invalid Sha512 hash".into()));
     };
@@ -168,7 +200,7 @@ async fn put_object(AxumPath(object_id): AxumPath<String>, State(state): State<S
         return Err((StatusCode::INTERNAL_SERVER_ERROR, "Impossible state".into()));
     };
 
-    create_dir(parent).map_err(|e|  (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()));
+    create_dir(parent).map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()));
 
     let Some(object_type) = headers.get("Object-Type").and_then(|v| v.to_str().ok()) else {
         return Err((StatusCode::BAD_REQUEST, "Missing Object-Type Header".into()));
@@ -181,14 +213,16 @@ async fn put_object(AxumPath(object_id): AxumPath<String>, State(state): State<S
     let Some(object_size) = headers.get("Object-Size").and_then(|v| v.to_str().ok()) else {
         return Err((StatusCode::BAD_REQUEST, "Missing Object-Size Header".into()));
     };
-    
+
     let Some(object_size): Option<u64> = object_size.parse().ok() else {
         return Err((StatusCode::BAD_REQUEST, "Invalid Object-Size Header".into()));
     };
 
     let data_stream = request.into_body().into_data_stream();
 
-    if let Err(err) = read_body_to_file(&object_path, &hash, object_type, object_size, data_stream).await {
+    if let Err(err) =
+        read_body_to_file(&object_path, &hash, object_type, object_size, data_stream).await
+    {
         return Err(err.get_response());
     }
 
@@ -212,22 +246,34 @@ impl Decoder for TestCodec {
     fn decode(&mut self, buf: &mut BytesMut) -> Result<Option<BytesMut>, tokio::io::Error> {
         if self.0 == None {
             if buf.is_empty() {
-                return Err(tokio::io::Error::new(std::io::ErrorKind::Other, "No data was avaliable to read the object header from"));
+                return Err(tokio::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    "No data was avaliable to read the object header from",
+                ));
             }
-            
+
             let Some(index) = buf.iter().position(|v| *v == 0) else {
-                return Err(tokio::io::Error::new(std::io::ErrorKind::Other, "First file slice did not contain object header"));
+                return Err(tokio::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    "First file slice did not contain object header",
+                ));
             };
-            
+
             let Some(value) = read_header_from_slice(&buf[..index]) else {
-                return Err(tokio::io::Error::new(std::io::ErrorKind::Other, "Invalid object header in start of file"));
+                return Err(tokio::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    "Invalid object header in start of file",
+                ));
             };
 
             self.0 = Some(value);
 
             buf.advance(index + 1);
             // stupid hack :(
-            return Err(tokio::io::Error::new(std::io::ErrorKind::Other, "Not an error"));
+            return Err(tokio::io::Error::new(
+                std::io::ErrorKind::Other,
+                "Not an error",
+            ));
         }
 
         if buf.is_empty() {
@@ -239,9 +285,11 @@ impl Decoder for TestCodec {
     }
 }
 
-
 #[debug_handler]
-async fn get_object(AxumPath(object_id): AxumPath<String>, State(state): State<ServerState>) -> Result<Response<Body>, (StatusCode, String)> {
+async fn get_object(
+    AxumPath(object_id): AxumPath<String>,
+    State(state): State<ServerState>,
+) -> Result<Response<Body>, (StatusCode, String)> {
     let Some(hash) = Hash::from_string(&object_id) else {
         return Err((StatusCode::BAD_REQUEST, "Invalid Sha512 hash".into()));
     };
@@ -249,12 +297,15 @@ async fn get_object(AxumPath(object_id): AxumPath<String>, State(state): State<S
     let object_path = hash.get_path(&state.cache_path);
 
     if !object_path.exists() {
-        return Err((StatusCode::NO_CONTENT, "No object with this hash exists".into()));
+        return Err((
+            StatusCode::NO_CONTENT,
+            "No object with this hash exists".into(),
+        ));
     }
 
-    let file = match tokio::fs::File::open(object_path).await  {
+    let file = match tokio::fs::File::open(object_path).await {
         Ok(v) => v,
-        Err(err) => return Err((StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))
+        Err(err) => return Err((StatusCode::INTERNAL_SERVER_ERROR, err.to_string())),
     };
 
     let mut stream = FramedRead::new(file, TestCodec::new());
@@ -263,7 +314,10 @@ async fn get_object(AxumPath(object_id): AxumPath<String>, State(state): State<S
     stream.next().await;
 
     let Some((object_type, object_size)) = stream.decoder().0 else {
-        return Err((StatusCode::INTERNAL_SERVER_ERROR, "Unable to read object header from file".into()));
+        return Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Unable to read object header from file".into(),
+        ));
     };
 
     // we then have to call it again since reading the header required us return an Err() value
@@ -272,7 +326,7 @@ async fn get_object(AxumPath(object_id): AxumPath<String>, State(state): State<S
     // after which it finally becomes available for reading again.
     // more info here: https://github.com/tokio-rs/tokio/blob/master/tokio-util/src/codec/framed_impl.rs#L129-L159
     stream.next().await;
-    
+
     let s = Body::from_stream(stream);
     let mut response = Response::new(s);
 
@@ -282,7 +336,6 @@ async fn get_object(AxumPath(object_id): AxumPath<String>, State(state): State<S
 
     return Ok(response);
 }
-
 
 #[tokio::main]
 async fn main() {
@@ -301,7 +354,7 @@ async fn main() {
         .route("/object/{object_id}", put(put_object))
         .route("/object/{object_id}", get(get_object))
         .with_state(ServerState {
-            cache_path: cache_dir
+            cache_path: cache_dir,
         })
         .route("/", get(|| async { "Hello, World!" }));
 
