@@ -4,7 +4,7 @@ use sha2::{Digest, Sha512};
 use tokio_stream::StreamExt;
 use tokio_util::{bytes::{Buf, BytesMut}, codec::{Decoder, FramedRead}};
 use std::{
-    collections::HashSet, fs::{self, remove_file, File}, io::{BufReader, BufWriter, Write}, path::{Path, PathBuf}, sync::RwLock
+    collections::HashSet, fs::{self, create_dir, remove_file, File}, io::{BufReader, BufWriter, Write}, path::{Path, PathBuf}, sync::RwLock
 };
 use axum::{
     body::{Body, BodyDataStream}, debug_handler, extract::{Path as AxumPath, Request, State}, http::{HeaderMap, StatusCode}, response::Response, routing::{get, put}, Router
@@ -164,6 +164,12 @@ async fn put_object(AxumPath(object_id): AxumPath<String>, State(state): State<S
         return Err((StatusCode::OK, "Object already exists".into()));
     }
 
+    let Some(parent) = object_path.parent() else {
+        return Err((StatusCode::INTERNAL_SERVER_ERROR, "Impossible state".into()));
+    };
+
+    create_dir(parent).map_err(|e|  (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()));
+
     let Some(object_type) = headers.get("Object-Type").and_then(|v| v.to_str().ok()) else {
         return Err((StatusCode::BAD_REQUEST, "Missing Object-Type Header".into()));
     };
@@ -283,6 +289,10 @@ async fn main() {
     let cache_dir = "/home/cebbinghaus/Projects/ArtifactRepository/cache";
 
     let cache_dir = PathBuf::from(cache_dir);
+
+    if !cache_dir.exists() {
+        create_dir(&cache_dir).expect("Cache directory to exist");
+    }
 
     read_cache(&cache_dir);
 
