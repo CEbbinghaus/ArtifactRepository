@@ -459,8 +459,17 @@ impl Object for Blob {
         let f = File::open(&self.file).unwrap();
         let mut reader = BufReader::new(f);
 
-        if reader.fill_buf().unwrap().len() > 0 {
-            hasher.write_all(reader.buffer()).unwrap();
+        let mut buf: [u8; 1024] = [0; 1024];
+        loop {
+            let Ok(bytes_read) = reader.read(&mut buf) else {
+                break;
+            };
+
+            if bytes_read == 0 {
+                break;
+            }
+
+            hasher.write_all(&buf[..bytes_read]).unwrap();
         }
 
         Hash::from(hasher)
@@ -578,6 +587,18 @@ enum Commands {
         #[arg(long)]
         hash: String,
     },
+
+fn get_total_size(index: &Hashed<Tree>) -> u128 {
+    let mut total = 0;
+
+    for element in &index.contents {
+        total += match element {
+            TreeObject::Tree(tree) => get_total_size(&tree),
+            TreeObject::Blob(blob) => blob.size as u128,
+        }
+    }
+
+    total
 }
 
 fn commit_directory(cache: &PathBuf, path: &PathBuf) {
@@ -596,7 +617,7 @@ fn commit_directory(cache: &PathBuf, path: &PathBuf) {
 
     let index = Hashed::from_object(Index::from_path(&path));
 
-    println!("Finished generating Index");
+    println!("Finished generating Index for {} bytes of data", get_total_size(&index.tree));
 
     write_index_to_folder(&cache, &index);
 
