@@ -1,12 +1,18 @@
-use std::{fmt::{Debug, Display}, fs::File, io::{BufRead, BufReader}, path::PathBuf, str::from_utf8};
+use std::{
+    fmt::{Debug, Display},
+    fs::File,
+    io::{BufRead, BufReader},
+    path::PathBuf,
+    str::from_utf8,
+};
 
 use sha2::{digest::FixedOutput, Sha512};
 
+pub mod object_body;
 
 pub const INDEX_KEY: &str = "index";
 pub const TREE_KEY: &str = "tree";
 pub const BLOB_KEY: &str = "blob";
-
 
 #[derive(Clone)]
 pub struct Hash {
@@ -84,8 +90,6 @@ impl From<&String> for Hash {
 
 impl From<&str> for Hash {
     fn from(value: &str) -> Self {
-        let value: &str = value.into();
-
         assert!(value.len() == 128);
 
         let hash = hex::decode(value).unwrap();
@@ -95,6 +99,16 @@ impl From<&str> for Hash {
         Self {
             hash: hash.try_into().unwrap(),
             hash_string: value.to_owned(),
+        }
+    }
+}
+
+impl From<&[u8]> for Hash {
+    fn from(value: &[u8]) -> Self {
+        let data: [u8; 64] = value.try_into().expect("slice to be valid 64 byte array");
+        Self {
+            hash_string: hex::encode(&value),
+            hash: data,
         }
     }
 }
@@ -126,6 +140,21 @@ impl Display for Hash {
     }
 }
 
+#[derive(Copy, Clone, Eq, PartialEq, PartialOrd, Debug, Ord, Hash)]
+pub struct Header {
+    pub object_type: ObjectType,
+    pub size: u64,
+}
+
+impl Header {
+    pub fn new(object_type: ObjectType, size: u64) -> Self {
+        Header { object_type, size }
+    }
+
+    pub fn get_prefix(&self) -> String {
+        format!("{} {}\0", self.object_type.to_str(), self.size)
+    }
+}
 
 #[derive(Debug)]
 pub enum Mode {
@@ -142,7 +171,7 @@ impl Mode {
             "100644" => Some(Mode::Normal),
             "100755" => Some(Mode::Executable),
             "120000" => Some(Mode::SymbolicLink),
-            _ => None
+            _ => None,
         }
     }
 }
@@ -188,16 +217,34 @@ impl ObjectType {
     }
 }
 
+pub fn read_slice_until_byte<'a>(data: &'a [u8], byte: u8) -> Option<&'a [u8]> {
+    let Some(position) = data.iter().position(|v| *v == byte) else {
+        return None;
+    };
 
-pub fn read_header_from_slice(slice: &[u8]) -> Option<(ObjectType, u64)> {
+    Some(&data[..position])
+}
+
+pub fn read_header_and_body<'a>(data: &'a [u8]) -> Option<(Header, &'a [u8])> {
+    let header = read_slice_until_byte(data, 0)?;
+
+    let body_index = header.len() + 1; // one extra for the 0 byte
+
+    let header = read_header_from_slice(header)?;
+
+    Some((header, &data[body_index..]))
+}
+
+pub fn read_header_from_slice(slice: &[u8]) -> Option<Header> {
+    assert!(slice[slice.len() - 1] != 0);
     let string = from_utf8(slice).ok()?;
 
     let (object_type, size) = string.split_once(' ')?;
 
-    Some((ObjectType::from_str(object_type)?, size.parse().ok()?))
+    Some(Header::new(ObjectType::from_str(object_type)?, size.parse().ok()?))
 }
 
-pub fn read_header_from_file(reader: &mut BufReader<File>) -> Option<(ObjectType, u64)> {
+pub fn read_header_from_file(reader: &mut BufReader<File>) -> Option<Header> {
     let mut vec = Vec::new();
     reader.read_until(b'\0', &mut vec).ok()?;
 

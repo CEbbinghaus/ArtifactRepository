@@ -1,15 +1,17 @@
 #![allow(dead_code)]
 use chrono::{DateTime, Utc};
 use clap::{Parser, Subcommand};
-use common::{read_header_from_file, Hash, Mode, ObjectType, BLOB_KEY, INDEX_KEY, TREE_KEY};
+use common::{
+    BLOB_KEY, Hash, Header, INDEX_KEY, Mode, ObjectType, TREE_KEY, object_body::Object as OtherObject, read_header_and_body, read_header_from_file, read_header_from_slice, read_slice_until_byte
+};
 use sha2::{Digest, Sha512};
 use std::{
     collections::HashMap,
-    fs::{create_dir, create_dir_all, read_dir, File},
+    fs::{File, create_dir, create_dir_all, read_dir},
     io::{BufRead, BufReader, BufWriter, Read, Write},
     ops::Deref,
     path::PathBuf,
-    str::from_utf8,
+    str::{from_utf8, from_utf8_unchecked},
 };
 use ureq::SendBody;
 
@@ -165,13 +167,13 @@ impl<'a> CacheObject<'a> {
     fn to_tree(&self, mode: Mode, path: &str) -> Hashed<Tree> {
         assert!(self.object_type == ObjectType::Tree);
 
-        println!("Reading tree {}", self.hash);
+        // println!("Reading tree {}", self.hash);
 
         let file = File::open(&self.file).unwrap();
         let mut file: BufReader<File> = BufReader::new(file);
 
         // Read out the file header
-        let (_, _) = read_header_from_file(&mut file).expect("File header to be correct");
+        let _ = read_header_from_file(&mut file).expect("File header to be correct");
 
         let mut vec = Vec::new();
 
@@ -224,7 +226,8 @@ impl<'a> CacheObject<'a> {
         let mut file: BufReader<File> = BufReader::new(file);
 
         // Read out the file header
-        let (_, size) = read_header_from_file(&mut file).expect("File header to be correct");
+        let Header { size, object_type } =
+            read_header_from_file(&mut file).expect("File header to be correct");
 
         Hashed {
             hash: self.hash.clone(),
@@ -526,21 +529,11 @@ fn get_bytes_from_thing<T: WithPath>(object: &T, hash: &Hash) -> Vec<u8> {
 
 impl<T: Object> Hashed<T> {
     fn write_if_not_exists(&self, dir: &PathBuf) {
-        let hash = &self.hash.to_string();
-
-        let dir_name = &hash[..2];
-
-        let dir = &dir.join(dir_name);
-
-        let _ = create_dir(dir);
-
-        let file_name = &hash[2..];
-
-        let path = &dir.join(file_name);
+        let path = self.hash.get_path(dir);
 
         if !path.exists() {
             // println!("writing {:?} {:?}", T::get_object_type(), path);
-            self.write_to(path);
+            self.write_to(&path);
         }
     }
 }
@@ -587,6 +580,8 @@ enum Commands {
         directory: PathBuf,
         #[arg(short, long)]
         index: String,
+        #[arg(long)]
+        validate: bool,
     },
 
     Cat {
@@ -600,6 +595,14 @@ enum Commands {
 
         #[arg(long)]
         hash: Option<String>,
+    },
+
+    Pull {
+        #[arg(long)]
+        url: String,
+
+        #[arg(long)]
+        hash: String,
     },
 }
 
@@ -642,7 +645,7 @@ fn commit_directory(cache: &PathBuf, path: &PathBuf) {
     println!("{}", index.hash);
 }
 
-fn restore_directory(cache: &PathBuf, path: &PathBuf, index: &String) {
+fn restore_directory(cache: &PathBuf, path: &PathBuf, index: &String, validate: bool) {
     if !path.exists() {
         create_dir_all(path).expect("Directory Creation to work");
     }
@@ -662,9 +665,33 @@ fn restore_directory(cache: &PathBuf, path: &PathBuf, index: &String) {
 
     let index = index_cache.to_index();
 
-    println!("{index:?}");
+    // println!("{index:?}");
 
     write_tree(&index.tree, path);
+
+    if validate {
+        validate_tree(&index.tree, path);
+    }
+}
+
+fn validate_tree(tree: &Tree, path: &PathBuf) {
+    for item in tree.contents.iter() {
+        if let TreeObject::Tree(tree) = item {
+            let tree_path = path.join(&tree.path);
+            validate_tree(&tree, &tree_path);
+            continue;
+        }
+
+        let TreeObject::Blob(blob) = item else {
+            unreachable!();
+        };
+
+        let blob_path = path.join(&blob.path);
+
+        let blob_hash = Hashed::from_object(Blob::from_path(&blob_path));
+
+        assert!(blob_hash.hash == blob.hash);
+    }
 }
 
 fn write_tree(tree: &Tree, path: &PathBuf) {
@@ -762,11 +789,74 @@ fn push_cache(cache: &PathBuf, url: &String, hash: Option<Hash>) {
     }
 }
 
+fn pull_tree(cache: &PathBuf, url: &String, tree_hash: &Hash) {
+    let tree_path = tree_hash.get_path(cache);
+
+    // tree already exists locally so we can skip downloading it
+    if !tree_path.exists() {
+        let Some(Header { object_type, size }) = download_object(&tree_hash, &tree_path, url)
+        else {
+            eprintln!("Unable to download object with hash {tree_hash}");
+            return;
+        };
+        assert!(object_type == ObjectType::Tree);
+    }
+
+    let mut file = File::open(tree_path).expect("Index file to exist");
+    let mut index_data = Vec::new();
+    let data_size = file
+        .read_to_end(&mut index_data)
+        .expect("file to be readable");
+
+    let (header, data) =
+        read_header_and_body(&index_data).expect("Index to be in the correct format");
+
+    let index_body = common::object_body::Tree::from_data(data);
+
+    for entry in index_body.contents {
+        let obj_path = entry.hash.get_path(cache);
+        let Some(Header { object_type, size }) = download_object(&entry.hash, &obj_path, url)
+        else {
+            eprintln!("Unable to download object with hash {}", entry.hash);
+            return;
+        };
+
+        assert!(object_type != ObjectType::Index);
+
+        if object_type == ObjectType::Tree {
+            pull_tree(cache, url, &entry.hash);
+        }
+    }
+}
+
+fn pull_cache(cache: &PathBuf, url: &String, hash: Hash) {
+    let index_path = hash.get_path(cache);
+    let Some(Header { object_type, size }) = download_object(&hash, &index_path, url) else {
+        eprintln!("Unable to download object with hash {hash}");
+        return;
+    };
+
+    assert!(object_type == ObjectType::Index);
+
+    let mut file = File::open(index_path).expect("Index file to exist");
+    let mut index_data = Vec::new();
+    let data_size = file
+        .read_to_end(&mut index_data)
+        .expect("file to be readable");
+
+    let (header, data) =
+        read_header_and_body(&index_data).expect("Index to be in the correct format");
+
+    let index_body = common::object_body::Index::from_data(data);
+
+    pull_tree(cache, url, &index_body.tree);
+}
+
 fn upload_object(hash: &Hash, file: &PathBuf, url: &String) {
     let file = File::open(file).expect("File to exist");
     let mut reader = BufReader::new(file);
 
-    let (object_type, object_size) =
+    let Header { object_type, size } =
         read_header_from_file(&mut reader).expect("file to be a valid object");
 
     let url = format!("{url}/object/{hash}");
@@ -775,7 +865,7 @@ fn upload_object(hash: &Hash, file: &PathBuf, url: &String) {
 
     let response = ureq::put(url)
         .header("Object-Type", object_type.to_str())
-        .header("Object-Size", object_size.to_string())
+        .header("Object-Size", size.to_string())
         .send(SendBody::from_reader(&mut reader));
 
     if let Err(err) = response {
@@ -783,13 +873,84 @@ fn upload_object(hash: &Hash, file: &PathBuf, url: &String) {
     }
 }
 
+fn download_object(hash: &Hash, file: &PathBuf, url: &String) -> Option<Header> {
+    let url = format!("{url}/object/{hash}");
+
+    let dir = file.parent().expect("Path to not be at root");
+    create_dir_all(dir).expect("Directory to be created");
+
+    if file.exists() {
+        let file = File::open(file).expect("File to exist");
+        let mut reader = BufReader::new(file);
+
+        let mut buffer = Vec::new();
+        reader.read_until(0, &mut buffer).expect("Header to exist within file");
+        
+        // subtract one to get rid of the null byte
+        return read_header_from_slice(&buffer[..buffer.len() - 1]);
+    }
+
+    println!("Sending get request to {url}");
+
+    let response = ureq::get(url).call();
+
+    let mut response = match response {
+        Ok(v) => v,
+        Err(err) => {
+            eprintln!("There was an error sending request {err:?}");
+            return None;
+        }
+    };
+
+    let file = File::create(file).expect("File to exist");
+    let mut writer = BufWriter::new(file);
+
+    let response_headers = response.headers();
+    let object_type: ObjectType = ObjectType::from_str(
+        response_headers
+            .get("Object-Type")
+            .expect("Object-Type Header to be present in the response")
+            .to_str()
+            .expect("Header to be valid ascii"),
+    )
+    .expect("Header to be a valid ObjectType");
+    let object_size: u64 = response_headers
+        .get("Object-Size")
+        .expect("Object-Size header to be present in the response")
+        .to_str()
+        .expect("Header to be valid ascii")
+        .parse()
+        .expect("Header to be a valid number");
+
+    let header = Header::new(object_type, object_size);
+
+    writer.write(header.get_prefix().as_bytes()).unwrap();
+
+    let mut data: [u8; 1024] = [0; 1024];
+    let mut reader = response.body_mut().as_reader();
+    while let Ok(num) = reader.read(&mut data) {
+        if num == 0 {
+            break;
+        }
+
+        writer.write(&data[..num]).unwrap();
+    }
+
+    return Some(header);
+}
+
 fn main() {
     let cli = Cli::parse();
 
     match cli.command {
         Commands::Commit { directory } => commit_directory(&cli.cache, &directory),
-        Commands::Restore { directory, index } => restore_directory(&cli.cache, &directory, &index),
+        Commands::Restore {
+            directory,
+            index,
+            validate,
+        } => restore_directory(&cli.cache, &directory, &index, validate),
         Commands::Cat { hash } => cat_object(&cli.cache, &hash),
         Commands::Push { url, hash } => push_cache(&cli.cache, &url, hash.as_ref().map(Hash::from)),
+        Commands::Pull { url, hash } => pull_cache(&cli.cache, &url, Hash::from(&hash)),
     }
 }

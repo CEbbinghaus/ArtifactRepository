@@ -7,7 +7,7 @@ use axum::{
     routing::{get, put},
     Router,
 };
-use common::{get_object_prefix, read_header_from_file, read_header_from_slice, Hash, ObjectType};
+use common::{Hash, Header, ObjectType, get_object_prefix, read_header_from_file, read_header_from_slice};
 use lazy_static::lazy_static;
 use sha2::{Digest, Sha512};
 use std::{
@@ -68,7 +68,7 @@ fn read_cache<P: AsRef<Path>>(path: P) {
             };
             let mut reader = BufReader::new(file);
 
-            let Some((object_type, size)) = read_header_from_file(&mut reader) else {
+            let Some(Header { object_type, size }) = read_header_from_file(&mut reader) else {
                 panic!("Corrupt file {:?}", entry.path());
             };
 
@@ -129,14 +129,12 @@ async fn read_body_to_file(
     hash: &Hash,
     object_type: ObjectType,
     object_size: u64,
-    body: BodyDataStream,
+    mut body: BodyDataStream,
 ) -> Result<(), ErrorResult> {
     assert!(
         !path.exists(),
         "Race condition. Someone else has somehow created this file before us"
     );
-
-    let mut body = body;
 
     let file = File::create(path)?;
     let mut writer = BufWriter::new(file);
@@ -200,7 +198,7 @@ async fn put_object(
         return Err((StatusCode::INTERNAL_SERVER_ERROR, "Impossible state".into()));
     };
 
-    create_dir(parent).map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()));
+    create_dir(parent).map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
     let Some(object_type) = headers.get("Object-Type").and_then(|v| v.to_str().ok()) else {
         return Err((StatusCode::BAD_REQUEST, "Missing Object-Type Header".into()));
@@ -230,7 +228,7 @@ async fn put_object(
 }
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash, Default)]
-pub struct TestCodec(Option<(ObjectType, u64)>);
+pub struct TestCodec(Option<Header>);
 
 impl TestCodec {
     /// Creates a new `BytesCodec` for shipping around raw bytes.
@@ -313,7 +311,7 @@ async fn get_object(
     // We call .next() on the stream to try and read out object header from the start of the file
     stream.next().await;
 
-    let Some((object_type, object_size)) = stream.decoder().0 else {
+    let Some(Header {object_type, size}) = stream.decoder().0 else {
         return Err((
             StatusCode::INTERNAL_SERVER_ERROR,
             "Unable to read object header from file".into(),
@@ -332,7 +330,7 @@ async fn get_object(
 
     let headers = response.headers_mut();
     headers.insert("Object-Type", object_type.to_str().parse().unwrap());
-    headers.insert("Object-Size", object_size.to_string().parse().unwrap());
+    headers.insert("Object-Size", size.to_string().parse().unwrap());
 
     return Ok(response);
 }
