@@ -11,7 +11,7 @@ use std::{
     io::{BufRead, BufReader, BufWriter, Read, Write},
     ops::Deref,
     path::PathBuf,
-    str::from_utf8, string,
+    str::from_utf8,
 };
 use ureq::SendBody;
 
@@ -990,7 +990,7 @@ fn read_object_into_headers(
 
     reader.read_to_end(&mut data)?;
 
-    println!("Reading Tree {object_hash}");
+    // println!("Reading Tree {object_hash}");
     let tree = common::object_body::Tree::from_data(&data[bytes_read..]);
 
     for entry in &tree.contents {
