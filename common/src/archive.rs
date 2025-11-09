@@ -1,10 +1,11 @@
-use std::io::{BufRead, BufReader, Read, Write};
+use std::{io::{BufRead, BufReader, Read, Write}, num::NonZero};
 
 use anyhow::anyhow;
 use sha2::{Digest, Sha512};
 
 use crate::{
-    Hash, Header, object_body::{Index, Object}, read_header_and_body
+    object_body::{Index, Object},
+    read_header_and_body, Hash, Header,
 };
 
 pub const HEADER: [u8; 4] = [b'a', b'r', b'x', b'a'];
@@ -55,7 +56,11 @@ where
         match self.compression {
             Compression::None => self.body.to_data(writer)?,
             Compression::Deflate => todo!(),
-            Compression::LZMA2 => todo!(),
+            Compression::LZMA2 => self.body.to_data(&mut lzma_rust2::Lzma2WriterMt::new(
+                writer,
+                lzma_rust2::Lzma2Options { lzma_options: Default::default(), chunk_size: NonZero::new(1024 * 64) },
+                std::thread::available_parallelism().unwrap().get() as u32,
+            )?)?,
         }
 
         Ok(())
@@ -87,7 +92,14 @@ where
         let body = match compression {
             Compression::None => ArchiveBody::<RawEntryData>::from_data(&mut reader)?,
             Compression::Deflate => todo!(),
-            Compression::LZMA2 => todo!(),
+            Compression::LZMA2 => {
+                ArchiveBody::<RawEntryData>::from_data(&mut lzma_rust2::Lzma2ReaderMt::new(
+                    &mut reader,
+                    lzma_rust2::LzmaOptions::DICT_SIZE_DEFAULT,
+                    None,
+                    std::thread::available_parallelism().unwrap().get() as u32,
+                ))?
+            }
         };
 
         Ok(Archive {
@@ -122,10 +134,13 @@ pub struct ReaderEntryData<T>(T)
 where
     T: Read;
 
-impl<T> ReaderEntryData<T> where T: Read {
-	pub fn new(reader: T) -> Self {
-		ReaderEntryData(reader)
-	}
+impl<T> ReaderEntryData<T>
+where
+    T: Read,
+{
+    pub fn new(reader: T) -> Self {
+        ReaderEntryData(reader)
+    }
 }
 
 impl<T> ArchiveEntryData for ReaderEntryData<T>
@@ -177,9 +192,7 @@ where
         Ok(())
     }
 
-    fn from_data<'a>(
-        reader: &mut BufReader<&'a mut impl Read>,
-    ) -> anyhow::Result<ArchiveBody<RawEntryData>> {
+    fn from_data<'a>(reader: &'a mut impl Read) -> anyhow::Result<ArchiveBody<RawEntryData>> {
         let mut long: [u8; 8] = [0; 8];
         reader.read_exact(&mut long)?;
         let count = u64::from_be_bytes(long);
@@ -212,31 +225,36 @@ where
             counter += 1;
         }
 
-		let mut counter: u64 = 0;
+        let mut counter: u64 = 0;
 
-		header_entries.sort_by(|a, b| a.index.cmp(&b.index));
-		assert!(header_entries[0].index == 0);
+        header_entries.sort_by(|a, b| a.index.cmp(&b.index));
+        assert!(header_entries[0].index == 0);
 
-		let mut entries: Vec<ArchiveEntry<RawEntryData>> = Vec::with_capacity(header_entries.len());
-		for entry in &header_entries {
-			assert!(entry.index == counter);
+        let mut entries: Vec<ArchiveEntry<RawEntryData>> = Vec::with_capacity(header_entries.len());
+        for entry in &header_entries {
+            assert!(entry.index == counter);
 
-			let amount = entry.length;
-			let mut data: Vec<u8> = vec![0; amount as usize];
-			reader.read_exact(&mut data[..])?;
+            let amount = entry.length;
+            let mut data: Vec<u8> = vec![0; amount as usize];
+            reader.read_exact(&mut data[..])?;
 
-			let mut hasher = Sha512::new();
-			hasher.write(&data)?;
-			assert!(Hash::from(hasher) == entry.hash);
+            let mut hasher = Sha512::new();
+            hasher.write(&data)?;
+            assert!(Hash::from(hasher) == entry.hash);
 
-			let (header, body) = read_header_and_body(&data).ok_or(anyhow!("Invalid Header"))?;
+            let (header, body) = read_header_and_body(&data).ok_or(anyhow!("Invalid Header"))?;
 
-			entries.push(ArchiveEntry { header , body: RawEntryData(body.to_vec())  });
+            entries.push(ArchiveEntry {
+                header,
+                body: RawEntryData(body.to_vec()),
+            });
 
-			counter += amount;
-		}
+            counter += amount;
+        }
 
-
-		Ok(ArchiveBody { header: header_entries, entries })
+        Ok(ArchiveBody {
+            header: header_entries,
+            entries,
+        })
     }
 }

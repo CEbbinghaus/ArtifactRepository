@@ -1058,7 +1058,7 @@ fn pack_archive(cache: &PathBuf, path: &PathBuf, index_hash: &Hash) -> anyhow::R
 
     let archive = Archive {
         header: HEADER,
-        compression: common::archive::Compression::None,
+        compression: common::archive::Compression::LZMA2,
         hash: index_hash.clone(),
         index,
         body: ArchiveBody {

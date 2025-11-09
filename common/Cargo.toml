@@ -7,4 +7,5 @@ edition = "2021"
 anyhow = "1.0.100"
 chrono = "0.4.41"
 hex = "0.4.3"
+lzma-rust2 = {version = "0.15.1", features = ["std"] }
 sha2 = "0.10.9"
