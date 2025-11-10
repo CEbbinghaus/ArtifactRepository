@@ -63,23 +63,25 @@ where
     T: ArchiveEntryData,
 {
     pub fn to_data<'a>(self, writer: &'a mut impl Write) -> anyhow::Result<()> {
-        writer.write(&HEADER)?;
-        writer.write(&(self.compression as u16).to_be_bytes())?;
-        writer.write(&self.hash.hash)?;
-        writer.write(&self.index.to_data())?;
-        writer.write(&[0])?;
+        writer.write_all(&HEADER)?;
+        writer.write_all(&(self.compression as u16).to_be_bytes())?;
+        writer.write_all(&self.hash.hash)?;
+        writer.write_all(&self.index.to_data())?;
+        writer.write_all(&[0])?;
 
         match self.compression {
             Compression::None => self.body.to_data(writer)?,
             Compression::Gzip => {
                 let mut gz_encoder = flate2::write::GzEncoder::new(writer, flate2::Compression::default());
                 self.body.to_data(&mut gz_encoder)?;
-                gz_encoder.finish()?;
+                let w = gz_encoder.finish()?;
+                w.flush()?;
             },
             Compression::Deflate => {
                 let mut gz_encoder = flate2::write::DeflateEncoder::new(writer, flate2::Compression::default());
                 self.body.to_data(&mut gz_encoder)?;
-                gz_encoder.finish()?;
+                let w = gz_encoder.finish()?;
+                w.flush()?;
             },
             Compression::LZMA2 => self.body.to_data(&mut lzma_rust2::Lzma2WriterMt::new(
                 writer,
@@ -202,17 +204,17 @@ where
     T: ArchiveEntryData,
 {
     fn to_data<'a>(self, writer: &'a mut impl Write) -> anyhow::Result<()> {
-        writer.write(&(self.header.len() as u64).to_be_bytes())?;
+        writer.write_all(&(self.header.len() as u64).to_be_bytes())?;
         for entry in &self.header {
-            writer.write(&entry.hash.hash)?;
-            writer.write(&entry.index.to_be_bytes())?;
-            writer.write(&entry.length.to_be_bytes())?;
+            writer.write_all(&entry.hash.hash)?;
+            writer.write_all(&entry.index.to_be_bytes())?;
+            writer.write_all(&entry.length.to_be_bytes())?;
         }
 
         for entry in self.entries {
-            writer.write(entry.header.get_prefix().as_bytes())?;
+            writer.write_all(entry.header.get_prefix().as_bytes())?;
 
-            writer.write(&entry.body.turn_into_vec())?;
+            writer.write_all(&entry.body.turn_into_vec())?;
         }
 
         writer.flush()?;
