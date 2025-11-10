@@ -1,6 +1,6 @@
-use std::{io::{BufRead, BufReader, Read, Write}, num::NonZero};
+use std::{io::{BufRead, BufReader, Read, Write}, num::NonZero, str::FromStr};
 
-use anyhow::anyhow;
+use anyhow::{Error, anyhow};
 use sha2::{Digest, Sha512};
 
 use crate::{
@@ -14,8 +14,23 @@ pub const HEADER: [u8; 4] = [b'a', b'r', b'x', b'a'];
 #[derive(Clone, Copy)]
 pub enum Compression {
     None = 0,
+    Gzip = 4,
     Deflate = 8,
     LZMA2 = 16,
+}
+
+impl FromStr for Compression {
+    type Err = Error;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "none" => Ok(Compression::None),
+            "gzip" => Ok(Compression::Gzip),
+            "deflate" => Ok(Compression::Deflate),
+            "lzma2" => Ok(Compression::LZMA2),
+            _ => Err(anyhow!("Invalid Compression Type"))
+        }
+    }
 }
 
 impl TryFrom<u16> for Compression {
@@ -24,6 +39,7 @@ impl TryFrom<u16> for Compression {
     fn try_from(v: u16) -> Result<Self, Self::Error> {
         match v {
             x if x == Compression::None as u16 => Ok(Compression::None),
+            x if x == Compression::Gzip as u16 => Ok(Compression::Gzip),
             x if x == Compression::Deflate as u16 => Ok(Compression::Deflate),
             x if x == Compression::LZMA2 as u16 => Ok(Compression::LZMA2),
             _ => Err(()),
@@ -55,12 +71,21 @@ where
 
         match self.compression {
             Compression::None => self.body.to_data(writer)?,
-            Compression::Deflate => todo!(),
+            Compression::Gzip => {
+                let mut gz_encoder = flate2::write::GzEncoder::new(writer, flate2::Compression::default());
+                self.body.to_data(&mut gz_encoder)?;
+                gz_encoder.finish()?;
+            },
+            Compression::Deflate => {
+                let mut gz_encoder = flate2::write::DeflateEncoder::new(writer, flate2::Compression::default());
+                self.body.to_data(&mut gz_encoder)?;
+                gz_encoder.finish()?;
+            },
             Compression::LZMA2 => self.body.to_data(&mut lzma_rust2::Lzma2WriterMt::new(
                 writer,
                 lzma_rust2::Lzma2Options { lzma_options: Default::default(), chunk_size: NonZero::new(1024 * 64) },
                 std::thread::available_parallelism().unwrap().get() as u32,
-            )?)?,
+            )?.auto_finish())?,
         }
 
         Ok(())
@@ -91,15 +116,16 @@ where
 
         let body = match compression {
             Compression::None => ArchiveBody::<RawEntryData>::from_data(&mut reader)?,
-            Compression::Deflate => todo!(),
-            Compression::LZMA2 => {
-                ArchiveBody::<RawEntryData>::from_data(&mut lzma_rust2::Lzma2ReaderMt::new(
+            Compression::Gzip => ArchiveBody::<RawEntryData>::from_data(&mut flate2::read::GzDecoder::new(&mut reader))?,
+            Compression::Deflate => ArchiveBody::<RawEntryData>::from_data(&mut flate2::read::DeflateDecoder::new(&mut reader))?,
+            Compression::LZMA2 => ArchiveBody::<RawEntryData>::from_data({
+                &mut lzma_rust2::Lzma2ReaderMt::new(
                     &mut reader,
                     lzma_rust2::LzmaOptions::DICT_SIZE_DEFAULT,
                     None,
                     std::thread::available_parallelism().unwrap().get() as u32,
-                ))?
-            }
+                )
+            })?
         };
 
         Ok(Archive {
@@ -188,6 +214,8 @@ where
 
             writer.write(&entry.body.turn_into_vec())?;
         }
+
+        writer.flush()?;
 
         Ok(())
     }

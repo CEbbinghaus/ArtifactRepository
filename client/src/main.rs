@@ -2,7 +2,7 @@
 use chrono::{DateTime, Utc};
 use clap::{Parser, Subcommand};
 use common::{
-    BLOB_KEY, Hash, Header, INDEX_KEY, Mode, ObjectType, TREE_KEY, archive::{Archive, ArchiveBody, ArchiveEntry, ArchiveEntryData, ArchiveHeaderEntry, HEADER, RawEntryData, ReaderEntryData}, object_body::Object as OtherObject, read_header_and_body, read_header_from_file, read_header_from_slice
+    BLOB_KEY, Hash, Header, INDEX_KEY, Mode, ObjectType, TREE_KEY, archive::{Archive, ArchiveBody, ArchiveEntry, ArchiveEntryData, ArchiveHeaderEntry, Compression, HEADER, RawEntryData, ReaderEntryData}, object_body::Object as OtherObject, read_header_and_body, read_header_from_file, read_header_from_slice
 };
 use sha2::{Digest, Sha512};
 use std::{
@@ -616,6 +616,9 @@ enum Commands {
 
         #[arg(long)]
         file: PathBuf,
+
+        #[arg(long)]
+        compression: Compression,
     },
 
     Unpack {
@@ -1000,7 +1003,7 @@ fn read_object_into_headers(
     Ok(())
 }
 
-fn pack_archive(cache: &PathBuf, path: &PathBuf, index_hash: &Hash) -> anyhow::Result<()> {
+fn pack_archive(cache: &PathBuf, path: &PathBuf, index_hash: &Hash, compression: Compression) -> anyhow::Result<()> {
     assert!(!path.exists());
     assert!(path.parent().map(|p| p.exists() && p.is_dir()) == Some(true));
 
@@ -1058,7 +1061,7 @@ fn pack_archive(cache: &PathBuf, path: &PathBuf, index_hash: &Hash) -> anyhow::R
 
     let archive = Archive {
         header: HEADER,
-        compression: common::archive::Compression::LZMA2,
+        compression,
         hash: index_hash.clone(),
         index,
         body: ArchiveBody {
@@ -1136,8 +1139,8 @@ fn main() {
             push_cache(&cli.cache, &url, index.as_ref().map(Hash::from))
         }
         Commands::Pull { url, index } => pull_cache(&cli.cache, &url, Hash::from(&index)),
-        Commands::Pack { index, file } => {
-            pack_archive(&cli.cache, &file, &Hash::from(&index)).expect("Packing to work")
+        Commands::Pack { index, file , compression} => {
+            pack_archive(&cli.cache, &file, &Hash::from(&index), compression).expect("Packing to work")
         }
         Commands::Unpack { file } => {
             unpack_archive(&cli.cache, &file).expect("Packing to work")
