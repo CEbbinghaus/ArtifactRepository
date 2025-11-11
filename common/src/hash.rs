@@ -1,18 +1,21 @@
+use anyhow::anyhow;
+use serde::de::{self, Visitor};
+use serde::{Deserialize, Deserializer, Serialize};
 use sha2::digest::FixedOutput;
 
 use sha2::Sha512;
 use std::path::PathBuf;
-use std::fmt::{Display, Debug};
+use std::fmt::{self, Debug, Display};
+use std::str::FromStr;
 // use std::hash::Hash;
 
-#[derive(Clone)]
+#[derive(Clone, Serialize)]
 pub struct Hash {
     // Sha512 Hash value
+    #[serde(skip)]
     pub hash: [u8; 64],
     hash_string: String,
 }
-
-
 
 impl Hash {
     pub fn get_parts(&self) -> (&str, &str) {
@@ -59,9 +62,9 @@ impl Hash {
             return None;
         }
 
-        Some(Self::from(
-            &(directory.to_str()?.to_owned() + filename.to_str()?),
-        ))
+        Some(Self::try_from(
+            directory.to_str()?.to_owned() + filename.to_str()?,
+        ).ok()?)
     }
 }
 
@@ -80,34 +83,63 @@ impl PartialEq for Hash {
 
 impl Eq for Hash {}
 
-impl From<&String> for Hash {
-    fn from(value: &String) -> Self {
-        value.as_str().into()
+impl FromStr for Hash {
+    type Err = anyhow::Error;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        s.try_into()
     }
 }
 
-impl From<&str> for Hash {
-    fn from(value: &str) -> Self {
-        assert!(value.len() == 128);
+impl TryFrom<String> for Hash {
+    type Error = anyhow::Error;
 
-        let hash = hex::decode(value).unwrap();
-
-        assert!(hash.len() == 64);
-
-        Self {
-            hash: hash.try_into().unwrap(),
-            hash_string: value.to_owned(),
+    fn try_from(value: String) -> Result<Self, Self::Error> {
+        if value.len() != 128 {
+            return Err(anyhow!("Invalid length. Hash has to be 128 characters long"));
         }
+
+        let mut hash = [0u8; 64];
+        hex::decode_to_slice(&value, &mut hash)?;
+
+        Ok(Self {
+            hash,
+            hash_string: value
+        })
     }
 }
 
-impl From<&[u8]> for Hash {
-    fn from(value: &[u8]) -> Self {
-        let data: [u8; 64] = value.try_into().expect("slice to be valid 64 byte array");
-        Self {
+impl TryFrom<&str> for Hash {
+    type Error = anyhow::Error;
+
+    fn try_from(value: &str) -> Result<Self, Self::Error> {
+        if value.len() != 128 {
+            return Err(anyhow!("Invalid length. Hash has to be 128 characters long"));
+        }
+
+        let mut hash = [0u8; 64];
+        hex::decode_to_slice(value, &mut hash)?;
+
+        Ok(Self {
+            hash,
+            hash_string: value.to_owned(),
+        })
+    }
+}
+
+impl TryFrom<&[u8]> for Hash {
+    type Error = anyhow::Error;
+    
+    fn try_from(value: &[u8]) -> Result<Self, Self::Error> {
+        if value.len() != 64 {
+            return Err(anyhow!("Invalid length. Slice must be 64 bytes long"));
+        }
+
+        let data: [u8; 64] = value.try_into()?;
+        Ok(Self {
             hash_string: hex::encode(&value),
             hash: data,
-        }
+        })
     }
 }
 
@@ -135,5 +167,37 @@ impl Debug for Hash {
 impl Display for Hash {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}", self.hash_string)
+    }
+}
+
+
+
+impl<'de> Deserialize<'de> for Hash {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        struct HashVisitor;
+
+        impl<'de> Visitor<'de> for HashVisitor {
+            type Value = Hash;
+
+            fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
+                formatter.write_str("Sha512 hex string Hash")
+            }
+
+            fn visit_string<E>(self, value: String) -> Result<Self::Value, E>
+                where
+                    E: serde::de::Error, {
+                
+                if value.len() != 128 {
+                    return Err(de::Error::invalid_length(value.len(), &"A hex string with 128 characters"));
+                }
+
+                value.try_into().map_err(de::Error::custom)
+            }
+        }
+        
+        deserializer.deserialize_string( HashVisitor)
     }
 }

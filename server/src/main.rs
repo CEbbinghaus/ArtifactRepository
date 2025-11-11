@@ -60,7 +60,7 @@ async fn read_cache<P: AsRef<Path>>(path: P) {
                 prefix.to_string_lossy(),
                 entry.file_name().to_string_lossy()
             );
-            let hash = Hash::from(&name);
+            let hash = Hash::try_from(name).expect("Valid Hash");
 
             let Ok(file) = File::open(entry.path()).await else {
                 continue;
@@ -177,16 +177,12 @@ async fn write_body_to_file(
 
 #[debug_handler]
 async fn put_object(
-    AxumPath(object_id): AxumPath<String>,
+    AxumPath(object_hash): AxumPath<Hash>,
     State(state): State<ServerState>,
     headers: HeaderMap,
     request: Request<Body>,
 ) -> Result<StatusCode, (StatusCode, String)> {
-    let Some(hash) = Hash::from_string(&object_id) else {
-        return Err((StatusCode::BAD_REQUEST, "Invalid Sha512 hash".into()));
-    };
-
-    let object_path = hash.get_path(&state.cache_path);
+    let object_path = object_hash.get_path(&state.cache_path);
 
     if object_path.exists() {
         return Err((StatusCode::OK, "Object already exists".into()));
@@ -217,7 +213,7 @@ async fn put_object(
     let data_stream = request.into_body().into_data_stream();
 
     if let Err(err) =
-        write_body_to_file(&object_path, &hash, object_type, object_size, data_stream).await
+        write_body_to_file(&object_path, &object_hash, object_type, object_size, data_stream).await
     {
         return Err(err.get_response());
     }
@@ -294,7 +290,6 @@ async fn main() {
         })
         .route("/", get(|| async { "Hello, World!" }));
 
-    // run our app with hyper, listening globally on port 3000
     let listener = tokio::net::TcpListener::bind(("0.0.0.0", port)).await.unwrap();
 
     println!("Listening at http://{}", listener.local_addr().unwrap());

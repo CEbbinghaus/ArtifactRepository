@@ -151,7 +151,7 @@ impl<'a> CacheObject<'a> {
 
         let timestamp = DateTime::parse_from_rfc3339(metadata["timestamp"]).unwrap();
 
-        let tree_hash = Hash::from(metadata["tree"]);
+        let tree_hash = Hash::try_from(metadata["tree"]).expect("tree hash to be valid");
 
         let tree_object = CacheObject::from_file(self.cache, &tree_hash.get_path(self.cache));
 
@@ -560,73 +560,6 @@ fn write_tree_to_folder(dir: &PathBuf, tree: &Hashed<Tree>) {
     }
 }
 
-#[derive(Parser)]
-#[command(version, about, long_about = None)]
-struct Cli {
-    #[arg(short, long, value_name = "Cache")]
-    cache: PathBuf,
-
-    #[arg(short, long, action = clap::ArgAction::Count)]
-    debug: u8,
-
-    #[command(subcommand)]
-    command: Commands,
-}
-
-#[derive(Subcommand)]
-enum Commands {
-    Commit {
-        #[arg(short, long)]
-        directory: PathBuf,
-    },
-
-    Restore {
-        #[arg(short, long)]
-        directory: PathBuf,
-        #[arg(short, long)]
-        index: String,
-        #[arg(long)]
-        validate: bool,
-    },
-
-    Cat {
-        #[arg(long)]
-        hash: String,
-    },
-
-    Push {
-        #[arg(long)]
-        url: String,
-
-        #[arg(long)]
-        index: Option<String>,
-    },
-
-    Pull {
-        #[arg(long)]
-        url: String,
-
-        #[arg(long)]
-        index: String,
-    },
-
-    Pack {
-        #[arg(long)]
-        index: String,
-
-        #[arg(long)]
-        file: PathBuf,
-
-        #[arg(long)]
-        compression: Compression,
-    },
-
-    Unpack {
-        #[arg(long)]
-        file: PathBuf,
-    },
-}
-
 fn get_total_size(index: &Hashed<Tree>) -> u128 {
     let mut total = 0;
 
@@ -666,7 +599,7 @@ fn commit_directory(cache: &PathBuf, path: &PathBuf) {
     println!("{}", index.hash);
 }
 
-fn restore_directory(cache: &PathBuf, path: &PathBuf, index: &String, validate: bool) {
+fn restore_directory(cache: &PathBuf, path: &PathBuf, index: Hash, validate: bool) {
     if !path.exists() {
         create_dir_all(path).expect("Directory Creation to work");
     }
@@ -679,9 +612,7 @@ fn restore_directory(cache: &PathBuf, path: &PathBuf, index: &String, validate: 
         panic!("Path provided must be an empty directory");
     }
 
-    let index_hash = Hash::from(index);
-
-    let index_path = index_hash.get_path(cache);
+    let index_path = index.get_path(cache);
     let index_cache = Hashed::from_object(CacheObject::from_file(cache, &index_path));
 
     let index = index_cache.to_index();
@@ -750,9 +681,7 @@ fn write_tree(tree: &Tree, path: &PathBuf) {
     }
 }
 
-fn cat_object(cache: &PathBuf, hash: &String) {
-    let hash = Hash::from(hash);
-
+fn cat_object(cache: &PathBuf, hash: &Hash) {
     let object_path = hash.get_path(cache);
 
     let file = File::open(&object_path).unwrap();
@@ -803,7 +732,7 @@ fn push_cache(cache: &PathBuf, url: &String, hash: Option<Hash>) {
                 prefix.to_string_lossy(),
                 entry.file_name().to_string_lossy()
             );
-            let hash = Hash::from(&name);
+            let hash = Hash::try_from(name).expect("Hash to be valid");
 
             upload_object(&hash, &entry.path(), url);
         }
@@ -1124,6 +1053,74 @@ fn unpack_archive(cache: &PathBuf, path: &PathBuf) -> anyhow::Result<()> {
     Ok(())
 }
 
+
+#[derive(Parser)]
+#[command(version, about, long_about = None)]
+struct Cli {
+    #[arg(short, long, value_name = "Cache")]
+    cache: PathBuf,
+
+    #[arg(short, long, action = clap::ArgAction::Count)]
+    debug: u8,
+
+    #[command(subcommand)]
+    command: Commands,
+}
+
+#[derive(Subcommand)]
+enum Commands {
+    Commit {
+        #[arg(short, long)]
+        directory: PathBuf,
+    },
+
+    Restore {
+        #[arg(short, long)]
+        directory: PathBuf,
+        #[arg(short, long)]
+        index: Hash,
+        #[arg(long)]
+        validate: bool,
+    },
+
+    Cat {
+        #[arg(long)]
+        hash: Hash,
+    },
+
+    Push {
+        #[arg(long)]
+        url: String,
+
+        #[arg(long)]
+        index: Option<Hash>,
+    },
+
+    Pull {
+        #[arg(long)]
+        url: String,
+
+        #[arg(long)]
+        index: Hash,
+    },
+
+    Pack {
+        #[arg(long)]
+        index: Hash,
+
+        #[arg(long)]
+        file: PathBuf,
+
+        #[arg(long)]
+        compression: Compression,
+    },
+
+    Unpack {
+        #[arg(long)]
+        file: PathBuf,
+    },
+}
+
 fn main() {
     let cli = Cli::parse();
 
@@ -1133,14 +1130,14 @@ fn main() {
             directory,
             index,
             validate,
-        } => restore_directory(&cli.cache, &directory, &index, validate),
+        } => restore_directory(&cli.cache, &directory, index, validate),
         Commands::Cat { hash } => cat_object(&cli.cache, &hash),
         Commands::Push { url, index } => {
-            push_cache(&cli.cache, &url, index.as_ref().map(Hash::from))
+            push_cache(&cli.cache, &url, index)
         }
-        Commands::Pull { url, index } => pull_cache(&cli.cache, &url, Hash::from(&index)),
+        Commands::Pull { url, index } => pull_cache(&cli.cache, &url, index),
         Commands::Pack { index, file , compression} => {
-            pack_archive(&cli.cache, &file, &Hash::from(&index), compression).expect("Packing to work")
+            pack_archive(&cli.cache, &file, &index, compression).expect("Packing to work")
         }
         Commands::Unpack { file } => {
             unpack_archive(&cli.cache, &file).expect("Packing to work")

@@ -19,6 +19,7 @@ pub struct Index {
 }
 
 impl Object for Index {
+    //TODO: This HAS to return a result. We need to fix that
     fn from_data(data: &[u8]) -> Self {
         let string_data = from_utf8(data).expect("Data to be in valid utf8 format");
 
@@ -42,7 +43,7 @@ impl Object for Index {
             let value = value.trim();
 
             match key.trim() {
-                TREE_KEY => tree_hash = Some(Hash::from(value)),
+                TREE_KEY => tree_hash = Hash::try_from(value).ok(),
                 TIMESTAMP_KEY => {
                     timestamp = Some(
                         DateTime::parse_from_rfc3339(value)
@@ -131,7 +132,7 @@ impl Object for Tree {
                 .expect("mode and filename to be seperated by space");
             let mode = Mode::from_str(mode).expect("valid mode");
 
-            let hash = Hash::from(&remaining[position..position + 64]);
+            let hash = Hash::try_from(&remaining[position..position + 64]).expect("Hash to be valid");
             contents.push(TreeEntry {
                 hash,
                 mode,
