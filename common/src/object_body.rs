@@ -164,19 +164,3 @@ impl Object for Tree {
         data
     }
 }
-
-#[derive(Debug)]
-pub struct Blob {
-    pub size: u64,
-}
-impl Object for Blob {
-    fn from_data(data: &[u8]) -> Self {
-        Blob {
-            size: data.len() as u64,
-        }
-    }
-
-    fn to_data(&self) -> Vec<u8> {
-        panic!("Blob has no data :(");
-    }
-}
