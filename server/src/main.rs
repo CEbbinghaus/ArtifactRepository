@@ -7,6 +7,7 @@ use axum::{
     routing::{get, put},
     Router,
 };
+use clap::Parser;
 use common::{Hash, Header, ObjectType};
 use lazy_static::lazy_static;
 use sha2::{Digest, Sha512};
@@ -260,28 +261,42 @@ async fn get_object(
     return Ok(response);
 }
 
+#[derive(Parser)]
+#[clap(version, about, long_about = None)]
+pub struct Cli {
+    /// Increase verbosity, and can be used multiple times
+    #[arg(short, long, action = clap::ArgAction::Count)]
+    pub verbose: u8,
+
+    #[arg(short, long, default_value_t = 1287)]
+    pub port: u16,
+
+    pub store: PathBuf,
+}
+
 #[tokio::main]
 async fn main() {
-    let cache_dir = "/home/cebbinghaus/Projects/ArtifactRepository/cache";
 
-    let cache_dir = PathBuf::from(cache_dir);
+    let Cli { store, port, ..} = Cli::parse();
 
-    if !cache_dir.exists() {
-        create_dir(&cache_dir).expect("Cache directory to exist");
+    if !store.exists() {
+        create_dir(&store).expect("Cache directory to exist");
     }
 
-    read_cache(&cache_dir).await;
+    read_cache(&store).await;
 
     // build our application with a single route
     let app = Router::new()
         .route("/object/{object_id}", put(put_object))
         .route("/object/{object_id}", get(get_object))
         .with_state(ServerState {
-            cache_path: cache_dir,
+            cache_path: store,
         })
         .route("/", get(|| async { "Hello, World!" }));
 
     // run our app with hyper, listening globally on port 3000
-    let listener = tokio::net::TcpListener::bind("0.0.0.0:3000").await.unwrap();
+    let listener = tokio::net::TcpListener::bind(("0.0.0.0", port)).await.unwrap();
+
+    println!("Listening at http://{}", listener.local_addr().unwrap());
     axum::serve(listener, app).await.unwrap();
 }

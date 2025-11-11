@@ -5,6 +5,7 @@ edition = "2021"
 
 [dependencies]
 axum = { version = "0.8.4", features = ["macros"] }
+clap = { version = "4.5.51", features = ["derive"] }
 common = { path = "../common" }
 futures-core = "0.3.31"
 http-body = "1.0.1"
