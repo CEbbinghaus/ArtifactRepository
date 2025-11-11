@@ -1,24 +1,15 @@
 use axum::{
-    body::{Body, BodyDataStream},
-    debug_handler,
-    extract::{Path as AxumPath, Request, State},
-    http::{HeaderMap, StatusCode},
-    response::Response,
-    routing::{get, put},
-    Router,
+    Router, body::{Body, BodyDataStream}, debug_handler, extract::{Path as AxumPath, Request, State}, http::{HeaderMap, HeaderValue, StatusCode}, response::Response, routing::{get, put}
 };
 use clap::Parser;
-use common::{Hash, Header, ObjectType};
+use common::{Hash, Header, ObjectType, archive::{Archive, ArchiveBody, ArchiveEntryData, ArchiveHeaderEntry, FileEntryData, HEADER}, object_body::{Index, Object}, read_object_into_headers};
 use lazy_static::lazy_static;
 use sha2::{Digest, Sha512};
+use tower_http::compression::CompressionLayer;
 use std::{
-    collections::HashSet,
-    fs::{self, create_dir, remove_file},
-    io::Write,
-    path::{Path, PathBuf},
-    sync::RwLock,
+    collections::{HashMap, HashSet}, fs::{self, create_dir, remove_file}, io::Write, path::{Path, PathBuf}, str::from_utf8, sync::RwLock
 };
-use tokio::{fs::File, io::{AsyncSeekExt, AsyncWriteExt, BufReader, BufWriter}};
+use tokio::{fs::File, io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt, BufReader, BufWriter}};
 use tokio_stream::StreamExt;
 use tokio_util::io::ReaderStream;
 
@@ -223,14 +214,10 @@ async fn put_object(
 
 #[debug_handler]
 async fn get_object(
-    AxumPath(object_id): AxumPath<String>,
+    AxumPath(object_hash): AxumPath<Hash>,
     State(state): State<ServerState>,
 ) -> Result<Response<Body>, (StatusCode, String)> {
-    let Some(hash) = Hash::from_string(&object_id) else {
-        return Err((StatusCode::BAD_REQUEST, "Invalid Sha512 hash".into()));
-    };
-
-    let object_path = hash.get_path(&state.cache_path);
+    let object_path = object_hash.get_path(&state.cache_path);
 
     if !object_path.exists() {
         return Err((
@@ -253,6 +240,84 @@ async fn get_object(
     let headers = response.headers_mut();
     headers.insert("Object-Type", object_type.to_str().parse().unwrap());
     headers.insert("Object-Size", size.to_string().parse().unwrap());
+
+    return Ok(response);
+}
+
+#[debug_handler]
+async fn get_bundle(
+    AxumPath(index_hash): AxumPath<Hash>,
+    State(ServerState { cache_path }): State<ServerState>,
+) -> Result<Response<Body>, (StatusCode, String)> {
+    let object_path = index_hash.get_path(&cache_path);
+
+    if !object_path.exists() {
+        return Err((
+            StatusCode::NO_CONTENT,
+            "No object with this hash exists".into(),
+        ));
+    }
+
+    let file = tokio::fs::File::open(object_path).await.map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))?;
+
+    let mut reader = BufReader::new(file);
+    let header = Header::read_from_async(&mut reader).await.map_err(|err| (StatusCode::BAD_REQUEST, err.to_string()))?;
+    
+    if header.object_type != ObjectType::Index {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "Object requested is not an index".into()
+        ))
+    }
+
+    reader.seek(std::io::SeekFrom::Start((header.to_string().len() ) as u64)).await.map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))?;
+
+    let mut index_data = Vec::new();
+    reader.read_to_end(&mut index_data).await.map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))?;
+
+    let index = Index::from_data(&index_data);
+
+    let mut headers = HashMap::new();
+
+    read_object_into_headers(&cache_path, &mut headers, &index.tree);
+
+    //TODO: Surely there is an algorithm to more efficiently lay out this data
+    let mut i = 0;
+    let mut header_entries: Vec<ArchiveHeaderEntry> = Vec::new();
+
+    for (hash, header) in &headers {
+        let prefix_length = header.to_string().len() as u64;
+        let total_length = header.size + prefix_length;
+
+        header_entries.push(ArchiveHeaderEntry {
+            hash: hash.clone(),
+            index: i,
+            length: total_length,
+        });
+
+        i += total_length;
+    }
+
+
+    let archive = Archive {
+        header: HEADER,
+        compression: common::archive::Compression::None,
+        hash: index_hash.clone(),
+        index: index,
+        body: ArchiveBody {
+            header: header_entries,
+            entries: headers.into_iter().map(|(hash, header)| FileEntryData(hash.get_path(&cache_path))).collect()
+        }
+    };
+
+    let mut body = Vec::new();
+
+    archive.to_data(&mut body).map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))?;
+
+    let mut response = Response::new(body.into());
+    let headers = response.headers_mut();
+    headers.insert("Content-Type", HeaderValue::from_str("application/arc").unwrap());
+    headers.insert("Content-Disposition", HeaderValue::from_str(&format!("Content-Disposition: attachment; filename=\"{index_hash}.ar\"")).unwrap());
 
     return Ok(response);
 }
@@ -281,13 +346,21 @@ async fn main() {
 
     read_cache(&store).await;
 
+    let comression_layer: CompressionLayer = CompressionLayer::new()
+        .br(true)
+        .deflate(true)
+        .gzip(true)
+        .zstd(true);
+
     // build our application with a single route
     let app = Router::new()
         .route("/object/{object_id}", put(put_object))
         .route("/object/{object_id}", get(get_object))
+        .route("/bundle/{index_id}", get(get_bundle))
         .with_state(ServerState {
             cache_path: store,
         })
+        .layer(comression_layer)
         .route("/", get(|| async { "Hello, World!" }));
 
     let listener = tokio::net::TcpListener::bind(("0.0.0.0", port)).await.unwrap();

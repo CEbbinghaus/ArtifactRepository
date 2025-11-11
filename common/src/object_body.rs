@@ -43,7 +43,7 @@ impl Object for Index {
             let value = value.trim();
 
             match key.trim() {
-                TREE_KEY => tree_hash = Hash::try_from(value).ok(),
+                TREE_KEY => tree_hash = Some(Hash::try_from(value).expect("Hash to be valid")),
                 TIMESTAMP_KEY => {
                     timestamp = Some(
                         DateTime::parse_from_rfc3339(value)
@@ -109,7 +109,7 @@ pub struct Tree {
     pub contents: Vec<TreeEntry>,
 }
 impl Object for Tree {
-    fn from_data(data: &[u8]) -> Self {
+    fn  from_data(data: &[u8]) -> Self {
         let mut contents = Vec::new();
 
         let mut index: usize = 0;

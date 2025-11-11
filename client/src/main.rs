@@ -2,7 +2,7 @@
 use chrono::{DateTime, Utc};
 use clap::{Parser, Subcommand};
 use common::{
-    BLOB_KEY, Hash, Header, INDEX_KEY, Mode, ObjectType, TREE_KEY, archive::{Archive, ArchiveBody, ArchiveEntry, ArchiveEntryData, ArchiveHeaderEntry, Compression, HEADER, RawEntryData, ReaderEntryData}, object_body::Object as OtherObject, read_header_and_body, read_header_from_file, read_header_from_slice
+    BLOB_KEY, Hash, Header, INDEX_KEY, Mode, ObjectType, TREE_KEY, archive::{Archive, ArchiveBody, ArchiveEntryData, ArchiveHeaderEntry, Compression, HEADER, RawEntryData, FileEntryData}, object_body::Object as OtherObject, read_object_into_headers, read_header_and_body, read_header_from_file, read_header_from_slice
 };
 use sha2::{Digest, Sha512};
 use std::{
@@ -891,47 +891,6 @@ fn download_object(hash: &Hash, file: &PathBuf, url: &String) -> Option<Header> 
     return Some(header);
 }
 
-fn read_object_into_headers(
-    cache: &PathBuf,
-    headers: &mut HashMap<Hash, Header>,
-    object_hash: &Hash,
-) -> anyhow::Result<()> {
-    let object_path = object_hash.get_path(&cache);
-    assert!(object_path.exists());
-
-    // We assume that if our hash already exists, We probably have already collected all children
-    if headers.contains_key(object_hash) {
-        return Ok(());
-    }
-
-    let file = File::open(object_path).expect("file to exist");
-    let mut reader = BufReader::new(file);
-    let mut data = Vec::new();
-    let bytes_read = reader
-        .read_until(0, &mut data)
-        .expect("File to be readable");
-
-    let header =
-        read_header_from_slice(&data[..bytes_read - 1]).expect("File to be correctly formatted");
-    assert!(header.object_type != ObjectType::Index);
-
-    headers.insert(object_hash.clone(), header.clone());
-    if header.object_type == ObjectType::Blob {
-        return Ok(());
-    }
-
-    reader.read_to_end(&mut data)?;
-
-    // println!("Reading Tree {object_hash}");
-    let tree = common::object_body::Tree::from_data(&data[bytes_read..]);
-
-    for entry in &tree.contents {
-        read_object_into_headers(cache, headers, &entry.hash)?;
-    }
-
-    Ok(())
-}
-
 fn pack_archive(cache: &PathBuf, path: &PathBuf, index_hash: &Hash, compression: Compression) -> anyhow::Result<()> {
     assert!(!path.exists());
     assert!(path.parent().map(|p| p.exists() && p.is_dir()) == Some(true));
@@ -972,22 +931,6 @@ fn pack_archive(cache: &PathBuf, path: &PathBuf, index_hash: &Hash, compression:
         i += total_length;
     }
 
-    let entries: Vec<_> = headers
-        .into_iter()
-        .map(|(hash, header)| ArchiveEntry {
-            header,
-            body: ReaderEntryData::new({
-                let path = hash.get_path(cache);
-                let file = File::open(path).expect("file to exist");
-                let mut reader = BufReader::new(file);
-                let mut tmp_buf = Vec::new();
-                reader.read_until(0, &mut tmp_buf).expect("Reading to work");
-
-                reader
-            }),
-        })
-        .collect();
-
     let archive = Archive {
         header: HEADER,
         compression,
@@ -995,7 +938,10 @@ fn pack_archive(cache: &PathBuf, path: &PathBuf, index_hash: &Hash, compression:
         index,
         body: ArchiveBody {
             header: header_entries,
-            entries,
+            entries: headers
+                .into_iter()
+                .map(|(hash, header)| FileEntryData(hash.get_path(cache)))
+                .collect(),
         },
     };
 
@@ -1046,8 +992,7 @@ fn unpack_archive(cache: &PathBuf, path: &PathBuf) -> anyhow::Result<()> {
         let file = File::create(path)?;
         let mut writer = BufWriter::new(file);
 
-        writer.write(&entry.header.to_string().as_bytes())?;
-        writer.write(&entry.body.turn_into_vec())?;
+        writer.write(&entry.turn_into_vec())?;
     }
 
     Ok(())

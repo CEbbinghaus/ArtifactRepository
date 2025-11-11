@@ -1,11 +1,10 @@
-use std::{io::{BufRead, BufReader, Read, Write}, num::NonZero, str::FromStr};
+use std::{fs::File, io::{BufRead, BufReader, Read, Write}, num::NonZero, path::PathBuf, str::FromStr};
 
 use anyhow::{Error, anyhow};
 use sha2::{Digest, Sha512};
 
 use crate::{
-    object_body::{Index, Object},
-    read_header_and_body, Hash, Header,
+    Hash, Header, object_body::{Index, Object}, pipe, read_header_and_body
 };
 
 pub const HEADER: [u8; 4] = [b'a', b'r', b'x', b'a'];
@@ -182,12 +181,16 @@ where
     }
 }
 
-pub struct ArchiveEntry<T>
-where
-    T: ArchiveEntryData,
-{
-    pub header: Header,
-    pub body: T,
+pub struct FileEntryData(pub PathBuf);
+
+impl ArchiveEntryData for FileEntryData {
+    fn turn_into_vec(self) -> Vec<u8> {
+        let file = File::open(self.0).expect("File to be avaliable for read");
+        let mut reader = BufReader::new(file);
+        let mut data = Vec::new();
+        pipe(&mut reader, &mut data).expect("reading to work");
+        data
+    }
 }
 
 pub struct ArchiveBody<T>
@@ -195,7 +198,7 @@ where
     T: ArchiveEntryData,
 {
     pub header: Vec<ArchiveHeaderEntry>,
-    pub entries: Vec<ArchiveEntry<T>>,
+    pub entries: Vec<T>,
 }
 
 impl<T> ArchiveBody<T>
@@ -211,9 +214,7 @@ where
         }
 
         for entry in self.entries {
-            writer.write_all(entry.header.to_string().as_bytes())?;
-
-            writer.write_all(&entry.body.turn_into_vec())?;
+            writer.write_all(&entry.turn_into_vec())?;
         }
 
         writer.flush()?;
@@ -228,10 +229,17 @@ where
 
         println!("Loading {count} entries");
 
+        if count == 0 {
+            return Ok(ArchiveBody {
+                header: Vec::new(),
+                entries: Vec::new(),
+            });
+        }
+
         let mut header_entries: Vec<ArchiveHeaderEntry> = Vec::with_capacity(count as usize);
         let mut counter = 0;
         loop {
-            if counter == count {
+            if counter >= count {
                 break;
             }
 
@@ -259,7 +267,7 @@ where
         header_entries.sort_by(|a, b| a.index.cmp(&b.index));
         assert!(header_entries[0].index == 0);
 
-        let mut entries: Vec<ArchiveEntry<RawEntryData>> = Vec::with_capacity(header_entries.len());
+        let mut entries: Vec<RawEntryData> = Vec::with_capacity(header_entries.len());
         for entry in &header_entries {
             assert!(entry.index == counter);
 
@@ -271,12 +279,7 @@ where
             hasher.write(&data)?;
             assert!(Hash::from(hasher) == entry.hash);
 
-            let (header, body) = read_header_and_body(&data).ok_or(anyhow!("Invalid Header"))?;
-
-            entries.push(ArchiveEntry {
-                header,
-                body: RawEntryData(body.to_vec()),
-            });
+            entries.push(RawEntryData(data.to_vec()));
 
             counter += amount;
         }
