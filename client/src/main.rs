@@ -947,7 +947,7 @@ fn download_object(hash: &Hash, file: &PathBuf, url: &String) -> Option<Header> 
 
     let header = Header::new(object_type, object_size);
 
-    writer.write(header.get_prefix().as_bytes()).unwrap();
+    writer.write(header.to_string().as_bytes()).unwrap();
 
     let mut data: [u8; 1024] = [0; 1024];
     let mut reader = response.body_mut().as_reader();
@@ -1031,7 +1031,7 @@ fn pack_archive(cache: &PathBuf, path: &PathBuf, index_hash: &Hash, compression:
     let mut header_entries: Vec<ArchiveHeaderEntry> = Vec::new();
 
     for (hash, header) in &headers {
-        let prefix_length = header.get_prefix().len() as u64;
+        let prefix_length = header.to_string().len() as u64;
         let total_length = header.size + prefix_length;
 
         header_entries.push(ArchiveHeaderEntry {
@@ -1094,7 +1094,7 @@ fn unpack_archive(cache: &PathBuf, path: &PathBuf) -> anyhow::Result<()> {
     let index_header = Header::new(ObjectType::Index, index_data.len() as u64);
 
     let mut hasher = Sha512::new();
-    hasher.write(&index_header.get_prefix().as_bytes())?;
+    hasher.write(&index_header.to_string().as_bytes())?;
     hasher.write(&index_data)?;
     assert!(Hash::from(hasher) == archive.hash);
 
@@ -1104,7 +1104,7 @@ fn unpack_archive(cache: &PathBuf, path: &PathBuf) -> anyhow::Result<()> {
     {
         let index_file = File::create(path)?;
         let mut writer = BufWriter::new(index_file);
-        writer.write(&index_header.get_prefix().as_bytes())?;
+        writer.write(&index_header.to_string().as_bytes())?;
         writer.write(&index_data)?;
     }
 
@@ -1117,7 +1117,7 @@ fn unpack_archive(cache: &PathBuf, path: &PathBuf) -> anyhow::Result<()> {
         let file = File::create(path)?;
         let mut writer = BufWriter::new(file);
 
-        writer.write(&entry.header.get_prefix().as_bytes())?;
+        writer.write(&entry.header.to_string().as_bytes())?;
         writer.write(&entry.body.turn_into_vec())?;
     }
 

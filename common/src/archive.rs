@@ -74,14 +74,13 @@ where
             Compression::Gzip => {
                 let mut gz_encoder = flate2::write::GzEncoder::new(writer, flate2::Compression::default());
                 self.body.to_data(&mut gz_encoder)?;
-                let w = gz_encoder.finish()?;
-                w.flush()?;
+                gz_encoder.finish()?.flush()?;
+
             },
             Compression::Deflate => {
                 let mut gz_encoder = flate2::write::DeflateEncoder::new(writer, flate2::Compression::default());
                 self.body.to_data(&mut gz_encoder)?;
-                let w = gz_encoder.finish()?;
-                w.flush()?;
+                gz_encoder.finish()?.flush()?;
             },
             Compression::LZMA2 => self.body.to_data(&mut lzma_rust2::Lzma2WriterMt::new(
                 writer,
@@ -212,7 +211,7 @@ where
         }
 
         for entry in self.entries {
-            writer.write_all(entry.header.get_prefix().as_bytes())?;
+            writer.write_all(entry.header.to_string().as_bytes())?;
 
             writer.write_all(&entry.body.turn_into_vec())?;
         }

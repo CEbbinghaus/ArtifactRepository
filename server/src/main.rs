@@ -7,21 +7,19 @@ use axum::{
     routing::{get, put},
     Router,
 };
-use common::{Hash, Header, ObjectType, get_object_prefix, read_header_from_file, read_header_from_slice};
+use common::{Hash, Header, ObjectType};
 use lazy_static::lazy_static;
 use sha2::{Digest, Sha512};
 use std::{
     collections::HashSet,
-    fs::{self, create_dir, remove_file, File},
-    io::{BufReader, BufWriter, Write},
+    fs::{self, create_dir, remove_file},
+    io::Write,
     path::{Path, PathBuf},
     sync::RwLock,
 };
+use tokio::{fs::File, io::{AsyncSeekExt, AsyncWriteExt, BufReader, BufWriter}};
 use tokio_stream::StreamExt;
-use tokio_util::{
-    bytes::{Buf, BytesMut},
-    codec::{Decoder, FramedRead},
-};
+use tokio_util::io::ReaderStream;
 
 lazy_static! {
     static ref INDEXES: RwLock<HashSet<Hash>> = Default::default();
@@ -29,7 +27,7 @@ lazy_static! {
     static ref BLOBS: RwLock<HashSet<Hash>> = Default::default();
 }
 
-fn read_cache<P: AsRef<Path>>(path: P) {
+async fn read_cache<P: AsRef<Path>>(path: P) {
     let mut indexes = INDEXES.try_write().unwrap();
     let mut trees = TREES.try_write().unwrap();
     let mut blobs = BLOBS.try_write().unwrap();
@@ -63,12 +61,12 @@ fn read_cache<P: AsRef<Path>>(path: P) {
             );
             let hash = Hash::from(&name);
 
-            let Ok(file) = File::open(entry.path()) else {
+            let Ok(file) = File::open(entry.path()).await else {
                 continue;
             };
             let mut reader = BufReader::new(file);
-
-            let Some(Header { object_type, size }) = read_header_from_file(&mut reader) else {
+            
+            let Ok(Header { object_type, size }) = Header::read_from_async(&mut reader).await else {
                 panic!("Corrupt file {:?}", entry.path());
             };
 
@@ -124,7 +122,7 @@ impl From<std::io::Error> for ErrorResult {
     }
 }
 
-async fn read_body_to_file(
+async fn write_body_to_file(
     path: &PathBuf,
     hash: &Hash,
     object_type: ObjectType,
@@ -133,18 +131,17 @@ async fn read_body_to_file(
 ) -> Result<(), ErrorResult> {
     assert!(
         !path.exists(),
-        "Race condition. Someone else has somehow created this file before us"
+        "Race condition. Someone else has created this file before us"
     );
 
-    let file = File::create(path)?;
+    let header = Header::new(object_type, object_size);
+
+    let file = File::create(path).await?;
     let mut writer = BufWriter::new(file);
-
-    let prefix = get_object_prefix(object_type, object_size);
-
-    writer.write_all(prefix.as_bytes())?;
-
     let mut hasher = Sha512::new();
-    hasher.write_all(prefix.as_bytes())?;
+
+    header.write_to(&mut hasher)?;
+    header.write_to_async(&mut writer).await?;
 
     let mut length: u64 = 0;
 
@@ -155,12 +152,12 @@ async fn read_body_to_file(
         };
 
         hasher.write_all(&chunk)?;
-        writer.write_all(&chunk)?;
+        writer.write_all(&chunk).await?;
         length += chunk.len() as u64;
     }
 
     if object_size != length {
-        writer.flush()?;
+        writer.flush().await?;
         remove_file(path)?;
         return Err(ErrorResult::LengthDoesntMatch);
     }
@@ -169,7 +166,7 @@ async fn read_body_to_file(
 
     // the hashes don't match
     if *hash != new_hash {
-        writer.flush()?;
+        writer.flush().await?;
         remove_file(path)?;
         return Err(ErrorResult::HashDoesntMatch);
     }
@@ -219,68 +216,12 @@ async fn put_object(
     let data_stream = request.into_body().into_data_stream();
 
     if let Err(err) =
-        read_body_to_file(&object_path, &hash, object_type, object_size, data_stream).await
+        write_body_to_file(&object_path, &hash, object_type, object_size, data_stream).await
     {
         return Err(err.get_response());
     }
 
     Ok(StatusCode::CREATED)
-}
-
-#[derive(Copy, Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash, Default)]
-pub struct TestCodec(Option<Header>);
-
-impl TestCodec {
-    /// Creates a new `BytesCodec` for shipping around raw bytes.
-    pub fn new() -> TestCodec {
-        TestCodec(None)
-    }
-}
-
-impl Decoder for TestCodec {
-    type Item = BytesMut;
-    type Error = tokio::io::Error;
-
-    fn decode(&mut self, buf: &mut BytesMut) -> Result<Option<BytesMut>, tokio::io::Error> {
-        if self.0 == None {
-            if buf.is_empty() {
-                return Err(tokio::io::Error::new(
-                    std::io::ErrorKind::Other,
-                    "No data was avaliable to read the object header from",
-                ));
-            }
-
-            let Some(index) = buf.iter().position(|v| *v == 0) else {
-                return Err(tokio::io::Error::new(
-                    std::io::ErrorKind::Other,
-                    "First file slice did not contain object header",
-                ));
-            };
-
-            let Some(value) = read_header_from_slice(&buf[..index]) else {
-                return Err(tokio::io::Error::new(
-                    std::io::ErrorKind::Other,
-                    "Invalid object header in start of file",
-                ));
-            };
-
-            self.0 = Some(value);
-
-            buf.advance(index + 1);
-            // stupid hack :(
-            return Err(tokio::io::Error::new(
-                std::io::ErrorKind::Other,
-                "Not an error",
-            ));
-        }
-
-        if buf.is_empty() {
-            return Ok(None);
-        }
-
-        let len = buf.len();
-        Ok(Some(buf.split_to(len)))
-    }
 }
 
 #[debug_handler]
@@ -301,31 +242,15 @@ async fn get_object(
         ));
     }
 
-    let file = match tokio::fs::File::open(object_path).await {
-        Ok(v) => v,
-        Err(err) => return Err((StatusCode::INTERNAL_SERVER_ERROR, err.to_string())),
-    };
+    let file = tokio::fs::File::open(object_path).await.map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))?;
 
-    let mut stream = FramedRead::new(file, TestCodec::new());
-
-    // We call .next() on the stream to try and read out object header from the start of the file
-    stream.next().await;
-
-    let Some(Header {object_type, size}) = stream.decoder().0 else {
-        return Err((
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "Unable to read object header from file".into(),
-        ));
-    };
-
-    // we then have to call it again since reading the header required us return an Err() value
-    // since None will just continue reading. This however sets the read state machine to errored
-    // which requires another read to next() to reset and clear the None
-    // after which it finally becomes available for reading again.
-    // more info here: https://github.com/tokio-rs/tokio/blob/master/tokio-util/src/codec/framed_impl.rs#L129-L159
-    stream.next().await;
-
-    let s = Body::from_stream(stream);
+    let mut reader = BufReader::new(file);
+    let Header { object_type, size } = Header::read_from_async(&mut reader).await.map_err(|err| (StatusCode::BAD_REQUEST, err.to_string()))?;
+    
+    reader.rewind().await.map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, format!("Unable to read file: \"{err}\"")))?;
+    
+    let reader = ReaderStream::new(reader);
+    let s = Body::from_stream(reader);
     let mut response = Response::new(s);
 
     let headers = response.headers_mut();
@@ -345,7 +270,7 @@ async fn main() {
         create_dir(&cache_dir).expect("Cache directory to exist");
     }
 
-    read_cache(&cache_dir);
+    read_cache(&cache_dir).await;
 
     // build our application with a single route
     let app = Router::new()

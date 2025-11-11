@@ -84,7 +84,7 @@ impl Object for Index {
             Ok(())
         }
 
-        write_kv(&mut data, TREE_KEY, &self.tree.hash_string).expect("Write to work");
+        write_kv(&mut data, TREE_KEY, &self.tree.as_str()).expect("Write to work");
         write_kv(&mut data, TIMESTAMP_KEY, &self.timestamp.to_rfc3339()).expect("Write to work");
 
         for (key, value) in &self.metadata {
