@@ -2,12 +2,18 @@
 use chrono::{DateTime, Utc};
 use clap::{Parser, Subcommand};
 use common::{
-    BLOB_KEY, Hash, Header, INDEX_KEY, Mode, ObjectType, TREE_KEY, archive::{Archive, ArchiveBody, ArchiveEntryData, ArchiveHeaderEntry, Compression, HEADER, RawEntryData, FileEntryData}, object_body::Object as OtherObject, read_object_into_headers, read_header_and_body, read_header_from_file, read_header_from_slice
+    archive::{
+        Archive, ArchiveBody, ArchiveEntryData, ArchiveHeaderEntry, Compression, FileEntryData,
+        RawEntryData, HEADER,
+    },
+    object_body::Object as OtherObject,
+    read_header_and_body, read_header_from_file, read_header_from_slice, read_object_into_headers,
+    Hash, Header, Mode, ObjectType, BLOB_KEY, INDEX_KEY, TREE_KEY,
 };
 use sha2::{Digest, Sha512};
 use std::{
     collections::HashMap,
-    fs::{File, create_dir, create_dir_all, read_dir},
+    fs::{create_dir, create_dir_all, read_dir, File},
     io::{BufRead, BufReader, BufWriter, Read, Write},
     ops::Deref,
     path::PathBuf,
@@ -744,8 +750,7 @@ fn pull_tree(cache: &PathBuf, url: &String, tree_hash: &Hash) {
 
     // tree already exists locally so we can skip downloading it
     if !tree_path.exists() {
-        let Some(Header { object_type, .. }) = download_object(&tree_hash, &tree_path, url)
-        else {
+        let Some(Header { object_type, .. }) = download_object(&tree_hash, &tree_path, url) else {
             eprintln!("Unable to download object with hash {tree_hash}");
             return;
         };
@@ -758,15 +763,13 @@ fn pull_tree(cache: &PathBuf, url: &String, tree_hash: &Hash) {
         .read_to_end(&mut index_data)
         .expect("file to be readable");
 
-    let (_, data) =
-        read_header_and_body(&index_data).expect("Index to be in the correct format");
+    let (_, data) = read_header_and_body(&index_data).expect("Index to be in the correct format");
 
     let index_body = common::object_body::Tree::from_data(data);
 
     for entry in index_body.contents {
         let obj_path = entry.hash.get_path(cache);
-        let Some(Header { object_type, .. }) = download_object(&entry.hash, &obj_path, url)
-        else {
+        let Some(Header { object_type, .. }) = download_object(&entry.hash, &obj_path, url) else {
             eprintln!("Unable to download object with hash {}", entry.hash);
             return;
         };
@@ -794,8 +797,7 @@ fn pull_cache(cache: &PathBuf, url: &String, hash: Hash) {
         .read_to_end(&mut index_data)
         .expect("file to be readable");
 
-    let (_, data) =
-        read_header_and_body(&index_data).expect("Index to be in the correct format");
+    let (_, data) = read_header_and_body(&index_data).expect("Index to be in the correct format");
 
     let index_body = common::object_body::Index::from_data(data);
 
@@ -891,7 +893,12 @@ fn download_object(hash: &Hash, file: &PathBuf, url: &String) -> Option<Header> 
     return Some(header);
 }
 
-fn pack_archive(cache: &PathBuf, path: &PathBuf, index_hash: &Hash, compression: Compression) -> anyhow::Result<()> {
+fn pack_archive(
+    cache: &PathBuf,
+    path: &PathBuf,
+    index_hash: &Hash,
+    compression: Compression,
+) -> anyhow::Result<()> {
     assert!(!path.exists());
     assert!(path.parent().map(|p| p.exists() && p.is_dir()) == Some(true));
 
@@ -983,9 +990,12 @@ fn unpack_archive(cache: &PathBuf, path: &PathBuf) -> anyhow::Result<()> {
         writer.write(&index_data)?;
     }
 
-    
-
-    for (header, entry) in archive.body.header.into_iter().zip(archive.body.entries.into_iter()) {
+    for (header, entry) in archive
+        .body
+        .header
+        .into_iter()
+        .zip(archive.body.entries.into_iter())
+    {
         let path = header.hash.get_path(cache);
         let _ = create_dir_all(path.parent().unwrap());
 
@@ -997,7 +1007,6 @@ fn unpack_archive(cache: &PathBuf, path: &PathBuf) -> anyhow::Result<()> {
 
     Ok(())
 }
-
 
 #[derive(Parser)]
 #[command(version, about, long_about = None)]
@@ -1077,15 +1086,13 @@ fn main() {
             validate,
         } => restore_directory(&cli.cache, &directory, index, validate),
         Commands::Cat { hash } => cat_object(&cli.cache, &hash),
-        Commands::Push { url, index } => {
-            push_cache(&cli.cache, &url, index)
-        }
+        Commands::Push { url, index } => push_cache(&cli.cache, &url, index),
         Commands::Pull { url, index } => pull_cache(&cli.cache, &url, index),
-        Commands::Pack { index, file , compression} => {
-            pack_archive(&cli.cache, &file, &index, compression).expect("Packing to work")
-        }
-        Commands::Unpack { file } => {
-            unpack_archive(&cli.cache, &file).expect("Packing to work")
-        }
+        Commands::Pack {
+            index,
+            file,
+            compression,
+        } => pack_archive(&cli.cache, &file, &index, compression).expect("Packing to work"),
+        Commands::Unpack { file } => unpack_archive(&cli.cache, &file).expect("Packing to work"),
     }
 }

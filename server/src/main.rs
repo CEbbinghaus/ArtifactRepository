@@ -1,90 +1,90 @@
 use axum::{
-    Router, body::{Body, BodyDataStream}, debug_handler, extract::{Path as AxumPath, Request, State}, http::{HeaderMap, HeaderValue, StatusCode}, response::Response, routing::{get, put}
+    body::Body,
+    debug_handler,
+    extract::{Path as AxumPath, Request, State},
+    http::{HeaderMap, StatusCode},
+    response::Response,
+    routing::{get, put},
+    Router,
 };
 use clap::Parser;
-use common::{Hash, Header, ObjectType, archive::{Archive, ArchiveBody, ArchiveHeaderEntry, FileEntryData, HEADER}, object_body::{Index, Object}, read_object_into_headers};
-use lazy_static::lazy_static;
-use sha2::{Digest, Sha512};
-use tower_http::compression::CompressionLayer;
-use std::{
-    collections::{HashMap, HashSet}, fs::{self, create_dir, remove_file}, io::Write, path::{Path, PathBuf}, sync::RwLock
+use common::{
+    store::{Store, StoreObject},
+    Hash, Header, ObjectType,
 };
-use tokio::{fs::File, io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt, BufReader, BufWriter}};
-use tokio_stream::StreamExt;
+use futures::TryStreamExt;
+use opendal::Operator;
+use std::{fs::create_dir, path::PathBuf};
+use tokio_util::compat::FuturesAsyncReadCompatExt;
 use tokio_util::io::ReaderStream;
-use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
+use tower_http::compression::CompressionLayer;
 
-lazy_static! {
-    static ref INDEXES: RwLock<HashSet<Hash>> = Default::default();
-    static ref TREES: RwLock<HashSet<Hash>> = Default::default();
-    static ref BLOBS: RwLock<HashSet<Hash>> = Default::default();
-}
+// lazy_static! {
+//     static ref INDEXES: RwLock<HashSet<Hash>> = Default::default();
+//     static ref TREES: RwLock<HashSet<Hash>> = Default::default();
+//     static ref BLOBS: RwLock<HashSet<Hash>> = Default::default();
+// }
 
-async fn read_cache<P: AsRef<Path>>(path: P) {
-    let mut indexes = INDEXES.try_write().unwrap();
-    let mut trees = TREES.try_write().unwrap();
-    let mut blobs = BLOBS.try_write().unwrap();
+// async fn read_cache(store: &Store) {
+//     let mut indexes = INDEXES.try_write().unwrap();
+//     let mut trees = TREES.try_write().unwrap();
+//     let mut blobs = BLOBS.try_write().unwrap();
 
-    let mut total_size: u128 = 0;
+//     store.
 
-    for entry in fs::read_dir(path).unwrap().filter_map(|x| x.ok()) {
-        let Ok(metadata) = entry.metadata() else {
-            continue;
-        };
+//     let mut total_size: u128 = 0;
 
-        if metadata.is_file() {
-            continue;
-        }
+//     for entry in fs::read_dir(path).unwrap().filter_map(|x| x.ok()) {
+//         let Ok(metadata) = entry.metadata() else {
+//             continue;
+//         };
 
-        let prefix = entry.file_name();
+//         if metadata.is_file() {
+//             continue;
+//         }
 
-        for entry in fs::read_dir(entry.path()).unwrap().filter_map(|x| x.ok()) {
-            let Ok(metadata) = entry.metadata() else {
-                continue;
-            };
+//         let prefix = entry.file_name();
 
-            if !metadata.is_file() {
-                continue;
-            }
+//         for entry in fs::read_dir(entry.path()).unwrap().filter_map(|x| x.ok()) {
+//             let Ok(metadata) = entry.metadata() else {
+//                 continue;
+//             };
 
-            let name = format!(
-                "{}{}",
-                prefix.to_string_lossy(),
-                entry.file_name().to_string_lossy()
-            );
-            let hash = Hash::try_from(name).expect("Valid Hash");
+//             if !metadata.is_file() {
+//                 continue;
+//             }
 
-            let Ok(file) = File::open(entry.path()).await else {
-                continue;
-            };
-            let mut reader = BufReader::new(file).compat();
-            
-            let Ok(Header { object_type, size }) = Header::read_from_async(&mut reader).await else {
-                panic!("Corrupt file {:?}", entry.path());
-            };
+//            let Ok(file) = File::open(entry.path()).await else {
+//                continue;
+//            };
+//            let mut reader = BufReader::new(file).compat();
 
-            total_size += size as u128;
+//             let Ok(Header { object_type, size }) = Header::read_from_async(&mut reader).await else {
+//                 panic!("Corrupt file {:?}", entry.path());
+//             };
 
-            match object_type {
-                common::ObjectType::Blob => &mut blobs,
-                common::ObjectType::Tree => &mut trees,
-                common::ObjectType::Index => &mut indexes,
-            }
-            .insert(hash);
-        }
-    }
+//             total_size += size as u128;
 
-    println!("Loaded {} blobs", blobs.len());
-    println!("Loaded {} trees", trees.len());
-    println!("Loaded {} indexes", indexes.len());
-    println!("Total Size: {} bytes", total_size);
+//             match object_type {
+//                 common::ObjectType::Blob => &mut blobs,
+//                 common::ObjectType::Tree => &mut trees,
+//                 common::ObjectType::Index => &mut indexes,
+//             }
+//             .insert(hash);
+//         }
+//     }
 
-    indexes.iter().for_each(|i| println!("Index {i}"));
-}
+//     println!("Loaded {} blobs", blobs.len());
+//     println!("Loaded {} trees", trees.len());
+//     println!("Loaded {} indexes", indexes.len());
+//     println!("Total Size: {} bytes", total_size);
+
+//     indexes.iter().for_each(|i| println!("Index {i}"));
+// }
 
 #[derive(Clone)]
 struct ServerState {
-    cache_path: PathBuf,
+    store: Store,
 }
 
 enum ErrorResult {
@@ -115,78 +115,72 @@ impl From<std::io::Error> for ErrorResult {
     }
 }
 
-async fn write_body_to_file(
-    path: &PathBuf,
-    hash: &Hash,
-    object_type: ObjectType,
-    object_size: u64,
-    mut body: BodyDataStream,
-) -> Result<(), ErrorResult> {
-    assert!(
-        !path.exists(),
-        "Race condition. Someone else has created this file before us"
-    );
+// async fn write_body_to_file(
+//     path: &PathBuf,
+//     hash: &Hash,
+//     object_type: ObjectType,
+//     object_size: u64,
+//     mut body: BodyDataStream,
+// ) -> Result<(), ErrorResult> {
+//     assert!(
+//         !path.exists(),
+//         "Race condition. Someone else has created this file before us"
+//     );
 
-    let header = Header::new(object_type, object_size);
+//     let header = Header::new(object_type, object_size);
 
-    let file = File::create(path).await?;
-    let mut writer = BufWriter::new(file).compat_write();
-    let mut hasher = Sha512::new();
+// let file = File::create(path).await?;
+// let mut writer = BufWriter::new(file).compat_write();
+// let mut hasher = Sha512::new();
 
-    header.write_to(&mut hasher)?;
-    header.write_to_async(&mut writer).await?;
+//     header.write_to(&mut hasher)?;
+//     header.write_to_async(&mut writer).await?;
 
-    let mut writer = writer.into_inner();
+// let mut writer = writer.into_inner();
 
-    let mut length: u64 = 0;
+// let mut length: u64 = 0;
 
-    while let Some(chunk) = body.next().await {
-        let chunk = match chunk {
-            Ok(v) => v,
-            Err(err) => return Err(ErrorResult::InternalError(err.to_string())),
-        };
+//     while let Some(chunk) = body.next().await {
+//         let chunk = match chunk {
+//             Ok(v) => v,
+//             Err(err) => return Err(ErrorResult::InternalError(err.to_string())),
+//         };
 
-        hasher.write_all(&chunk)?;
-        writer.write_all(&chunk).await?;
-        length += chunk.len() as u64;
-    }
+//         hasher.write_all(&chunk)?;
+//         writer.write_all(&chunk).await?;
+//         length += chunk.len() as u64;
+//     }
 
-    if object_size != length {
-        writer.flush().await?;
-        remove_file(path)?;
-        return Err(ErrorResult::LengthDoesntMatch);
-    }
+//     if object_size != length {
+//         writer.flush().await?;
+//         remove_file(path)?;
+//         return Err(ErrorResult::LengthDoesntMatch);
+//     }
 
-    let new_hash = Hash::from(hasher);
+//     let new_hash = Hash::from(hasher);
 
-    // the hashes don't match
-    if *hash != new_hash {
-        writer.flush().await?;
-        remove_file(path)?;
-        return Err(ErrorResult::HashDoesntMatch);
-    }
+//     // the hashes don't match
+//     if *hash != new_hash {
+//         writer.flush().await?;
+//         remove_file(path)?;
+//         return Err(ErrorResult::HashDoesntMatch);
+//     }
 
-    Ok(())
-}
+//     Ok(())
+// }
 
 #[debug_handler]
 async fn put_object(
     AxumPath(object_hash): AxumPath<Hash>,
-    State(state): State<ServerState>,
+    State(ServerState { store }): State<ServerState>,
     headers: HeaderMap,
     request: Request<Body>,
 ) -> Result<StatusCode, (StatusCode, String)> {
-    let object_path = object_hash.get_path(&state.cache_path);
-
-    if object_path.exists() {
-        return Err((StatusCode::OK, "Object already exists".into()));
-    }
-
-    let Some(parent) = object_path.parent() else {
-        return Err((StatusCode::INTERNAL_SERVER_ERROR, "Impossible state".into()));
-    };
-
-    create_dir(parent).map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    match store.exists(&object_hash).await {
+        Ok(true) => Ok(()),
+        Ok(false) => Err((StatusCode::OK, "Object already exists".into())),
+        Err(err) => Err((StatusCode::INTERNAL_SERVER_ERROR, err.to_string())),
+    }?;
 
     let Some(object_type) = headers.get("Object-Type").and_then(|v| v.to_str().ok()) else {
         return Err((StatusCode::BAD_REQUEST, "Missing Object-Type Header".into()));
@@ -204,13 +198,18 @@ async fn put_object(
         return Err((StatusCode::BAD_REQUEST, "Invalid Object-Size Header".into()));
     };
 
+    let header = Header::new(object_type, object_size);
+
     let data_stream = request.into_body().into_data_stream();
 
-    if let Err(err) =
-        write_body_to_file(&object_path, &object_hash, object_type, object_size, data_stream).await
-    {
-        return Err(err.get_response());
-    }
+    let buffered_reader = data_stream.map_err(std::io::Error::other).into_async_read();
+
+    let store_object = StoreObject::new_with_header(header, buffered_reader);
+
+    store
+        .put_object(&object_hash, store_object)
+        .await
+        .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))?;
 
     Ok(StatusCode::CREATED)
 }
@@ -218,115 +217,112 @@ async fn put_object(
 #[debug_handler]
 async fn get_object(
     AxumPath(object_hash): AxumPath<Hash>,
-    State(state): State<ServerState>,
+    State(ServerState { store }): State<ServerState>,
 ) -> Result<Response<Body>, (StatusCode, String)> {
-    let object_path = object_hash.get_path(&state.cache_path);
-
-    if !object_path.exists() {
-        return Err((
+    let store_object = store.get_object(&object_hash).await.map_err(|_| {
+        (
             StatusCode::NO_CONTENT,
             "No object with this hash exists".into(),
-        ));
-    }
+        )
+    })?;
 
-    let file = tokio::fs::File::open(object_path).await.map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))?;
+    let header = store_object.header();
+    let object_type = header.object_type;
+    let size = header.size;
 
-    let mut reader = BufReader::new(file).compat();
-    let Header { object_type, size } = Header::read_from_async(&mut reader).await.map_err(|err| (StatusCode::BAD_REQUEST, err.to_string()))?;
-
-    let mut reader = reader.into_inner();
-    reader.rewind().await.map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, format!("Unable to read file: \"{err}\"")))?;
-    
-    let reader = ReaderStream::new(reader);
-    let s = Body::from_stream(reader);
-    let mut response = Response::new(s);
+    let reader_stream = ReaderStream::new(store_object.compat());
+    let mut response = Response::new(Body::from_stream(reader_stream));
 
     let headers = response.headers_mut();
     headers.insert("Object-Type", object_type.to_str().parse().unwrap());
     headers.insert("Object-Size", size.to_string().parse().unwrap());
 
-    return Ok(response);
+    Ok(response)
 }
 
-#[debug_handler]
-async fn get_bundle(
-    AxumPath(index_hash): AxumPath<Hash>,
-    State(ServerState { cache_path }): State<ServerState>,
-) -> Result<Response<Body>, (StatusCode, String)> {
-    let object_path = index_hash.get_path(&cache_path);
+// #[debug_handler]
+// async fn get_bundle(
+//     AxumPath(index_hash): AxumPath<Hash>,
+//     State(ServerState { store }): State<ServerState>,
+// ) -> Result<Response<Body>, (StatusCode, String)> {
+//     // let object_path = index_hash.get_path(&cache_path);
 
-    if !object_path.exists() {
-        return Err((
-            StatusCode::NO_CONTENT,
-            "No object with this hash exists".into(),
-        ));
-    }
+//     let index_object = store.get_object(&index_hash).await;
 
-    let file = tokio::fs::File::open(object_path).await.map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))?;
- 
-    let mut reader = BufReader::new(file).compat();
-    let header = Header::read_from_async(&mut reader).await.map_err(|err| (StatusCode::BAD_REQUEST, err.to_string()))?;
+//     let Ok(index_object) = index_object else {
+//         return Err((
+//             StatusCode::NO_CONTENT,
+//             "No object with this hash exists".into(),
+//         ));
+//     };
 
-    let mut reader = reader.into_inner();
+//     let header = index_object.header();
+//     if header.object_type != ObjectType::Index {
+//         return Err((
+//             StatusCode::BAD_REQUEST,
+//             "Object requested is not an index".into(),
+//         ));
+//     }
 
-    if header.object_type != ObjectType::Index {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            "Object requested is not an index".into()
-        ))
-    }
+//     let index = Index::from_data(&index_object.to_data());
 
-    reader.seek(std::io::SeekFrom::Start((header.to_string().len() ) as u64)).await.map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))?;
+//     let mut headers = HashMap::new();
 
-    let mut index_data = Vec::new();
-    reader.read_to_end(&mut index_data).await.map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))?;
+//     let _ = read_object_into_headers(&cache_path, &mut headers, &index.tree);
 
-    let index = Index::from_data(&index_data);
+//     //TODO: Surely there is an algorithm to more efficiently lay out this data
+//     let mut i = 0;
+//     let mut header_entries: Vec<ArchiveHeaderEntry> = Vec::new();
 
-    let mut headers = HashMap::new();
+//     for (hash, header) in &headers {
+//         let prefix_length = header.to_string().len() as u64;
+//         let total_length = header.size + prefix_length;
 
-    let _ = read_object_into_headers(&cache_path, &mut headers, &index.tree);
+//         header_entries.push(ArchiveHeaderEntry {
+//             hash: hash.clone(),
+//             index: i,
+//             length: total_length,
+//         });
 
-    //TODO: Surely there is an algorithm to more efficiently lay out this data
-    let mut i = 0;
-    let mut header_entries: Vec<ArchiveHeaderEntry> = Vec::new();
+//         i += total_length;
+//     }
 
-    for (hash, header) in &headers {
-        let prefix_length = header.to_string().len() as u64;
-        let total_length = header.size + prefix_length;
+//     let archive = Archive {
+//         header: HEADER,
+//         compression: common::archive::Compression::None,
+//         hash: index_hash.clone(),
+//         index: index,
+//         body: ArchiveBody {
+//             header: header_entries,
+//             entries: headers
+//                 .into_iter()
+//                 .map(|(hash, _header)| FileEntryData(hash.get_path(&cache_path)))
+//                 .collect(),
+//         },
+//     };
 
-        header_entries.push(ArchiveHeaderEntry {
-            hash: hash.clone(),
-            index: i,
-            length: total_length,
-        });
+//     let mut body = Vec::new();
 
-        i += total_length;
-    }
+//     archive
+//         .to_data(&mut body)
+//         .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))?;
 
+//     let mut response = Response::new(body.into());
+//     let headers = response.headers_mut();
+//     headers.insert(
+//         "Content-Type",
+//         HeaderValue::from_str("application/arc").unwrap(),
+//     );
+//     headers.insert(
+//         "Content-Disposition",
+//         HeaderValue::from_str(&format!(
+//             "Content-Disposition: attachment; filename=\"{index_hash}.ar\""
+//         ))
+//         .unwrap(),
+//     );
 
-    let archive = Archive {
-        header: HEADER,
-        compression: common::archive::Compression::None,
-        hash: index_hash.clone(),
-        index: index,
-        body: ArchiveBody {
-            header: header_entries,
-            entries: headers.into_iter().map(|(hash, _header)| FileEntryData(hash.get_path(&cache_path))).collect()
-        }
-    };
-
-    let mut body = Vec::new();
-
-    archive.to_data(&mut body).map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))?;
-
-    let mut response = Response::new(body.into());
-    let headers = response.headers_mut();
-    headers.insert("Content-Type", HeaderValue::from_str("application/arc").unwrap());
-    headers.insert("Content-Disposition", HeaderValue::from_str(&format!("Content-Disposition: attachment; filename=\"{index_hash}.ar\"")).unwrap());
-
-    return Ok(response);
-}
+//     return Ok(response);
+// }
 
 #[derive(Parser)]
 #[clap(version, about, long_about = None)]
@@ -343,14 +339,18 @@ pub struct Cli {
 
 #[tokio::main]
 async fn main() {
-
-    let Cli { store, port, ..} = Cli::parse();
+    let Cli { store, port, .. } = Cli::parse();
 
     if !store.exists() {
         create_dir(&store).expect("Cache directory to exist");
     }
 
-    read_cache(&store).await;
+    let store = opendal::services::Fs::default()
+        .root(store.to_str().expect("Path to be valid utf8 string"));
+
+    let operator = Operator::new(store).unwrap().finish();
+
+    // read_cache(&store).await;
 
     let comression_layer: CompressionLayer = CompressionLayer::new()
         .br(true)
@@ -362,14 +362,16 @@ async fn main() {
     let app = Router::new()
         .route("/object/{object_id}", put(put_object))
         .route("/object/{object_id}", get(get_object))
-        .route("/bundle/{index_id}", get(get_bundle))
+        // .route("/bundle/{index_id}", get(get_bundle))
         .with_state(ServerState {
-            cache_path: store,
+            store: Store::new(operator),
         })
         .layer(comression_layer)
         .route("/", get(|| async { "Hello, World!" }));
 
-    let listener = tokio::net::TcpListener::bind(("0.0.0.0", port)).await.unwrap();
+    let listener = tokio::net::TcpListener::bind(("0.0.0.0", port))
+        .await
+        .unwrap();
 
     println!("Listening at http://{}", listener.local_addr().unwrap());
     axum::serve(listener, app).await.unwrap();

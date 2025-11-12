@@ -1,21 +1,25 @@
 use std::{
-    collections::HashMap, fs::File, io::{BufRead, BufReader, Read, Write}, path::PathBuf, str::from_utf8
+    collections::HashMap,
+    fs::File,
+    io::{BufRead, BufReader, Read, Write},
+    path::PathBuf,
+    str::from_utf8,
 };
 
 pub use crate::constants::{BLOB_KEY, INDEX_KEY, TREE_KEY};
 pub use crate::hash::Hash;
 pub use crate::header::Header;
-use crate::object_body::{Object as ObjectTrait};
-pub use crate::primitives::{Mode, ObjectType};
 pub use crate::object::Object;
+use crate::object_body::Object as ObjectTrait;
+pub use crate::primitives::{Mode, ObjectType};
 
-mod object;
+pub mod archive;
 mod constants;
 mod hash;
 mod header;
-mod primitives;
+mod object;
 pub mod object_body;
-pub mod archive;
+mod primitives;
 pub mod store;
 
 pub fn read_slice_until_byte<'a>(data: &'a [u8], byte: u8) -> Option<&'a [u8]> {
@@ -42,7 +46,10 @@ pub fn read_header_from_slice(slice: &[u8]) -> Option<Header> {
 
     let (object_type, size) = string.split_once(' ')?;
 
-    Some(Header::new(ObjectType::from_str(object_type)?, size.parse().ok()?))
+    Some(Header::new(
+        ObjectType::from_str(object_type)?,
+        size.parse().ok()?,
+    ))
 }
 
 pub fn read_header_from_file(reader: &mut BufReader<File>) -> Option<Header> {
@@ -97,7 +104,7 @@ pub fn pipe<'a, 'b>(reader: &'a mut dyn Read, writer: &'b mut dyn Write) -> anyh
     let mut buffer: [u8; 1024] = [0; 1024];
     loop {
         let read = reader.read(&mut buffer)?;
-        
+
         if read == 0 {
             break;
         }

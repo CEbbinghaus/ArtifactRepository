@@ -4,8 +4,8 @@ use serde::{Deserialize, Deserializer, Serialize};
 use sha2::digest::FixedOutput;
 
 use sha2::Sha512;
-use std::path::PathBuf;
 use std::fmt::{self, Debug, Display};
+use std::path::PathBuf;
 use std::str::FromStr;
 // use std::hash::Hash;
 
@@ -22,9 +22,9 @@ impl Hash {
         (&self.hash_string[..2], &self.hash_string[2..])
     }
 
-	pub fn as_str(&self) -> &str {
-		&self.hash_string
-	}
+    pub fn as_str(&self) -> &str {
+        &self.hash_string
+    }
 
     pub fn from_string(value: &String) -> Option<Self> {
         let value = value.as_str();
@@ -62,12 +62,9 @@ impl Hash {
             return None;
         }
 
-        Some(Self::try_from(
-            directory.to_str()?.to_owned() + filename.to_str()?,
-        ).ok()?)
+        Some(Self::try_from(directory.to_str()?.to_owned() + filename.to_str()?).ok()?)
     }
 }
-
 
 impl std::hash::Hash for Hash {
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
@@ -96,7 +93,9 @@ impl TryFrom<String> for Hash {
 
     fn try_from(value: String) -> Result<Self, Self::Error> {
         if value.len() != 128 {
-            return Err(anyhow!("Invalid length. Hash has to be 128 characters long"));
+            return Err(anyhow!(
+                "Invalid length. Hash has to be 128 characters long"
+            ));
         }
 
         let mut hash = [0u8; 64];
@@ -104,7 +103,7 @@ impl TryFrom<String> for Hash {
 
         Ok(Self {
             hash,
-            hash_string: value
+            hash_string: value,
         })
     }
 }
@@ -114,7 +113,9 @@ impl TryFrom<&str> for Hash {
 
     fn try_from(value: &str) -> Result<Self, Self::Error> {
         if value.len() != 128 {
-            return Err(anyhow!("Invalid length. Hash has to be 128 characters long"));
+            return Err(anyhow!(
+                "Invalid length. Hash has to be 128 characters long"
+            ));
         }
 
         let mut hash = [0u8; 64];
@@ -129,7 +130,7 @@ impl TryFrom<&str> for Hash {
 
 impl TryFrom<&[u8]> for Hash {
     type Error = anyhow::Error;
-    
+
     fn try_from(value: &[u8]) -> Result<Self, Self::Error> {
         if value.len() != 64 {
             return Err(anyhow!("Invalid length. Slice must be 64 bytes long"));
@@ -170,8 +171,6 @@ impl Display for Hash {
     }
 }
 
-
-
 impl<'de> Deserialize<'de> for Hash {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
@@ -187,17 +186,20 @@ impl<'de> Deserialize<'de> for Hash {
             }
 
             fn visit_string<E>(self, value: String) -> Result<Self::Value, E>
-                where
-                    E: serde::de::Error, {
-                
+            where
+                E: serde::de::Error,
+            {
                 if value.len() != 128 {
-                    return Err(de::Error::invalid_length(value.len(), &"A hex string with 128 characters"));
+                    return Err(de::Error::invalid_length(
+                        value.len(),
+                        &"A hex string with 128 characters",
+                    ));
                 }
 
                 value.try_into().map_err(de::Error::custom)
             }
         }
-        
-        deserializer.deserialize_string( HashVisitor)
+
+        deserializer.deserialize_string(HashVisitor)
     }
 }

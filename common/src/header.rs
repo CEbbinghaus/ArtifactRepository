@@ -1,7 +1,10 @@
-use std::{io::{Read, Write}, str::from_utf8};
+use std::{
+    io::{Read, Write},
+    str::from_utf8,
+};
 
-use anyhow::{Result, anyhow};
-use futures::{AsyncBufRead, AsyncRead, AsyncReadExt, AsyncSeek, AsyncSeekExt, AsyncWrite, AsyncWriteExt};
+use anyhow::{anyhow, Result};
+use futures::{AsyncRead, AsyncReadExt, AsyncSeek, AsyncSeekExt, AsyncWrite, AsyncWriteExt};
 
 use crate::ObjectType;
 
@@ -20,7 +23,10 @@ impl Header {
         format!("{} {}\0", self.object_type.to_str(), self.size)
     }
 
-    pub async fn write_to_async(&self, writer: &mut (impl AsyncWrite + std::marker::Unpin)) -> Result<(), std::io::Error> {
+    pub async fn write_to_async(
+        &self,
+        writer: &mut (impl AsyncWrite + std::marker::Unpin),
+    ) -> Result<(), std::io::Error> {
         writer.write_all(self.to_string().as_bytes()).await
     }
 
@@ -43,10 +49,14 @@ impl Header {
     }
 
     pub fn from_str(string: &str) -> Result<Self> {
-        let (object_type, size) = string.split_once(' ').ok_or(anyhow!("Invalid Header: missing space ' ' character"))?;
+        let (object_type, size) = string
+            .split_once(' ')
+            .ok_or(anyhow!("Invalid Header: missing space ' ' character"))?;
 
         Ok(Header::new(
-            ObjectType::from_str(object_type).ok_or(anyhow!("Invalid Header: Invalid ObjectType \"{object_type}\""))?,
+            ObjectType::from_str(object_type).ok_or(anyhow!(
+                "Invalid Header: Invalid ObjectType \"{object_type}\""
+            ))?,
             size.parse()?,
         ))
     }
@@ -62,7 +72,9 @@ impl Header {
         Self::from_data(&buffer)
     }
 
-    pub async fn read_from_async(reader: &mut (impl AsyncRead + AsyncSeek + std::marker::Unpin)) -> Result<Self> {
+    pub async fn read_from_async(
+        reader: &mut (impl AsyncRead + AsyncSeek + std::marker::Unpin),
+    ) -> Result<Self> {
         let mut buffer = [0u8; 32];
         let bytes_read = reader.read(&mut buffer).await?;
 
@@ -76,7 +88,9 @@ impl Header {
         let null_position = buffer.iter().position(|x| *x == 0).unwrap_or(buffer.len());
         let buffer = &buffer[..null_position];
 
-        reader.seek(std::io::SeekFrom::Start(null_position as u64)).await?;
+        reader
+            .seek(std::io::SeekFrom::Start(null_position as u64))
+            .await?;
 
         Self::from_data(&buffer)
     }
@@ -84,11 +98,11 @@ impl Header {
     pub fn read_from(reader: &mut impl Read) -> Result<Self> {
         let mut buffer = [0u8; 32];
         let bytes_read = reader.read(&mut buffer)?;
-        
+
         if bytes_read == 0 {
             return Err(anyhow!("Invalid Header: No Data"));
         }
-        
+
         let buffer = &buffer[..bytes_read];
         Self::from_buf(&buffer)
     }
