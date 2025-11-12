@@ -1,23 +1,116 @@
-use anyhow::Result;
-use crate::{Hash, Object};
+use crate::{header, Hash, Header};
+use anyhow::{anyhow, Result};
+use futures::io::copy;
+use futures::{AsyncBufRead, AsyncRead, AsyncSeek, AsyncWriteExt};
+use futures::{AsyncReadExt, AsyncSeekExt};
+use opendal::{FuturesAsyncReader, Operator};
 
-
-pub trait Store {
-	fn get_object(&self, hash: &Hash) -> Option<Object>;
-
-	fn put_object(&mut self, hash: &Hash, object: &Object) -> Result<()>;
+pub struct StoreObject<T>
+where
+    T: AsyncBufRead + AsyncRead + Unpin + AsyncSeek,
+{
+    header: Header,
+    body: T,
 }
 
-pub struct InMemoryStore {
+impl<T> StoreObject<T>
+where
+    T: AsyncBufRead + AsyncRead + Unpin + AsyncSeek,
+{
+    pub async fn new(mut reader: T) -> Result<Self> {
+        let mut buffer = [0u8; 32];
+        let bytes_read = reader.read(&mut buffer).await?;
+        let data = &buffer[..bytes_read];
 
+        let Some(header_end) = data.iter().position(|x| *x == 0) else {
+            return Err(anyhow!(
+                "Invalid header. No null byte in the first 32 bytes"
+            ));
+        };
+        let header = Header::from_data(&data[..header_end])?;
+        reader
+            .seek(std::io::SeekFrom::Start(header_end as u64))
+            .await?;
+
+        Ok(Self {
+            header,
+            body: reader,
+        })
+    }
+
+    pub fn new_with_header(header: Header, reader: T) -> Self {
+        Self {
+            header,
+            body: reader,
+        }
+    }
 }
 
-impl Store for InMemoryStore {
-	fn get_object(&self, _hash: &Hash) -> Option<Object> {
-		todo!()
-	}
+impl<T> AsyncRead for StoreObject<T>
+where
+    T: AsyncBufRead + AsyncRead + Unpin + AsyncSeek,
+{
+    fn poll_read(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut [u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        let body = unsafe { self.map_unchecked_mut(|s| &mut s.body) };
+        body.poll_read(cx, buf)
+    }
+}
 
-	fn put_object(&mut self, _hash: &Hash, _object: &Object) -> Result<()> {
-		todo!()
-	}
+impl<T> AsyncBufRead for StoreObject<T>
+where
+    T: AsyncBufRead + AsyncRead + Unpin + AsyncSeek,
+{
+    fn poll_fill_buf(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<&[u8]>> {
+        let body = unsafe { self.map_unchecked_mut(|s| &mut s.body) };
+        body.poll_fill_buf(cx)
+    }
+
+    fn consume(self: std::pin::Pin<&mut Self>, amt: usize) {
+        let body = unsafe { self.map_unchecked_mut(|s| &mut s.body) };
+        body.consume(amt);
+    }
+}
+
+pub struct Store {
+    operator: Operator,
+}
+
+impl Store {
+    async fn get_object(&self, hash: &Hash) -> Result<StoreObject<FuturesAsyncReader>> {
+        let mut reader = self
+            .operator
+            .reader(hash.as_str())
+            .await?
+            .into_futures_async_read(..)
+            .await?;
+
+        let header = Header::read_from_async(&mut reader).await?;
+
+        Ok(StoreObject::new_with_header(header, reader))
+    }
+
+    async fn put_object<T>(&mut self, hash: &Hash, mut object: StoreObject<T>) -> Result<()>
+    where
+        T: AsyncBufRead + AsyncRead + Unpin + AsyncSeek,
+    {
+        let mut writer = self
+            .operator
+            .writer(hash.as_str())
+            .await?
+            .into_futures_async_write();
+
+		object.header.write_to_async(&mut writer).await?;
+		copy(&mut object.body, &mut writer).await?;
+
+		writer.close().await?;
+
+		Ok(())
+    }
 }

@@ -12,6 +12,7 @@ use std::{
 use tokio::{fs::File, io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt, BufReader, BufWriter}};
 use tokio_stream::StreamExt;
 use tokio_util::io::ReaderStream;
+use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
 
 lazy_static! {
     static ref INDEXES: RwLock<HashSet<Hash>> = Default::default();
@@ -56,7 +57,7 @@ async fn read_cache<P: AsRef<Path>>(path: P) {
             let Ok(file) = File::open(entry.path()).await else {
                 continue;
             };
-            let mut reader = BufReader::new(file);
+            let mut reader = BufReader::new(file).compat();
             
             let Ok(Header { object_type, size }) = Header::read_from_async(&mut reader).await else {
                 panic!("Corrupt file {:?}", entry.path());
@@ -129,11 +130,13 @@ async fn write_body_to_file(
     let header = Header::new(object_type, object_size);
 
     let file = File::create(path).await?;
-    let mut writer = BufWriter::new(file);
+    let mut writer = BufWriter::new(file).compat_write();
     let mut hasher = Sha512::new();
 
     header.write_to(&mut hasher)?;
     header.write_to_async(&mut writer).await?;
+
+    let mut writer = writer.into_inner();
 
     let mut length: u64 = 0;
 
@@ -228,9 +231,10 @@ async fn get_object(
 
     let file = tokio::fs::File::open(object_path).await.map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))?;
 
-    let mut reader = BufReader::new(file);
+    let mut reader = BufReader::new(file).compat();
     let Header { object_type, size } = Header::read_from_async(&mut reader).await.map_err(|err| (StatusCode::BAD_REQUEST, err.to_string()))?;
-    
+
+    let mut reader = reader.into_inner();
     reader.rewind().await.map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, format!("Unable to read file: \"{err}\"")))?;
     
     let reader = ReaderStream::new(reader);
@@ -259,10 +263,12 @@ async fn get_bundle(
     }
 
     let file = tokio::fs::File::open(object_path).await.map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))?;
-
-    let mut reader = BufReader::new(file);
+ 
+    let mut reader = BufReader::new(file).compat();
     let header = Header::read_from_async(&mut reader).await.map_err(|err| (StatusCode::BAD_REQUEST, err.to_string()))?;
-    
+
+    let mut reader = reader.into_inner();
+
     if header.object_type != ObjectType::Index {
         return Err((
             StatusCode::BAD_REQUEST,
