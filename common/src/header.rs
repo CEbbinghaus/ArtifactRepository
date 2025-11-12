@@ -1,7 +1,7 @@
 use std::{io::{Read, Write}, str::from_utf8};
 
 use anyhow::{Result, anyhow};
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use futures::{AsyncBufRead, AsyncRead, AsyncReadExt, AsyncSeek, AsyncSeekExt, AsyncWrite, AsyncWriteExt};
 
 use crate::ObjectType;
 
@@ -62,7 +62,7 @@ impl Header {
         Self::from_data(&buffer)
     }
 
-    pub async fn read_from_async(reader: &mut (impl AsyncRead + std::marker::Unpin)) -> Result<Self> {
+    pub async fn read_from_async(reader: &mut (impl AsyncRead + AsyncSeek + std::marker::Unpin)) -> Result<Self> {
         let mut buffer = [0u8; 32];
         let bytes_read = reader.read(&mut buffer).await?;
 
@@ -71,7 +71,14 @@ impl Header {
         }
 
         let buffer = &buffer[..bytes_read];
-        Self::from_buf(&buffer)
+
+        // Find the null marker of the header. If its not available then we just gotta assume the whole buffer is a valid utf8 header
+        let null_position = buffer.iter().position(|x| *x == 0).unwrap_or(buffer.len());
+        let buffer = &buffer[..null_position];
+
+        reader.seek(std::io::SeekFrom::Start(null_position as u64)).await?;
+
+        Self::from_data(&buffer)
     }
 
     pub fn read_from(reader: &mut impl Read) -> Result<Self> {
