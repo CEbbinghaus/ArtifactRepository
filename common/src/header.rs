@@ -76,7 +76,8 @@ impl Header {
         let null_position = buffer.iter().position(|x| *x == 0).unwrap_or(buffer.len());
         let buffer = &buffer[..null_position];
 
-        reader.seek(std::io::SeekFrom::Start(null_position as u64)).await?;
+        // We set the reader position to after the null byte so the body doesn't contain it
+        reader.seek(std::io::SeekFrom::Start(null_position as u64 + 1)).await?;
 
         Self::from_data(&buffer)
     }

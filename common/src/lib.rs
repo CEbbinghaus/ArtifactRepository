@@ -2,10 +2,12 @@ use std::{
     collections::HashMap, fs::File, io::{BufRead, BufReader, Read, Write}, path::PathBuf, str::from_utf8
 };
 
+use futures::AsyncReadExt;
+
 pub use crate::constants::{BLOB_KEY, INDEX_KEY, TREE_KEY};
 pub use crate::hash::Hash;
 pub use crate::header::Header;
-use crate::object_body::{Object as ObjectTrait};
+use crate::{object_body::Object as ObjectTrait, store::Store};
 pub use crate::primitives::{Mode, ObjectType};
 pub use crate::object::Object;
 
@@ -52,42 +54,40 @@ pub fn read_header_from_file(reader: &mut BufReader<File>) -> Option<Header> {
     read_header_from_slice(&vec[..vec.len() - 1])
 }
 
-pub fn read_object_into_headers(
-    cache: &PathBuf,
+pub async fn read_object_into_headers(
+    store: &Store,
     headers: &mut HashMap<Hash, Header>,
     object_hash: &Hash,
 ) -> anyhow::Result<()> {
-    let object_path = object_hash.get_path(&cache);
-    assert!(object_path.exists());
+    let mut stack = vec![object_hash.clone()];
 
-    // We assume that if our hash already exists, We probably have already collected all children
-    if headers.contains_key(object_hash) {
-        return Ok(());
-    }
+    while let Some(current_hash) = stack.pop() {
+        if headers.contains_key(&current_hash) {
+            continue;
+        }
 
-    let file = File::open(object_path).expect("file to exist");
-    let mut reader = BufReader::new(file);
-    let mut data = Vec::new();
-    let bytes_read = reader
-        .read_until(0, &mut data)
-        .expect("File to be readable");
+        let mut object = store.get_object(&current_hash).await?;
 
-    let header =
-        read_header_from_slice(&data[..bytes_read - 1]).expect("File to be correctly formatted");
-    assert!(header.object_type != ObjectType::Index);
+        if object.header.object_type == ObjectType::Index {
+            return Err(anyhow::anyhow!("Indexes cannot exist within a tree. Likely a hash collision 😳"));
+        }
 
-    headers.insert(object_hash.clone(), header.clone());
-    if header.object_type == ObjectType::Blob {
-        return Ok(());
-    }
+        headers.insert(current_hash.clone(), object.header.clone());
+        
+        if object.header.object_type == ObjectType::Blob {
+            continue;
+        }
 
-    reader.read_to_end(&mut data)?;
+        let mut data = Vec::new();
+        let bytes_read = object.read_to_end(&mut data).await?;
 
-    // println!("Reading Tree {object_hash}");
-    let tree = crate::object_body::Tree::from_data(&data[bytes_read..]);
+        assert!(bytes_read as u64 == object.header.size, "Read size must match header size");
+    
+        let tree = crate::object_body::Tree::from_data(&data);
 
-    for entry in &tree.contents {
-        read_object_into_headers(cache, headers, &entry.hash)?;
+        for entry in &tree.contents {
+            stack.push(entry.hash.clone());
+        }
     }
 
     Ok(())

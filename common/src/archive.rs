@@ -1,10 +1,21 @@
-use std::{fs::File, io::{BufRead, BufReader, Read, Write}, num::NonZero, path::PathBuf, str::FromStr};
+use std::{
+    fs::File,
+    io::{BufRead, BufReader, Read, Write},
+    num::NonZero,
+    path::PathBuf,
+    str::FromStr,
+};
 
-use anyhow::{Error, anyhow};
+use anyhow::{anyhow, Error};
+use bytes::Bytes;
+use futures::{AsyncRead, AsyncReadExt, Stream, TryStream};
 use sha2::{Digest, Sha512};
 
 use crate::{
-    Hash, Header, object_body::{Index, Object}, pipe, read_header_and_body
+    object_body::{Index, Object},
+    pipe,
+    store::Store,
+    Hash,
 };
 
 pub const HEADER: [u8; 4] = [b'a', b'r', b'x', b'a'];
@@ -27,7 +38,7 @@ impl FromStr for Compression {
             "gzip" => Ok(Compression::Gzip),
             "deflate" => Ok(Compression::Deflate),
             "lzma2" => Ok(Compression::LZMA2),
-            _ => Err(anyhow!("Invalid Compression Type"))
+            _ => Err(anyhow!("Invalid Compression Type")),
         }
     }
 }
@@ -71,21 +82,28 @@ where
         match self.compression {
             Compression::None => self.body.to_data(writer)?,
             Compression::Gzip => {
-                let mut gz_encoder = flate2::write::GzEncoder::new(writer, flate2::Compression::default());
+                let mut gz_encoder =
+                    flate2::write::GzEncoder::new(writer, flate2::Compression::default());
                 self.body.to_data(&mut gz_encoder)?;
                 gz_encoder.finish()?.flush()?;
-
-            },
+            }
             Compression::Deflate => {
-                let mut gz_encoder = flate2::write::DeflateEncoder::new(writer, flate2::Compression::default());
+                let mut gz_encoder =
+                    flate2::write::DeflateEncoder::new(writer, flate2::Compression::default());
                 self.body.to_data(&mut gz_encoder)?;
                 gz_encoder.finish()?.flush()?;
-            },
-            Compression::LZMA2 => self.body.to_data(&mut lzma_rust2::Lzma2WriterMt::new(
-                writer,
-                lzma_rust2::Lzma2Options { lzma_options: Default::default(), chunk_size: NonZero::new(1024 * 64) },
-                std::thread::available_parallelism().unwrap().get() as u32,
-            )?.auto_finish())?,
+            }
+            Compression::LZMA2 => self.body.to_data(
+                &mut lzma_rust2::Lzma2WriterMt::new(
+                    writer,
+                    lzma_rust2::Lzma2Options {
+                        lzma_options: Default::default(),
+                        chunk_size: NonZero::new(1024 * 64),
+                    },
+                    std::thread::available_parallelism().unwrap().get() as u32,
+                )?
+                .auto_finish(),
+            )?,
         }
 
         Ok(())
@@ -116,8 +134,12 @@ where
 
         let body = match compression {
             Compression::None => ArchiveBody::<RawEntryData>::from_data(&mut reader)?,
-            Compression::Gzip => ArchiveBody::<RawEntryData>::from_data(&mut flate2::read::GzDecoder::new(&mut reader))?,
-            Compression::Deflate => ArchiveBody::<RawEntryData>::from_data(&mut flate2::read::DeflateDecoder::new(&mut reader))?,
+            Compression::Gzip => ArchiveBody::<RawEntryData>::from_data(
+                &mut flate2::read::GzDecoder::new(&mut reader),
+            )?,
+            Compression::Deflate => ArchiveBody::<RawEntryData>::from_data(
+                &mut flate2::read::DeflateDecoder::new(&mut reader),
+            )?,
             Compression::LZMA2 => ArchiveBody::<RawEntryData>::from_data({
                 &mut lzma_rust2::Lzma2ReaderMt::new(
                     &mut reader,
@@ -125,7 +147,7 @@ where
                     None,
                     std::thread::available_parallelism().unwrap().get() as u32,
                 )
-            })?
+            })?,
         };
 
         Ok(Archive {
@@ -135,6 +157,35 @@ where
             index,
             body,
         })
+    }
+}
+
+// /// Create a new `Body` from a [`Stream`].
+// ///
+// /// [`Stream`]: https://docs.rs/futures-core/latest/futures_core/stream/trait.Stream.html
+// pub fn from_stream<S>(stream: S) -> Self
+// where
+//     S: TryStream + Send + 'static,
+//     S::Ok: Into<Bytes>,
+//     S::Error: Into<BoxError>,
+// {
+//     Self::new(StreamBody {
+//         stream: SyncWrapper::new(stream),
+//     })
+// }
+
+impl<T> Stream for Archive<T>
+where
+    T: Bytes + Unpin,
+{
+    type Item = Result<T, Error>;
+
+    fn poll_next(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Self::Item>> {
+        let this = self.get_mut();
+
     }
 }
 
@@ -155,7 +206,6 @@ impl ArchiveEntryData for RawEntryData {
         self.0
     }
 }
-
 pub struct ReaderEntryData<T>(T)
 where
     T: Read;
@@ -189,6 +239,23 @@ impl ArchiveEntryData for FileEntryData {
         let mut reader = BufReader::new(file);
         let mut data = Vec::new();
         pipe(&mut reader, &mut data).expect("reading to work");
+        data
+    }
+}
+
+pub struct StoreEntryData {
+    pub store: Store,
+    pub hash: Hash,
+}
+
+impl<'a> ArchiveEntryData for StoreEntryData {
+    fn turn_into_vec(self) -> Vec<u8> {
+        let mut object = futures::executor::block_on(self.store.get_object(&self.hash))
+            .expect("Object to be available in store");
+
+        let mut data: Vec<u8> = Vec::new();
+        futures::executor::block_on(object.read_to_end(&mut data)).expect("Reading to work");
+
         data
     }
 }

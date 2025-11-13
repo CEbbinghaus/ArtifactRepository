@@ -1,15 +1,15 @@
 use crate::{header, Hash, Header};
 use anyhow::{anyhow, Result};
 use futures::io::copy;
-use futures::{AsyncBufRead, AsyncRead, AsyncSeek, AsyncWriteExt};
+use futures::{AsyncBufRead, AsyncRead, AsyncSeek, AsyncWriteExt, FutureExt};
 use futures::{AsyncReadExt, AsyncSeekExt};
-use opendal::{FuturesAsyncReader, Operator};
+use opendal::{Builder, FuturesAsyncReader, Operator};
 
 pub struct StoreObject<T>
 where
     T: AsyncBufRead + AsyncRead + Unpin,
 {
-    header: Header,
+    pub header: Header,
     body: T,
 }
 
@@ -56,7 +56,8 @@ where
         cx: &mut std::task::Context<'_>,
         buf: &mut [u8],
     ) -> std::task::Poll<std::io::Result<usize>> {
-        self.poll_read(cx, buf)
+        let this = self.get_mut();
+        std::pin::Pin::new(&mut this.body).poll_read(cx, buf)
     }
 }
 
@@ -68,14 +69,17 @@ where
         self: std::pin::Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<std::io::Result<&[u8]>> {
-        self.poll_fill_buf(cx)
+        let this = self.get_mut();
+        std::pin::Pin::new(&mut this.body).poll_fill_buf(cx)
     }
 
     fn consume(self: std::pin::Pin<&mut Self>, amt: usize) {
-        self.consume(amt);
+        let this = self.get_mut();
+        std::pin::Pin::new(&mut this.body).consume(amt);
     }
 }
 
+#[derive(Clone)]
 pub struct Store {
     operator: Operator,
 }
@@ -84,6 +88,10 @@ impl Store {
 	pub fn new(operator: Operator) -> Self {
 		Self { operator }
 	}
+
+    pub fn from_builder(builder: impl Builder) -> Result<Self> {
+        Ok(Self::new(Operator::new(builder)?.finish()))
+    }
 
 	pub async fn exists(&self, hash: &Hash) -> Result<bool> {
 		Ok(self.operator.exists(hash.as_str()).await?)
@@ -104,7 +112,7 @@ impl Store {
 
     pub async fn put_object<T>(&self, hash: &Hash, mut object: StoreObject<T>) -> Result<()>
     where
-        T: AsyncBufRead + AsyncRead + Unpin + AsyncSeek,
+        T: AsyncBufRead + AsyncRead + Unpin,
     {
         let mut writer = self
             .operator

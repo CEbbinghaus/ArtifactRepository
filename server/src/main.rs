@@ -1,18 +1,32 @@
 use axum::{
-    Router, body::{Body, BodyDataStream}, debug_handler, extract::{Path as AxumPath, Request, State}, http::{HeaderMap, HeaderValue, StatusCode}, response::Response, routing::{get, put}
+    body::{Body, BodyDataStream},
+    debug_handler,
+    extract::{Path as AxumPath, Request, State},
+    http::{HeaderMap, HeaderValue, Response, StatusCode},
+    routing::{get, put},
+    Router,
 };
 use clap::Parser;
-use common::{Hash, Header, ObjectType, archive::{Archive, ArchiveBody, ArchiveEntryData, ArchiveHeaderEntry, FileEntryData, HEADER}, object_body::{Index, Object}, read_object_into_headers, store::{Store, StoreObject}};
-use lazy_static::lazy_static;
-use opendal::Operator;
-use sha2::{Digest, Sha512};
-use tower_http::compression::CompressionLayer;
-use std::{
-    collections::{HashMap, HashSet}, fs::{self, create_dir, remove_file}, io::Write, path::{Path, PathBuf}, str::from_utf8, sync::RwLock
+use common::{
+    Hash, Header, ObjectType, archive::{
+        Archive, ArchiveBody, ArchiveEntryData, ArchiveHeaderEntry, AsyncReaderEntryData,
+        FileEntryData, HEADER, StoreEntryData,
+    }, object_body::{Index, Object}, read_object_into_headers, store::{Store, StoreObject}
 };
-use tokio::{fs::File, io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt, BufReader, BufWriter}};
-use tokio_stream::StreamExt;
-use tokio_util::io::ReaderStream;
+use lazy_static::lazy_static;
+use opendal::{Builder, Operator};
+use sha2::{Digest, Sha512};
+use std::{
+    collections::{HashMap, HashSet},
+    fs::{self, create_dir, remove_file},
+    io::Write,
+    path::{Path, PathBuf},
+    str::from_utf8,
+    sync::RwLock,
+};
+use tower_http::compression::CompressionLayer;
+
+use futures::{AsyncReadExt, AsyncSeekExt, StreamExt, TryStreamExt, future::join_all};
 
 // lazy_static! {
 //     static ref INDEXES: RwLock<HashSet<Hash>> = Default::default();
@@ -60,7 +74,7 @@ use tokio_util::io::ReaderStream;
 //                 continue;
 //             };
 //             let mut reader = BufReader::new(file);
-            
+
 //             let Ok(Header { object_type, size }) = Header::read_from_async(&mut reader).await else {
 //                 panic!("Corrupt file {:?}", entry.path());
 //             };
@@ -86,7 +100,7 @@ use tokio_util::io::ReaderStream;
 
 #[derive(Clone)]
 struct ServerState {
-    store: Store
+    store: Store,
 }
 
 enum ErrorResult {
@@ -176,10 +190,9 @@ async fn put_object(
     headers: HeaderMap,
     request: Request<Body>,
 ) -> Result<StatusCode, (StatusCode, String)> {
-
     match store.exists(&object_hash).await {
-        Ok(true) => Ok(()),
-        Ok(false) => Err((StatusCode::OK, "Object already exists".into())),
+        Ok(false) => Ok(()),
+        Ok(true) => Err((StatusCode::OK, "Object already exists".into())),
         Err(err) => Err((StatusCode::INTERNAL_SERVER_ERROR, err.to_string())),
     }?;
 
@@ -198,12 +211,22 @@ async fn put_object(
     let Some(object_size): Option<u64> = object_size.parse().ok() else {
         return Err((StatusCode::BAD_REQUEST, "Invalid Object-Size Header".into()));
     };
-
     let header = Header::new(object_type, object_size);
-
     let data_stream = request.into_body().into_data_stream();
 
-    store.put_object(&object_hash, StoreObject::new_with_header(header, data_stream)).await?;
+    let buffered_reader = data_stream.map(|result| {
+        result.map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))
+    }).into_async_read();
+
+    let store_object = StoreObject::new_with_header(header, buffered_reader);
+
+    store
+        .put_object(
+            &object_hash,
+            store_object,
+        )
+        .await
+        .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))?;
 
     Ok(StatusCode::CREATED)
 }
@@ -211,27 +234,43 @@ async fn put_object(
 #[debug_handler]
 async fn get_object(
     AxumPath(object_hash): AxumPath<Hash>,
-    State(state): State<ServerState>,
+    State(ServerState { store }): State<ServerState>,
 ) -> Result<Response<Body>, (StatusCode, String)> {
-    let object_path = object_hash.get_path(&state.cache_path);
+    match store.exists(&object_hash).await {
+        Ok(true) => Ok(()),
+        Ok(false) => Err((StatusCode::NO_CONTENT, "no object".into())),
+        Err(err) => Err((StatusCode::INTERNAL_SERVER_ERROR, err.to_string())),
+    }?;
 
-    if !object_path.exists() {
-        return Err((
-            StatusCode::NO_CONTENT,
-            "No object with this hash exists".into(),
-        ));
-    }
+    // let file = tokio::fs::File::open(object_path).await.map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))?;
 
-    let file = tokio::fs::File::open(object_path).await.map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))?;
+    // let mut reader = BufReader::new(file);
+    // let Header { object_type, size } = Header::read_from_async(&mut reader).await.map_err(|err| (StatusCode::BAD_REQUEST, err.to_string()))?;
 
-    let mut reader = BufReader::new(file);
-    let Header { object_type, size } = Header::read_from_async(&mut reader).await.map_err(|err| (StatusCode::BAD_REQUEST, err.to_string()))?;
-    
-    reader.rewind().await.map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, format!("Unable to read file: \"{err}\"")))?;
-    
-    let reader = ReaderStream::new(reader);
-    let s = Body::from_stream(reader);
-    let mut response = Response::new(s);
+    // reader.rewind().await.map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, format!("Unable to read file: \"{err}\"")))?;
+
+    // let reader = ReaderStream::new(reader);
+    // let s = Body::from_stream(reader);
+    // let mut response = Response::new(s);
+
+    let object = store
+        .get_object(&object_hash)
+        .await
+        .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))?;
+    let Header { object_type, size } = object.header.clone();
+
+    let reader_stream = futures::stream::unfold(object, |mut reader| async move {
+        let mut buffer = vec![0u8; 8192];
+        match reader.read(&mut buffer).await {
+            Ok(0) => None,
+            Ok(n) => {
+                buffer.truncate(n);
+                Some((Ok(buffer), reader))
+            }
+            Err(e) => Some((Err(e), reader)),
+        }
+    });
+    let mut response = Response::new(Body::from_stream(reader_stream));
 
     let headers = response.headers_mut();
     headers.insert("Object-Type", object_type.to_str().parse().unwrap());
@@ -243,39 +282,40 @@ async fn get_object(
 #[debug_handler]
 async fn get_bundle(
     AxumPath(index_hash): AxumPath<Hash>,
-    State(ServerState { cache_path }): State<ServerState>,
+    State(ServerState { store }): State<ServerState>,
 ) -> Result<Response<Body>, (StatusCode, String)> {
-    let object_path = index_hash.get_path(&cache_path);
+    match store.exists(&index_hash).await {
+        Ok(true) => Ok(()),
+        Ok(false) => Err((StatusCode::NO_CONTENT, "no object".into())),
+        Err(err) => Err((StatusCode::INTERNAL_SERVER_ERROR, err.to_string())),
+    }?;
 
-    if !object_path.exists() {
+    let mut object = store
+        .get_object(&index_hash)
+        .await
+        .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))?;
+
+    if object.header.object_type != ObjectType::Index {
         return Err((
-            StatusCode::NO_CONTENT,
-            "No object with this hash exists".into(),
+            StatusCode::BAD_REQUEST,
+            "Object requested is not an index".into(),
         ));
     }
 
-    let file = tokio::fs::File::open(object_path).await.map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))?;
-
-    let mut reader = BufReader::new(file);
-    let header = Header::read_from_async(&mut reader).await.map_err(|err| (StatusCode::BAD_REQUEST, err.to_string()))?;
-    
-    if header.object_type != ObjectType::Index {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            "Object requested is not an index".into()
-        ))
-    }
-
-    reader.seek(std::io::SeekFrom::Start((header.to_string().len() ) as u64)).await.map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))?;
-
     let mut index_data = Vec::new();
-    reader.read_to_end(&mut index_data).await.map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))?;
+
+    object
+        .read_to_end(&mut index_data)
+        .await
+        .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))?;
 
     let index = Index::from_data(&index_data);
 
     let mut headers = HashMap::new();
 
-    read_object_into_headers(&cache_path, &mut headers, &index.tree);
+    println!("Reading objects for index {}", index_hash);
+    read_object_into_headers(&store, &mut headers, &index.tree).await.map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))?;
+    println!("Finished reading {} objects from index", headers.len());
 
     //TODO: Surely there is an algorithm to more efficiently lay out this data
     let mut i = 0;
@@ -294,7 +334,6 @@ async fn get_bundle(
         i += total_length;
     }
 
-
     let archive = Archive {
         header: HEADER,
         compression: common::archive::Compression::None,
@@ -302,18 +341,29 @@ async fn get_bundle(
         index: index,
         body: ArchiveBody {
             header: header_entries,
-            entries: headers.into_iter().map(|(hash, header)| FileEntryData(hash.get_path(&cache_path))).collect()
-        }
+            entries: headers
+                .iter()
+                .map(|(hash, header)| StoreEntryData {
+                    store: store.clone(),
+                    hash: hash.clone(),
+                })
+                .collect(),
+        },
     };
 
-    let mut body = Vec::new();
-
-    archive.to_data(&mut body).map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))?;
-
-    let mut response = Response::new(body.into());
+    let mut response = Response::new(Body::from_stream(archive));
     let headers = response.headers_mut();
-    headers.insert("Content-Type", HeaderValue::from_str("application/arc").unwrap());
-    headers.insert("Content-Disposition", HeaderValue::from_str(&format!("Content-Disposition: attachment; filename=\"{index_hash}.ar\"")).unwrap());
+    headers.insert(
+        "Content-Type",
+        HeaderValue::from_str("application/arc").unwrap(),
+    );
+    headers.insert(
+        "Content-Disposition",
+        HeaderValue::from_str(&format!(
+            "Content-Disposition: attachment; filename=\"{index_hash}.ar\""
+        ))
+        .unwrap(),
+    );
 
     return Ok(response);
 }
@@ -333,14 +383,13 @@ pub struct Cli {
 
 #[tokio::main]
 async fn main() {
-
-    let Cli { store, port, ..} = Cli::parse();
+    let Cli { store, port, .. } = Cli::parse();
 
     if !store.exists() {
         create_dir(&store).expect("Cache directory to exist");
     }
 
-    let store = opendal::services::Fs::default().root(&store);
+    let store = opendal::services::Fs::default().root(store.to_str().expect("valid path"));
 
     // read_cache(&store).await;
 
@@ -356,12 +405,14 @@ async fn main() {
         .route("/object/{object_id}", get(get_object))
         .route("/bundle/{index_id}", get(get_bundle))
         .with_state(ServerState {
-            store: Store::new()
+            store: Store::from_builder(store).expect("S"),
         })
         .layer(comression_layer)
         .route("/", get(|| async { "Hello, World!" }));
 
-    let listener = tokio::net::TcpListener::bind(("0.0.0.0", port)).await.unwrap();
+    let listener = tokio::net::TcpListener::bind(("0.0.0.0", port))
+        .await
+        .unwrap();
 
     println!("Listening at http://{}", listener.local_addr().unwrap());
     axum::serve(listener, app).await.unwrap();
