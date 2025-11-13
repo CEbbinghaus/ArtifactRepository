@@ -355,6 +355,7 @@ name = "common"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "bytes",
  "chrono",
  "flate2",
  "futures",
@@ -1644,6 +1645,7 @@ dependencies = [
  "clap",
  "common",
  "futures",
+ "futures-core",
  "http-body",
  "lazy_static",
  "opendal",

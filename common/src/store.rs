@@ -3,10 +3,13 @@ use anyhow::Result;
 use futures::io::copy;
 use futures::AsyncReadExt;
 use futures::{AsyncBufRead, AsyncRead, AsyncWriteExt};
-use opendal::{FuturesAsyncReader, Operator};
+use opendal::{Builder, FuturesAsyncReader, Operator};
 
-pub struct StoreObject<T> {
-    header: Header,
+pub struct StoreObject<T>
+where
+    T: AsyncBufRead + AsyncRead + Unpin,
+{
+    pub header: Header,
     body: T,
 }
 
@@ -65,8 +68,8 @@ where
         cx: &mut std::task::Context<'_>,
         buf: &mut [u8],
     ) -> std::task::Poll<std::io::Result<usize>> {
-        let body = unsafe { self.map_unchecked_mut(|s| &mut s.body) };
-        body.poll_read(cx, buf)
+        let this = self.get_mut();
+        std::pin::Pin::new(&mut this.body).poll_read(cx, buf)
     }
 }
 
@@ -78,13 +81,13 @@ where
         self: std::pin::Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<std::io::Result<&[u8]>> {
-        let body = unsafe { self.map_unchecked_mut(|s| &mut s.body) };
-        body.poll_fill_buf(cx)
+        let this = self.get_mut();
+        std::pin::Pin::new(&mut this.body).poll_fill_buf(cx)
     }
 
     fn consume(self: std::pin::Pin<&mut Self>, amt: usize) {
-        let body = unsafe { self.map_unchecked_mut(|s| &mut s.body) };
-        body.consume(amt);
+        let this = self.get_mut();
+        std::pin::Pin::new(&mut this.body).consume(amt);
     }
 }
 
@@ -96,6 +99,10 @@ pub struct Store {
 impl Store {
     pub fn new(operator: Operator) -> Self {
         Self { operator }
+    }
+
+    pub fn from_builder(builder: impl Builder) -> Result<Self> {
+        Ok(Self::new(Operator::new(builder)?.finish()))
     }
 
     pub async fn exists(&self, hash: &Hash) -> Result<bool> {

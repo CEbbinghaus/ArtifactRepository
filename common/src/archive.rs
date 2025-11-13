@@ -7,11 +7,14 @@ use std::{
 };
 
 use anyhow::{anyhow, Error};
+use futures::AsyncReadExt;
 use sha2::{Digest, Sha512};
 
 use crate::{
     object_body::{Index, Object},
-    pipe, Hash,
+    pipe,
+    store::Store,
+    Hash,
 };
 
 pub const HEADER: [u8; 4] = [b'a', b'r', b'x', b'a'];
@@ -156,6 +159,34 @@ where
     }
 }
 
+// /// Create a new `Body` from a [`Stream`].
+// ///
+// /// [`Stream`]: https://docs.rs/futures-core/latest/futures_core/stream/trait.Stream.html
+// pub fn from_stream<S>(stream: S) -> Self
+// where
+//     S: TryStream + Send + 'static,
+//     S::Ok: Into<Bytes>,
+//     S::Error: Into<BoxError>,
+// {
+//     Self::new(StreamBody {
+//         stream: SyncWrapper::new(stream),
+//     })
+// }
+
+// impl<T> Stream for Archive<T>
+// where
+//     T: ArchiveEntryData + Unpin,
+// {
+//     type Item = Result<Bytes, Error>;
+
+//     fn poll_next(
+//         self: std::pin::Pin<&mut Self>,
+//         cx: &mut std::task::Context<'_>,
+//     ) -> std::task::Poll<Option<Self::Item>> {
+
+//     }
+// }
+
 pub struct ArchiveHeaderEntry {
     pub hash: Hash,
     pub index: u64,
@@ -173,7 +204,6 @@ impl ArchiveEntryData for RawEntryData {
         self.0
     }
 }
-
 pub struct ReaderEntryData<T>(T)
 where
     T: Read;
@@ -207,6 +237,23 @@ impl ArchiveEntryData for FileEntryData {
         let mut reader = BufReader::new(file);
         let mut data = Vec::new();
         pipe(&mut reader, &mut data).expect("reading to work");
+        data
+    }
+}
+
+pub struct StoreEntryData {
+    pub store: Store,
+    pub hash: Hash,
+}
+
+impl<'a> ArchiveEntryData for StoreEntryData {
+    fn turn_into_vec(self) -> Vec<u8> {
+        let mut object = futures::executor::block_on(self.store.get_object(&self.hash))
+            .expect("Object to be available in store");
+
+        let mut data: Vec<u8> = Vec::new();
+        futures::executor::block_on(object.read_to_end(&mut data)).expect("Reading to work");
+
         data
     }
 }

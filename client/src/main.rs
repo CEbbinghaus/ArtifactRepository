@@ -7,8 +7,8 @@ use common::{
         RawEntryData, HEADER,
     },
     object_body::Object as OtherObject,
-    read_header_and_body, read_header_from_file, read_header_from_slice, read_object_into_headers,
-    Hash, Header, Mode, ObjectType, BLOB_KEY, INDEX_KEY, TREE_KEY,
+    read_header_and_body, read_header_from_file, read_header_from_slice,
+    read_object_into_headers_sync, Hash, Header, Mode, ObjectType, BLOB_KEY, INDEX_KEY, TREE_KEY,
 };
 use sha2::{Digest, Sha512};
 use std::{
@@ -919,7 +919,7 @@ fn pack_archive(
 
     let mut headers: HashMap<Hash, Header> = HashMap::new();
 
-    read_object_into_headers(cache, &mut headers, &index.tree)?;
+    read_object_into_headers_sync(cache, &mut headers, &index.tree)?;
 
     //TODO: Surely there is an algorithm to more efficiently lay out this data
     let mut i = 0;

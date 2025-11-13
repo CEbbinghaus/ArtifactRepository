@@ -6,12 +6,14 @@ use std::{
     str::from_utf8,
 };
 
+use futures::AsyncReadExt;
+
 pub use crate::constants::{BLOB_KEY, INDEX_KEY, TREE_KEY};
 pub use crate::hash::Hash;
 pub use crate::header::Header;
 pub use crate::object::Object;
-use crate::object_body::Object as ObjectTrait;
 pub use crate::primitives::{Mode, ObjectType};
+use crate::{object_body::Object as ObjectTrait, store::Store};
 
 pub mod archive;
 mod constants;
@@ -59,42 +61,89 @@ pub fn read_header_from_file(reader: &mut BufReader<File>) -> Option<Header> {
     read_header_from_slice(&vec[..vec.len() - 1])
 }
 
-pub fn read_object_into_headers(
+pub async fn read_object_into_headers(
+    store: &Store,
+    headers: &mut HashMap<Hash, Header>,
+    object_hash: &Hash,
+) -> anyhow::Result<()> {
+    let mut stack = vec![object_hash.clone()];
+
+    while let Some(current_hash) = stack.pop() {
+        if headers.contains_key(&current_hash) {
+            continue;
+        }
+
+        let mut object = store.get_object(&current_hash).await?;
+
+        if object.header.object_type == ObjectType::Index {
+            return Err(anyhow::anyhow!(
+                "Indexes cannot exist within a tree. Likely a hash collision 😳"
+            ));
+        }
+
+        headers.insert(current_hash.clone(), object.header.clone());
+
+        if object.header.object_type == ObjectType::Blob {
+            continue;
+        }
+
+        let mut data = Vec::new();
+        let bytes_read = object.read_to_end(&mut data).await?;
+
+        assert!(
+            bytes_read as u64 == object.header.size,
+            "Read size must match header size"
+        );
+
+        let tree = crate::object_body::Tree::from_data(&data);
+
+        for entry in &tree.contents {
+            stack.push(entry.hash.clone());
+        }
+    }
+
+    Ok(())
+}
+
+pub fn read_object_into_headers_sync(
     cache: &PathBuf,
     headers: &mut HashMap<Hash, Header>,
     object_hash: &Hash,
 ) -> anyhow::Result<()> {
-    let object_path = object_hash.get_path(&cache);
-    assert!(object_path.exists());
+    let mut stack = vec![object_hash.clone()];
 
-    // We assume that if our hash already exists, We probably have already collected all children
-    if headers.contains_key(object_hash) {
-        return Ok(());
-    }
+    while let Some(current_hash) = stack.pop() {
+        if headers.contains_key(&current_hash) {
+            continue;
+        }
 
-    let file = File::open(object_path).expect("file to exist");
-    let mut reader = BufReader::new(file);
-    let mut data = Vec::new();
-    let bytes_read = reader
-        .read_until(0, &mut data)
-        .expect("File to be readable");
+        let object_path = current_hash.get_path(cache);
+        let file = File::open(object_path)?;
+        let mut reader = BufReader::new(file);
+        let mut data = Vec::new();
+        let bytes_read = reader.read_until(0, &mut data)?;
 
-    let header =
-        read_header_from_slice(&data[..bytes_read - 1]).expect("File to be correctly formatted");
-    assert!(header.object_type != ObjectType::Index);
+        let header = read_header_from_slice(&data[..bytes_read - 1])
+            .ok_or_else(|| anyhow::anyhow!("Invalid header"))?;
 
-    headers.insert(object_hash.clone(), header.clone());
-    if header.object_type == ObjectType::Blob {
-        return Ok(());
-    }
+        if header.object_type == ObjectType::Index {
+            return Err(anyhow::anyhow!("Indexes cannot exist within a tree"));
+        }
 
-    reader.read_to_end(&mut data)?;
+        headers.insert(current_hash.clone(), header.clone());
 
-    // println!("Reading Tree {object_hash}");
-    let tree = crate::object_body::Tree::from_data(&data[bytes_read..]);
+        if header.object_type == ObjectType::Blob {
+            continue;
+        }
 
-    for entry in &tree.contents {
-        read_object_into_headers(cache, headers, &entry.hash)?;
+        data.clear();
+        reader.read_to_end(&mut data)?;
+
+        let tree = crate::object_body::Tree::from_data(&data);
+
+        for entry in &tree.contents {
+            stack.push(entry.hash.clone());
+        }
     }
 
     Ok(())

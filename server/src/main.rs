@@ -2,22 +2,22 @@ use axum::{
     body::Body,
     debug_handler,
     extract::{Path as AxumPath, Request, State},
-    http::{HeaderMap, StatusCode},
-    response::Response,
+    http::{HeaderMap, HeaderValue, Response, StatusCode},
     routing::{get, put},
     Router,
 };
 use clap::Parser;
 use common::{
+    archive::{Archive, ArchiveBody, ArchiveHeaderEntry, StoreEntryData, HEADER},
+    object_body::{Index, Object},
+    read_object_into_headers,
     store::{Store, StoreObject},
     Hash, Header, ObjectType,
 };
-use futures::TryStreamExt;
-use opendal::Operator;
-use std::{fs::create_dir, path::PathBuf};
-use tokio_util::compat::FuturesAsyncReadCompatExt;
-use tokio_util::io::ReaderStream;
+use std::{collections::HashMap, fs::create_dir, path::PathBuf};
 use tower_http::compression::CompressionLayer;
+
+use futures::{AsyncReadExt, TryStreamExt};
 
 // lazy_static! {
 //     static ref INDEXES: RwLock<HashSet<Hash>> = Default::default();
@@ -58,6 +58,11 @@ use tower_http::compression::CompressionLayer;
 //                continue;
 //            };
 //            let mut reader = BufReader::new(file).compat();
+
+//             let Ok(file) = File::open(entry.path()).await else {
+//                 continue;
+//             };
+//             let mut reader = BufReader::new(file);
 
 //             let Ok(Header { object_type, size }) = Header::read_from_async(&mut reader).await else {
 //                 panic!("Corrupt file {:?}", entry.path());
@@ -177,8 +182,8 @@ async fn put_object(
     request: Request<Body>,
 ) -> Result<StatusCode, (StatusCode, String)> {
     match store.exists(&object_hash).await {
-        Ok(true) => Ok(()),
-        Ok(false) => Err((StatusCode::OK, "Object already exists".into())),
+        Ok(false) => Ok(()),
+        Ok(true) => Err((StatusCode::OK, "Object already exists".into())),
         Err(err) => Err((StatusCode::INTERNAL_SERVER_ERROR, err.to_string())),
     }?;
 
@@ -197,9 +202,7 @@ async fn put_object(
     let Some(object_size): Option<u64> = object_size.parse().ok() else {
         return Err((StatusCode::BAD_REQUEST, "Invalid Object-Size Header".into()));
     };
-
     let header = Header::new(object_type, object_size);
-
     let data_stream = request.into_body().into_data_stream();
 
     let buffered_reader = data_stream.map_err(std::io::Error::other).into_async_read();
@@ -219,18 +222,30 @@ async fn get_object(
     AxumPath(object_hash): AxumPath<Hash>,
     State(ServerState { store }): State<ServerState>,
 ) -> Result<Response<Body>, (StatusCode, String)> {
-    let store_object = store.get_object(&object_hash).await.map_err(|_| {
-        (
-            StatusCode::NO_CONTENT,
-            "No object with this hash exists".into(),
-        )
-    })?;
+    match store.exists(&object_hash).await {
+        Ok(true) => Ok(()),
+        Ok(false) => Err((StatusCode::NO_CONTENT, "no object".into())),
+        Err(err) => Err((StatusCode::INTERNAL_SERVER_ERROR, err.to_string())),
+    }?;
 
-    let header = store_object.header();
-    let object_type = header.object_type;
-    let size = header.size;
+    let object = store
+        .get_object(&object_hash)
+        .await
+        .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))?;
 
-    let reader_stream = ReaderStream::new(store_object.compat());
+    let Header { object_type, size } = object.header.clone();
+
+    let reader_stream = futures::stream::unfold(object, |mut reader| async move {
+        let mut buffer = vec![0u8; 8192];
+        match reader.read(&mut buffer).await {
+            Ok(0) => None,
+            Ok(n) => {
+                buffer.truncate(n);
+                Some((Ok(buffer), reader))
+            }
+            Err(e) => Some((Err(e), reader)),
+        }
+    });
     let mut response = Response::new(Body::from_stream(reader_stream));
 
     let headers = response.headers_mut();
@@ -240,89 +255,101 @@ async fn get_object(
     Ok(response)
 }
 
-// #[debug_handler]
-// async fn get_bundle(
-//     AxumPath(index_hash): AxumPath<Hash>,
-//     State(ServerState { store }): State<ServerState>,
-// ) -> Result<Response<Body>, (StatusCode, String)> {
-//     // let object_path = index_hash.get_path(&cache_path);
+#[debug_handler]
+async fn get_bundle(
+    AxumPath(index_hash): AxumPath<Hash>,
+    State(ServerState { store }): State<ServerState>,
+) -> Result<Response<Body>, (StatusCode, String)> {
+    match store.exists(&index_hash).await {
+        Ok(true) => Ok(()),
+        Ok(false) => Err((StatusCode::NO_CONTENT, "no object".into())),
+        Err(err) => Err((StatusCode::INTERNAL_SERVER_ERROR, err.to_string())),
+    }?;
 
-//     let index_object = store.get_object(&index_hash).await;
+    let mut object = store
+        .get_object(&index_hash)
+        .await
+        .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))?;
 
-//     let Ok(index_object) = index_object else {
-//         return Err((
-//             StatusCode::NO_CONTENT,
-//             "No object with this hash exists".into(),
-//         ));
-//     };
+    if object.header.object_type != ObjectType::Index {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "Object requested is not an index".into(),
+        ));
+    }
 
-//     let header = index_object.header();
-//     if header.object_type != ObjectType::Index {
-//         return Err((
-//             StatusCode::BAD_REQUEST,
-//             "Object requested is not an index".into(),
-//         ));
-//     }
+    let mut index_data = Vec::new();
 
-//     let index = Index::from_data(&index_object.to_data());
+    object
+        .read_to_end(&mut index_data)
+        .await
+        .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))?;
 
-//     let mut headers = HashMap::new();
+    let index = Index::from_data(&index_data);
 
-//     let _ = read_object_into_headers(&cache_path, &mut headers, &index.tree);
+    let mut headers = HashMap::new();
 
-//     //TODO: Surely there is an algorithm to more efficiently lay out this data
-//     let mut i = 0;
-//     let mut header_entries: Vec<ArchiveHeaderEntry> = Vec::new();
+    println!("Reading objects for index {}", index_hash);
+    read_object_into_headers(&store, &mut headers, &index.tree)
+        .await
+        .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))?;
+    println!("Finished reading {} objects from index", headers.len());
 
-//     for (hash, header) in &headers {
-//         let prefix_length = header.to_string().len() as u64;
-//         let total_length = header.size + prefix_length;
+    let mut i = 0;
+    let mut header_entries: Vec<ArchiveHeaderEntry> = Vec::new();
 
-//         header_entries.push(ArchiveHeaderEntry {
-//             hash: hash.clone(),
-//             index: i,
-//             length: total_length,
-//         });
+    for (hash, header) in &headers {
+        let prefix_length = header.to_string().len() as u64;
+        let total_length = header.size + prefix_length;
 
-//         i += total_length;
-//     }
+        header_entries.push(ArchiveHeaderEntry {
+            hash: hash.clone(),
+            index: i,
+            length: total_length,
+        });
 
-//     let archive = Archive {
-//         header: HEADER,
-//         compression: common::archive::Compression::None,
-//         hash: index_hash.clone(),
-//         index: index,
-//         body: ArchiveBody {
-//             header: header_entries,
-//             entries: headers
-//                 .into_iter()
-//                 .map(|(hash, _header)| FileEntryData(hash.get_path(&cache_path)))
-//                 .collect(),
-//         },
-//     };
+        i += total_length;
+    }
 
-//     let mut body = Vec::new();
+    let archive = Archive {
+        header: HEADER,
+        compression: common::archive::Compression::None,
+        hash: index_hash.clone(),
+        index: index,
+        body: ArchiveBody {
+            header: header_entries,
+            entries: headers
+                .iter()
+                .map(|(hash, _header)| StoreEntryData {
+                    store: store.clone(),
+                    hash: hash.clone(),
+                })
+                .collect(),
+        },
+    };
 
-//     archive
-//         .to_data(&mut body)
-//         .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))?;
+    let mut body = Vec::new();
 
-//     let mut response = Response::new(body.into());
-//     let headers = response.headers_mut();
-//     headers.insert(
-//         "Content-Type",
-//         HeaderValue::from_str("application/arc").unwrap(),
-//     );
-//     headers.insert(
-//         "Content-Disposition",
-//         HeaderValue::from_str(&format!(
-//             "Content-Disposition: attachment; filename=\"{index_hash}.ar\""
-//         ))
-//         .unwrap(),
-//     );
+    archive
+        .to_data(&mut body)
+        .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))?;
 
-//     return Ok(response);
-// }
+    let mut response = Response::new(Body::from(body));
+    let headers = response.headers_mut();
+    headers.insert(
+        "Content-Type",
+        HeaderValue::from_str("application/arc").unwrap(),
+    );
+    headers.insert(
+        "Content-Disposition",
+        HeaderValue::from_str(&format!(
+            "Content-Disposition: attachment; filename=\"{index_hash}.ar\""
+        ))
+        .unwrap(),
+    );
+
+    return Ok(response);
+}
 
 #[derive(Parser)]
 #[clap(version, about, long_about = None)]
@@ -345,10 +372,7 @@ async fn main() {
         create_dir(&store).expect("Cache directory to exist");
     }
 
-    let store = opendal::services::Fs::default()
-        .root(store.to_str().expect("Path to be valid utf8 string"));
-
-    let operator = Operator::new(store).unwrap().finish();
+    let store = opendal::services::Fs::default().root(store.to_str().expect("valid path"));
 
     // read_cache(&store).await;
 
@@ -362,9 +386,9 @@ async fn main() {
     let app = Router::new()
         .route("/object/{object_id}", put(put_object))
         .route("/object/{object_id}", get(get_object))
-        // .route("/bundle/{index_id}", get(get_bundle))
+        .route("/bundle/{index_id}", get(get_bundle))
         .with_state(ServerState {
-            store: Store::new(operator),
+            store: Store::from_builder(store).expect("S"),
         })
         .layer(comression_layer)
         .route("/", get(|| async { "Hello, World!" }));
