@@ -176,15 +176,14 @@ where
 
 impl<T> Stream for Archive<T>
 where
-    T: Bytes + Unpin,
+    T: ArchiveEntryData + Unpin,
 {
-    type Item = Result<T, Error>;
+    type Item = Result<Bytes, Error>;
 
     fn poll_next(
         self: std::pin::Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Option<Self::Item>> {
-        let this = self.get_mut();
 
     }
 }
