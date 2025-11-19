@@ -7,8 +7,7 @@ use std::{
 };
 
 use anyhow::{anyhow, Error};
-use bytes::Bytes;
-use futures::{AsyncRead, AsyncReadExt, Stream, TryStream};
+use futures::AsyncReadExt;
 use sha2::{Digest, Sha512};
 
 use crate::{
@@ -174,19 +173,19 @@ where
 //     })
 // }
 
-impl<T> Stream for Archive<T>
-where
-    T: ArchiveEntryData + Unpin,
-{
-    type Item = Result<Bytes, Error>;
+// impl<T> Stream for Archive<T>
+// where
+//     T: ArchiveEntryData + Unpin,
+// {
+//     type Item = Result<Bytes, Error>;
 
-    fn poll_next(
-        self: std::pin::Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<Option<Self::Item>> {
+//     fn poll_next(
+//         self: std::pin::Pin<&mut Self>,
+//         cx: &mut std::task::Context<'_>,
+//     ) -> std::task::Poll<Option<Self::Item>> {
 
-    }
-}
+//     }
+// }
 
 pub struct ArchiveHeaderEntry {
     pub hash: Hash,

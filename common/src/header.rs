@@ -1,7 +1,7 @@
 use std::{io::{Read, Write}, str::from_utf8};
 
 use anyhow::{Result, anyhow};
-use futures::{AsyncBufRead, AsyncRead, AsyncReadExt, AsyncSeek, AsyncSeekExt, AsyncWrite, AsyncWriteExt};
+use futures::{AsyncRead, AsyncReadExt, AsyncSeek, AsyncSeekExt, AsyncWrite, AsyncWriteExt};
 
 use crate::ObjectType;
 

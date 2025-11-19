@@ -1,21 +1,16 @@
-use crate::{header, Hash, Header};
-use anyhow::{anyhow, Result};
+use crate::{Hash, Header};
+use anyhow::Result;
 use futures::io::copy;
-use futures::{AsyncBufRead, AsyncRead, AsyncSeek, AsyncWriteExt, FutureExt};
-use futures::{AsyncReadExt, AsyncSeekExt};
+use futures::{AsyncBufRead, AsyncRead, AsyncWriteExt};
 use opendal::{Builder, FuturesAsyncReader, Operator};
 
 pub struct StoreObject<T>
-where
-    T: AsyncBufRead + AsyncRead + Unpin,
 {
     pub header: Header,
     body: T,
 }
 
 impl<T> StoreObject<T>
-where
-    T: AsyncBufRead + AsyncRead + Unpin,
 {
     // pub async fn new(mut reader: T) -> Result<Self>
 	// {
