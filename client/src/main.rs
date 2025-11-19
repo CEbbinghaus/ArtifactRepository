@@ -1,17 +1,16 @@
 #![allow(dead_code)]
-use chrono::{DateTime, Utc};
+use chrono::Utc;
 use clap::{Parser, Subcommand};
 use common::{
     BLOB_KEY, Hash, Header, INDEX_KEY, Mode, ObjectType, TREE_KEY, 
     archive::{Archive, ArchiveBody, ArchiveEntryData, ArchiveHeaderEntry, Compression, HEADER, RawEntryData, FileEntryData}, 
-    object_body::Object as OtherObject, read_header_and_body, read_header_from_slice
+    object_body, read_header_and_body, read_header_from_slice,
+    store::{Store, StoreObject},
 };
 use sha2::{Digest, Sha512};
 use std::{
     collections::HashMap,
-    ops::Deref,
     path::PathBuf,
-    str::from_utf8,
     io::Write as StdWrite,
 };
 
@@ -23,526 +22,131 @@ use futures_lite::{
     io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt},
     stream::StreamExt,
 };
+use opendal;
 
-#[derive(Debug)]
-struct Hashed<T: Object> {
-    inner: T,
-    hash: Hash,
-}
-
-impl<T: Object> Deref for Hashed<T> {
-    type Target = T;
-
-    fn deref(&self) -> &Self::Target {
-        &self.inner
-    }
-}
-
-impl<T: Object> Hashed<T> {
-    fn from_object(value: T) -> Self {
-        Self {
-            hash: value.get_hash(),
-            inner: value,
-        }
-    }
-}
-
-trait Object {
-    fn get_object_type(&self) -> ObjectType;
-    fn get_hash(&self) -> Hash;
-    fn get_prefix(&self) -> String;
-    fn write_to(&self, path: &PathBuf) -> impl std::future::Future<Output = ()> + Send;
-}
-
-// Helper to read header from async file
-async fn read_header_from_async_file<R: AsyncBufReadExt + Unpin>(reader: &mut R) -> Option<Header> {
-    let mut buffer = Vec::new();
-    reader.read_until(0, &mut buffer).await.ok()?;
+// Helper to build Index from filesystem
+async fn build_index_from_path(store: &Store, path: &PathBuf) -> (object_body::Index, Hash, u128) {
+    assert!(path.is_dir());
     
-    if buffer.last() == Some(&0) {
-        buffer.pop();
-    }
+    let (tree_hash, total_size) = build_tree_from_dir(store, path).await;
     
-    read_header_from_slice(&buffer)
+    let index = object_body::Index {
+        tree: tree_hash,
+        timestamp: Utc::now(),
+        metadata: HashMap::new(),
+    };
+    
+    let index_data = object_body::Object::to_data(&index);
+    let mut hasher = Sha512::new();
+    let prefix = format!("{} {}\0", INDEX_KEY, index_data.len());
+    hasher.write_all(prefix.as_bytes()).unwrap();
+    hasher.write_all(&index_data).unwrap();
+    let index_hash = Hash::from(hasher);
+    
+    // Write index to store immediately
+    let header = Header::new(ObjectType::Index, index_data.len() as u64);
+    let reader = futures_lite::io::Cursor::new(index_data);
+    let store_obj = StoreObject::new_with_header(header, reader);
+    store.put_object(&index_hash, store_obj).await.unwrap();
+    
+    (index, index_hash, total_size)
 }
 
-struct CacheObject<'a> {
-    cache: &'a PathBuf,
-    object_type: ObjectType,
-    hash: Hash,
-    size: u64,
-    file: PathBuf,
-}
-
-impl<'a> CacheObject<'a> {
-    async fn from_file(cache: &'a PathBuf, file_path: &PathBuf) -> Self {
-        let file = File::open(file_path).await.unwrap();
-        let mut file = BufReader::new(file);
-
-        let mut data = Vec::new();
-        file.read_until(b'\0', &mut data).await.unwrap();
-
-        if data.last() == Some(&0) {
-            data.pop();
-        }
-
-        let data = String::from_utf8(data).expect("data to be a valid u8");
-
-        let (object_type, size) = data.split_once(' ').unwrap();
-
-        let object_type = ObjectType::from_str(object_type).unwrap();
-
-        let hash = Hash::from_path(file_path).unwrap();
-
-        Self {
-            cache,
-            file: file_path.clone(),
-            size: size.parse().unwrap(),
-            object_type,
-            hash,
-        }
-    }
-
-    async fn to_index(&self) -> Hashed<Index> {
-        assert!(self.object_type == ObjectType::Index);
-
-        let file = File::open(&self.file).await.unwrap();
-        let mut file = BufReader::new(file);
-
-        let mut data = Vec::new();
-        file.read_until(b'\0', &mut data).await.unwrap();
-
-        let mut metadata = HashMap::new();
-
-        let mut string_data = String::new();
-
-        file.read_to_string(&mut string_data)
-            .await
-            .expect("Index to only contain string");
-
-        let string_data = string_data.trim_end();
-
-        let lines = string_data.split('\n').collect::<Vec<&str>>();
-
-        for line in lines {
-            let (key, value) = line.split_once(':').unwrap();
-
-            _ = metadata.insert(key, value.trim());
-        }
-
-        let timestamp = DateTime::parse_from_rfc3339(metadata["timestamp"]).unwrap();
-
-        let tree_hash = Hash::try_from(metadata["tree"]).expect("tree hash to be valid");
-
-        let tree_object = CacheObject::from_file(self.cache, &tree_hash.get_path(self.cache)).await;
-
-        assert!(tree_object.get_object_type() == ObjectType::Tree);
-
-        Hashed {
-            hash: self.hash.clone(),
-            inner: Index {
-                timestamp: timestamp.into(),
-                tree: tree_object.to_tree(Mode::Tree, &"").await,
-            },
-        }
-    }
-
-    fn to_tree<'b>(&'b self, mode: Mode, path: &'b str) -> std::pin::Pin<Box<dyn std::future::Future<Output = Hashed<Tree>> + Send + 'b>> {
-        Box::pin(async move {
-            assert!(self.object_type == ObjectType::Tree);
-
-            let file = File::open(&self.file).await.unwrap();
-            let mut file = BufReader::new(file);
-
-            // Read out the file header
-            let _ = read_header_from_async_file(&mut file).await.expect("File header to be correct");
-
-            let mut vec = Vec::new();
-
-            loop {
-                let mut buffer = Vec::new();
-                let bytes = file
-                    .read_until(0, &mut buffer)
-                    .await
-                    .expect("To have a file header");
-
-                if bytes == 0 {
-                    break;
-                }
-
-                let string = from_utf8(&buffer[..buffer.len() - 1]).expect("valid utf8");
-
-                let (mode_str, name) = string.split_once(' ').expect("space");
-
-                let mode = Mode::from_str(mode_str).expect("valid mode");
-
-                let mut hash: [u8; 64] = [0; 64];
-                file.read_exact(&mut hash).await.expect("file to contain hash");
-
-                let hash = Hash::from(hash);
-
-                let object_file = hash.get_path(&self.cache);
-
-                let cache_object = CacheObject::from_file(&self.cache, &object_file).await;
-
-                vec.push(match cache_object.object_type {
-                    ObjectType::Blob => TreeObject::Blob(cache_object.to_blob(mode, name).await),
-                    ObjectType::Tree => TreeObject::Tree(cache_object.to_tree(mode, name).await),
-                    ObjectType::Index => panic!("Invalid ObjectType in tree"),
-                })
-            }
-
-            Hashed {
-                hash: self.hash.clone(),
-                inner: Tree {
-                    mode,
-                    path: path.to_owned(),
-                    contents: vec,
-                },
-            }
-        })
-    }
-
-    async fn to_blob(&self, mode: Mode, path: &str) -> Hashed<Blob> {
-        assert!(self.object_type == ObjectType::Blob);
-
-        let file = File::open(&self.file).await.unwrap();
-        let mut file = BufReader::new(file);
-
-        // Read out the file header
-        let Header { size, .. } =
-            read_header_from_async_file(&mut file).await.expect("File header to be correct");
-
-        Hashed {
-            hash: self.hash.clone(),
-
-            inner: Blob {
-                mode,
-                path: path.to_string(),
-                file: self.file.clone(),
-                size,
-            },
-        }
-    }
-}
-
-impl<'a> Object for CacheObject<'a> {
-    fn get_object_type(&self) -> ObjectType {
-        self.object_type.clone()
-    }
-
-    fn get_hash(&self) -> Hash {
-        self.hash.clone()
-    }
-
-    fn get_prefix(&self) -> String {
-        format!("{} {}\0", self.object_type.to_str(), self.size)
-    }
-
-    async fn write_to(&self, _: &PathBuf) {
-        unimplemented!("Should probably fix this")
-    }
-}
-
-#[derive(Debug)]
-struct Index {
-    timestamp: DateTime<Utc>,
-    tree: Hashed<Tree>,
-}
-
-impl Index {
-    fn get_body(&self) -> String {
-        format!(
-            "tree: {}\ntimestamp: {}\n\n",
-            self.tree.hash,
-            self.timestamp.to_rfc3339()
-        )
-    }
-
-    async fn from_path(path: &PathBuf) -> Index {
-        assert!(path.is_dir());
-        Index {
-            timestamp: Utc::now(),
-            tree: Hashed::from_object(Tree::from_dir(path).await),
-        }
-    }
-}
-
-impl Object for Index {
-    fn get_object_type(&self) -> ObjectType {
-        ObjectType::Index
-    }
-
-    fn get_hash(&self) -> Hash {
-        let body = self.get_body();
-        let mut hasher = Sha512::new();
-        StdWrite::write_fmt(&mut hasher, format_args!("{}{}", self.get_prefix(), body)).unwrap();
-        Hash::from(hasher)
-    }
-
-    fn get_prefix(&self) -> String {
-        format!("{} {}\0", INDEX_KEY, self.get_body().len())
-    }
-
-    async fn write_to(&self, path: &PathBuf) {
-        let mut file = File::create(path).await.unwrap();
-
-        file.write_all(self.get_prefix().as_bytes()).await.unwrap();
-        file.write_all(self.get_body().as_bytes()).await.unwrap();
-    }
-}
-
-trait WithPath {
-    fn get_path_component(&self) -> &String;
-    fn get_mode(&self) -> &Mode;
-}
-
-#[derive(Debug)]
-struct Tree {
-    mode: Mode,
-    path: String,
-    contents: Vec<TreeObject>,
-}
-
-impl Tree {
-    fn get_body(&self) -> Vec<u8> {
-        let mut value = Vec::new();
-
-        for object in self.contents.iter() {
-            value.extend_from_slice(&mut object.to_tree_bytes());
-        }
-
-        value
-    }
-
-    fn from_dir(path: &PathBuf) -> std::pin::Pin<Box<dyn std::future::Future<Output = Self> + Send>> {
-        let path = path.clone();
-        Box::pin(async move {
-            assert!(path.is_dir());
-
-            let mut contents = Vec::new();
-            let mut entries = read_dir(&path).await.unwrap();
-            
-            while let Some(entry) = entries.next().await {
-                let entry = entry.unwrap();
-                let entry_path: PathBuf = entry.path().into();
-                
-                if smol::fs::metadata(&entry_path).await.unwrap().is_dir() {
-                    contents.push(TreeObject::Tree(Hashed::from_object(Tree::from_dir(&entry_path).await)));
-                } else {
-                    contents.push(TreeObject::Blob(Hashed::from_object(Blob::from_path(&entry_path).await)));
-                }
-            }
-
-            Self {
-                mode: Mode::Tree,
-                contents,
-                path: match path.file_name() {
-                    Some(v) => v.to_string_lossy().to_string(),
-                    None => panic!("{path:?} did not have a filename"),
-                },
-            }
-        })
-    }
-}
-
-impl WithPath for Tree {
-    fn get_path_component(&self) -> &String {
-        &self.path
-    }
-
-    fn get_mode(&self) -> &Mode {
-        &self.mode
-    }
-}
-
-impl Object for Tree {
-    fn get_object_type(&self) -> ObjectType {
-        ObjectType::Tree
-    }
-
-    fn get_hash(&self) -> Hash {
-        let body = self.get_body();
-        let mut hasher = Sha512::new();
-        StdWrite::write_fmt(&mut hasher, format_args!("{}", self.get_prefix())).unwrap();
-        hasher.write_all(&body).expect("Body to be added to the hasher");
-        Hash::from(hasher)
-    }
-
-    async fn write_to(&self, path: &PathBuf) {
-        let mut file = File::create(path).await.unwrap();
-
-        file.write_all(self.get_prefix().as_bytes()).await.unwrap();
-        file.write_all(&self.get_body()).await.unwrap();
-    }
-
-    fn get_prefix(&self) -> String {
-        format!("{} {}\0", TREE_KEY, self.get_body().len())
-    }
-}
-
-#[derive(Debug)]
-struct Blob {
-    mode: Mode,
-    path: String,
-    file: PathBuf,
-    size: u64,
-}
-
-impl Blob {
-    async fn from_path(path: &PathBuf) -> Self {
-        let metadata = smol::fs::metadata(path).await.unwrap();
-        assert!(metadata.is_file());
-
-        Self {
-            // TODO: Support other types
-            mode: Mode::Normal,
-            path: path.file_name().unwrap().to_string_lossy().to_string(),
-            size: metadata.len(),
-            file: path.clone(),
-        }
-    }
-}
-
-impl WithPath for Blob {
-    fn get_path_component(&self) -> &String {
-        &self.path
-    }
-
-    fn get_mode(&self) -> &Mode {
-        &self.mode
-    }
-}
-
-impl Object for Blob {
-    fn get_object_type(&self) -> ObjectType {
-        ObjectType::Blob
-    }
-
-    fn get_hash(&self) -> Hash {
-        // Since we want to read the file only once, we'll use blocking I/O for hashing
-        // as sha2 doesn't support async operations
-        let mut hasher = Sha512::new();
-        hasher.write_all(self.get_prefix().as_bytes()).unwrap();
-
-        // Read the file once in blocking context
-        let data = std::fs::read(&self.file).unwrap();
-        hasher.write_all(&data).unwrap();
-
-        Hash::from(hasher)
-    }
-
-    async fn write_to(&self, path: &PathBuf) {
-        let mut file = File::create(path).await.unwrap();
-
-        file.write_all(self.get_prefix().as_bytes()).await.unwrap();
-
-        let mut src = File::open(&self.file).await.unwrap();
-        futures_lite::io::copy(&mut src, &mut file).await.unwrap();
-    }
-
-    fn get_prefix(&self) -> String {
-        format!("{} {}\0", BLOB_KEY, self.size)
-    }
-}
-
-#[derive(Debug)]
-enum TreeObject {
-    Tree(Hashed<Tree>),
-    Blob(Hashed<Blob>),
-}
-
-impl TreeObject {
-    fn to_tree_bytes(&self) -> Vec<u8> {
-        match self {
-            Self::Tree(tree) => get_bytes_from_thing(tree.deref(), &tree.hash),
-            Self::Blob(blob) => get_bytes_from_thing(blob.deref(), &blob.hash),
-        }
-    }
-}
-
-fn get_bytes_from_thing<T: WithPath>(object: &T, hash: &Hash) -> Vec<u8> {
-    let mut path = Vec::new();
-
-    path.extend_from_slice(&mut object.get_mode().to_string().as_bytes());
-    path.push(b' ');
-    path.extend_from_slice(&mut object.get_path_component().as_bytes());
-    path.push(0);
-    path.extend_from_slice(&hash.hash);
-
-    path
-}
-
-impl<T: Object> Hashed<T> {
-    async fn write_if_not_exists(&self, dir: &PathBuf) {
-        let path = self.hash.get_path(dir);
-        let dir_path = path.parent().unwrap();
-
-        let _ = create_dir_all(dir_path).await;
-
-        if !smol::fs::metadata(&path).await.is_ok() {
-            self.write_to(&path).await;
-        }
-    }
-}
-
-async fn write_index_to_folder(dir: &PathBuf, index: &Hashed<Index>) {
-    index.write_if_not_exists(dir).await;
-
-    write_tree_to_folder(dir, &index.tree).await;
-}
-
-fn write_tree_to_folder<'a>(dir: &'a PathBuf, tree: &'a Hashed<Tree>) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'a>> {
+fn build_tree_from_dir<'a>(
+    store: &'a Store,
+    path: &'a PathBuf,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = (Hash, u128)> + Send + 'a>> {
     Box::pin(async move {
-        tree.write_if_not_exists(dir).await;
-
-        for element in tree.contents.iter() {
-            match element {
-                TreeObject::Tree(tree) => write_tree_to_folder(dir, &tree).await,
-                TreeObject::Blob(blob) => blob.write_if_not_exists(dir).await,
+        assert!(path.is_dir());
+        let mut entries = Vec::new();
+        let mut dir_entries = read_dir(&path).await.unwrap();
+        let mut total_size: u128 = 0;
+        
+        while let Some(entry) = dir_entries.next().await {
+            let entry = entry.unwrap();
+            let entry_path: PathBuf = entry.path().into();
+            
+            if smol::fs::metadata(&entry_path).await.unwrap().is_dir() {
+                let (tree_hash, subtree_size) = build_tree_from_dir(store, &entry_path).await;
+                total_size += subtree_size;
+                entries.push(object_body::TreeEntry {
+                    mode: Mode::Tree,
+                    path: entry_path.file_name().unwrap().to_string_lossy().to_string(),
+                    hash: tree_hash,
+                });
+            } else {
+                let data = smol::fs::read(&entry_path).await.unwrap();
+                let size = data.len() as u64;
+                total_size += size as u128;
+                
+                let mut hasher = Sha512::new();
+                let prefix = format!("{} {}\0", BLOB_KEY, size);
+                hasher.write_all(prefix.as_bytes()).unwrap();
+                hasher.write_all(&data).unwrap();
+                let hash = Hash::from(hasher);
+                
+                // Write blob to store immediately if it doesn't exist
+                if !store.exists(&hash).await.unwrap_or(false) {
+                    let header = Header::new(ObjectType::Blob, size);
+                    let reader = futures_lite::io::Cursor::new(data);
+                    let store_obj = StoreObject::new_with_header(header, reader);
+                    store.put_object(&hash, store_obj).await.unwrap();
+                }
+                // Data is dropped here, freeing memory
+                
+                entries.push(object_body::TreeEntry {
+                    mode: Mode::Normal,
+                    path: entry_path.file_name().unwrap().to_string_lossy().to_string(),
+                    hash,
+                });
             }
         }
+        
+        let tree = object_body::Tree { contents: entries };
+        let tree_data = object_body::Object::to_data(&tree);
+        let mut hasher = Sha512::new();
+        let prefix = format!("{} {}\0", TREE_KEY, tree_data.len());
+        hasher.write_all(prefix.as_bytes()).unwrap();
+        hasher.write_all(&tree_data).unwrap();
+        let hash = Hash::from(hasher);
+        
+        // Write tree to store immediately if it doesn't exist
+        if !store.exists(&hash).await.unwrap_or(false) {
+            let header = Header::new(ObjectType::Tree, tree_data.len() as u64);
+            let reader = futures_lite::io::Cursor::new(tree_data);
+            let store_obj = StoreObject::new_with_header(header, reader);
+            store.put_object(&hash, store_obj).await.unwrap();
+        }
+        // tree_data is dropped here, freeing memory
+        
+        (hash, total_size)
     })
 }
 
-fn get_total_size(index: &Hashed<Tree>) -> u128 {
-    let mut total = 0;
-
-    for element in &index.contents {
-        total += match element {
-            TreeObject::Tree(tree) => get_total_size(&tree),
-            TreeObject::Blob(blob) => blob.size as u128,
-        }
-    }
-
-    total
+// Helper to read Tree from Store
+async fn read_tree_from_store(store: &Store, hash: &Hash) -> object_body::Tree {
+    let mut store_obj = store.get_object(hash).await.unwrap();
+    assert!(store_obj.header.object_type == ObjectType::Tree);
+    
+    let mut data = Vec::new();
+    store_obj.read_to_end(&mut data).await.unwrap();
+    
+    object_body::Object::from_data(&data)
 }
 
-async fn commit_directory(cache: &PathBuf, path: &PathBuf) {
+async fn commit_directory(store: &Store, path: &PathBuf) {
     let path_meta = smol::fs::metadata(path).await.unwrap();
     assert!(path_meta.is_dir());
 
-    if let Ok(cache_meta) = smol::fs::metadata(cache).await {
-        assert!(cache_meta.is_dir());
-    } else {
-        create_dir(&cache).await.unwrap();
-    }
-
     let path = std::fs::canonicalize(path).expect(&format!("unable to canonicalize {path:?}"));
 
-    let index = Hashed::from_object(Index::from_path(&path).await);
-
-    println!(
-        "Finished generating Index for {} bytes of data",
-        get_total_size(&index.tree)
-    );
-
-    write_index_to_folder(&cache, &index).await;
-
-    println!("{}", index.hash);
+    let (_index, index_hash, total_size) = build_index_from_path(store, &path).await;
+    
+    println!("Finished generating Index for {} bytes of data", total_size);
+    println!("{}", index_hash);
 }
 
-async fn restore_directory(cache: &PathBuf, path: &PathBuf, index: Hash, validate: bool) {
+async fn restore_directory(store: &Store, path: &PathBuf, index_hash: Hash, validate: bool) {
     if smol::fs::metadata(path).await.is_err() {
         create_dir_all(path).await.expect("Directory Creation to work");
     }
@@ -557,91 +161,96 @@ async fn restore_directory(cache: &PathBuf, path: &PathBuf, index: Hash, validat
         panic!("Path provided must be an empty directory");
     }
 
-    let index_path = index.get_path(cache);
-    let index_cache = Hashed::from_object(CacheObject::from_file(cache, &index_path).await);
+    let mut store_obj = store.get_object(&index_hash).await.unwrap();
+    let mut index_data = Vec::new();
+    store_obj.read_to_end(&mut index_data).await.unwrap();
+    let index: object_body::Index = object_body::Object::from_data(&index_data);
+    
+    let tree = read_tree_from_store(&store, &index.tree).await;
 
-    let index = index_cache.to_index().await;
-
-    write_tree(&index.tree, path).await;
+    write_tree_to_path(&store, &tree, path).await;
 
     if validate {
-        validate_tree(&index.tree, path).await;
+        validate_tree_at_path(&store, &tree, path).await;
     }
 }
 
-fn validate_tree<'a>(tree: &'a Tree, path: &'a PathBuf) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'a>> {
+fn validate_tree_at_path<'a>(
+    store: &'a Store,
+    tree: &'a object_body::Tree,
+    path: &'a PathBuf,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'a>> {
     Box::pin(async move {
-        for item in tree.contents.iter() {
-            if let TreeObject::Tree(tree) = item {
-                let tree_path = path.join(&tree.path);
-                validate_tree(&tree, &tree_path).await;
-                continue;
-            }
-
-            let TreeObject::Blob(blob) = item else {
-                unreachable!();
-            };
-
-            let blob_path = path.join(&blob.path);
-
-            let blob_hash = Hashed::from_object(Blob::from_path(&blob_path).await);
-
-            assert!(blob_hash.hash == blob.hash);
-        }
-    })
-}
-
-fn write_tree<'a>(tree: &'a Tree, path: &'a PathBuf) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'a>> {
-    Box::pin(async move {
-        for item in tree.contents.iter() {
-            if let TreeObject::Tree(tree) = item {
-                let tree_path = path.join(&tree.path);
-
-                create_dir(&tree_path).await.expect("Directory creation to work");
-
-                write_tree(&tree, &tree_path).await;
-                continue;
-            }
-
-            let TreeObject::Blob(blob) = item else {
-                unreachable!();
-            };
-
-            let blob_path = path.join(&blob.path);
-
-            let file = File::create(blob_path).await.expect("File to be created");
-            let mut writer = BufWriter::new(file);
-
-            let cache_file = File::open(&blob.file).await.unwrap();
-            let mut reader = BufReader::new(cache_file);
-
-            let _ = read_header_from_async_file(&mut reader).await;
-
-            let mut data: [u8; 1024] = [0; 1024];
-            loop {
-                let num = reader.read(&mut data).await.unwrap();
-                if num == 0 {
-                    break;
+        for entry in &tree.contents {
+            let entry_path = path.join(&entry.path);
+            let header = store.get_object(&entry.hash).await.unwrap().header;
+            
+            match header.object_type {
+                ObjectType::Tree => {
+                    let subtree = read_tree_from_store(store, &entry.hash).await;
+                    validate_tree_at_path(store, &subtree, &entry_path).await;
                 }
-                writer.write(&data[..num]).await.unwrap();
+                ObjectType::Blob => {
+                    // Verify blob hash matches
+                    let data = smol::fs::read(&entry_path).await.unwrap();
+                    let size = data.len() as u64;
+                    let mut hasher = Sha512::new();
+                    let prefix = format!("{} {}\0", BLOB_KEY, size);
+                    hasher.write_all(prefix.as_bytes()).unwrap();
+                    hasher.write_all(&data).unwrap();
+                    let computed_hash = Hash::from(hasher);
+                    assert!(computed_hash == entry.hash, "Hash mismatch for {}", entry.path);
+                }
+                ObjectType::Index => panic!("Invalid ObjectType in tree"),
             }
         }
     })
 }
 
-async fn cat_object(cache: &PathBuf, hash: &Hash) {
-    let object_path = hash.get_path(cache);
+fn write_tree_to_path<'a>(
+    store: &'a Store,
+    tree: &'a object_body::Tree,
+    path: &'a PathBuf,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'a>> {
+    Box::pin(async move {
+        for entry in &tree.contents {
+            let entry_path = path.join(&entry.path);
+            let header = store.get_object(&entry.hash).await.unwrap().header;
+            
+            match header.object_type {
+                ObjectType::Tree => {
+                    create_dir(&entry_path).await.expect("Directory creation to work");
+                    let subtree = read_tree_from_store(store, &entry.hash).await;
+                    write_tree_to_path(store, &subtree, &entry_path).await;
+                }
+                ObjectType::Blob => {
+                    let file = File::create(&entry_path).await.expect("File to be created");
+                    let mut writer = BufWriter::new(file);
+                    let mut store_obj = store.get_object(&entry.hash).await.unwrap();
+                    
+                    let mut data: [u8; 1024] = [0; 1024];
+                    loop {
+                        let num = store_obj.read(&mut data).await.unwrap();
+                        if num == 0 {
+                            break;
+                        }
+                        writer.write(&data[..num]).await.unwrap();
+                    }
+                }
+                ObjectType::Index => panic!("Invalid ObjectType in tree"),
+            }
+        }
+    })
+}
 
-    let file = File::open(&object_path).await.unwrap();
-    let mut reader = BufReader::new(file);
-
-    read_header_from_async_file(&mut reader).await.expect("file to contain a valid header");
+async fn cat_object(store: &Store, hash: &Hash) {
+    let mut store_obj = store.get_object(hash).await.unwrap();
 
     let stdout = smol::Unblock::new(std::io::stdout());
     let mut stdout = BufWriter::new(stdout);
     let mut data: [u8; 1024] = [0; 1024];
     loop {
-        let num = reader.read(&mut data).await.unwrap();
+        let num = store_obj.read(&mut data).await.unwrap();
         if num == 0 {
             break;
         }
@@ -731,7 +340,7 @@ fn pull_tree<'a>(cache: &'a PathBuf, url: &'a String, tree_hash: &'a Hash) -> st
         let (_, data) =
             read_header_and_body(&index_data).expect("Index to be in the correct format");
 
-        let index_body = common::object_body::Tree::from_data(data);
+        let index_body: object_body::Tree = object_body::Object::from_data(data);
 
         for entry in index_body.contents {
             let obj_path = entry.hash.get_path(cache);
@@ -769,7 +378,7 @@ async fn pull_cache(cache: &PathBuf, url: &String, hash: Hash) {
     let (_, data) =
         read_header_and_body(&index_data).expect("Index to be in the correct format");
 
-    let index_body = common::object_body::Index::from_data(data);
+    let index_body: object_body::Index = object_body::Object::from_data(data);
 
     pull_tree(cache, url, &index_body.tree).await;
 }
@@ -885,7 +494,7 @@ async fn pack_archive(cache: &PathBuf, path: &PathBuf, index_hash: &Hash, compre
         let (header, body) = read_header_and_body(&data).expect("File to be correctly formatted");
         assert!(header.object_type == ObjectType::Index);
 
-        common::object_body::Index::from_data(&body)
+        object_body::Object::from_data(&body)
     };
 
     // Note: read_object_into_headers expects a Store reference, not a PathBuf.
@@ -945,7 +554,7 @@ async fn unpack_archive(cache: &PathBuf, path: &PathBuf) -> anyhow::Result<()> {
 
     println!("Successfully read archive, Index {}", archive.hash);
 
-    let index_data = archive.index.to_data();
+    let index_data = object_body::Object::to_data(&archive.index);
     let index_header = Header::new(ObjectType::Index, index_data.len() as u64);
 
     let mut hasher = Sha512::new();
@@ -978,8 +587,8 @@ async fn unpack_archive(cache: &PathBuf, path: &PathBuf) -> anyhow::Result<()> {
 #[derive(Parser)]
 #[command(version, about, long_about = None)]
 struct Cli {
-    #[arg(short, long, value_name = "Cache")]
-    cache: PathBuf,
+    #[arg(short, long, value_name = "Store")]
+    store: PathBuf,
 
     #[arg(short, long, action = clap::ArgAction::Count)]
     debug: u8,
@@ -1042,30 +651,36 @@ enum Commands {
     },
 }
 
-fn main() {
-    smol::block_on(async_main());
-}
-
-async fn async_main() {
+#[tokio::main]
+async fn main() {
     let cli = Cli::parse();
 
+    // Ensure cache directory exists
+    if smol::fs::metadata(&cli.store).await.is_err() {
+        create_dir_all(&cli.store).await.expect("Failed to create store directory");
+    }
+
+    // Create store from cache directory
+    let store = Store::from_builder(opendal::services::Fs::default().root(cli.store.to_str().unwrap()))
+        .expect("Failed to create store");
+
     match cli.command {
-        Commands::Commit { directory } => commit_directory(&cli.cache, &directory).await,
+        Commands::Commit { directory } => commit_directory(&store, &directory).await,
         Commands::Restore {
             directory,
             index,
             validate,
-        } => restore_directory(&cli.cache, &directory, index, validate).await,
-        Commands::Cat { hash } => cat_object(&cli.cache, &hash).await,
+        } => restore_directory(&store, &directory, index, validate).await,
+        Commands::Cat { hash } => cat_object(&store, &hash).await,
         Commands::Push { url, index } => {
-            push_cache(&cli.cache, &url, index).await
+            push_cache(&cli.store, &url, index).await
         }
-        Commands::Pull { url, index } => pull_cache(&cli.cache, &url, index).await,
+        Commands::Pull { url, index } => pull_cache(&cli.store, &url, index).await,
         Commands::Pack { index, file , compression} => {
-            pack_archive(&cli.cache, &file, &index, compression).await.expect("Packing to work")
+            pack_archive(&cli.store, &file, &index, compression).await.expect("Packing to work")
         }
         Commands::Unpack { file } => {
-            unpack_archive(&cli.cache, &file).await.expect("Packing to work")
+            unpack_archive(&cli.store, &file).await.expect("Packing to work")
         }
     }
 }

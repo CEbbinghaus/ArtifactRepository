@@ -473,8 +473,10 @@ dependencies = [
  "futures-lite",
  "hex",
  "lzma-rust2",
+ "opendal",
  "sha2",
  "smol",
+ "tokio",
  "ureq",
 ]
 
