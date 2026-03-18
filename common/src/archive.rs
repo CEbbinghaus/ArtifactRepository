@@ -26,6 +26,7 @@ pub enum Compression {
     Gzip = 4,
     Deflate = 8,
     LZMA2 = 16,
+    Zstd = 32,
 }
 
 impl FromStr for Compression {
@@ -37,6 +38,7 @@ impl FromStr for Compression {
             "gzip" => Ok(Compression::Gzip),
             "deflate" => Ok(Compression::Deflate),
             "lzma2" => Ok(Compression::LZMA2),
+            "zstd" => Ok(Compression::Zstd),
             _ => Err(anyhow!("Invalid Compression Type")),
         }
     }
@@ -51,6 +53,7 @@ impl TryFrom<u16> for Compression {
             x if x == Compression::Gzip as u16 => Ok(Compression::Gzip),
             x if x == Compression::Deflate as u16 => Ok(Compression::Deflate),
             x if x == Compression::LZMA2 as u16 => Ok(Compression::LZMA2),
+            x if x == Compression::Zstd as u16 => Ok(Compression::Zstd),
             _ => Err(()),
         }
     }
@@ -92,6 +95,11 @@ where
                 self.body.to_data(&mut gz_encoder)?;
                 gz_encoder.finish()?.flush()?;
             }
+            Compression::Zstd => {
+                let mut encoder = zstd::stream::write::Encoder::new(writer, 3)?;
+                self.body.to_data(&mut encoder)?;
+                encoder.finish()?.flush()?;
+            }
             Compression::LZMA2 => self.body.to_data(
                 &mut lzma_rust2::Lzma2WriterMt::new(
                     writer,
@@ -129,7 +137,7 @@ where
         let mut index_bytes = Vec::new();
         let index_bytes_read = reader.read_until(0, &mut index_bytes)?;
 
-        let index = Index::from_data(&index_bytes[..index_bytes_read - 1]);
+        let index = Index::from_data(&index_bytes[..index_bytes_read - 1])?;
 
         let body = match compression {
             Compression::None => ArchiveBody::<RawEntryData>::from_data(&mut reader)?,
@@ -138,6 +146,9 @@ where
             )?,
             Compression::Deflate => ArchiveBody::<RawEntryData>::from_data(
                 &mut flate2::read::DeflateDecoder::new(&mut reader),
+            )?,
+            Compression::Zstd => ArchiveBody::<RawEntryData>::from_data(
+                &mut zstd::stream::read::Decoder::new(&mut reader)?,
             )?,
             Compression::LZMA2 => ArchiveBody::<RawEntryData>::from_data({
                 &mut lzma_rust2::Lzma2ReaderMt::new(

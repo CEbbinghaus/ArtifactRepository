@@ -4,8 +4,8 @@ use chrono::{DateTime, Utc};
 
 use crate::{Hash, Mode};
 
-pub trait Object {
-    fn from_data(data: &[u8]) -> Self;
+pub trait Object: Sized {
+    fn from_data(data: &[u8]) -> anyhow::Result<Self>;
     fn to_data(&self) -> Vec<u8>;
 }
 
@@ -19,57 +19,58 @@ pub struct Index {
 }
 
 impl Object for Index {
-    //TODO: This HAS to return a result. We need to fix that
-    fn from_data(data: &[u8]) -> Self {
-        let string_data = from_utf8(data).expect("Data to be in valid utf8 format");
+    fn from_data(data: &[u8]) -> anyhow::Result<Self> {
+        let string_data = from_utf8(data)
+            .map_err(|e| anyhow::anyhow!("Invalid UTF-8 in index data: {}", e))?;
 
-        assert!(&string_data[string_data.len() - 2..] == "\n\n", "Index MUST end in a double newline");
+        if !string_data.ends_with("\n\n") {
+            anyhow::bail!("Index must end with a double newline");
+        }
         let string_data = &string_data[..string_data.len() - 2];
 
         let mut tree_hash: Option<Hash> = None;
         let mut timestamp: Option<DateTime<Utc>> = None;
         let mut metadata = HashMap::new();
 
-        let lines: Vec<&str> = string_data.split('\n').collect();
-        for line in lines {
-            if line.trim() == "" {
-                panic!("Index CANNOT contain a blank line")
+        for line in string_data.split('\n') {
+            if line.trim().is_empty() {
+                anyhow::bail!("Index cannot contain a blank line");
             }
 
-            let (key, value) = line
-                .split_once(':')
-                .expect("Each line to be properly formatted");
+            let (key, value) = line.split_once(':')
+                .ok_or_else(|| anyhow::anyhow!("Invalid line format: missing ':'"))?;
             let key = key.trim();
             let value = value.trim();
 
-            match key.trim() {
-                TREE_KEY => tree_hash = Some(Hash::try_from(value).expect("Hash to be valid")),
+            match key {
+                TREE_KEY => tree_hash = Some(Hash::try_from(value)?),
                 TIMESTAMP_KEY => {
                     timestamp = Some(
                         DateTime::parse_from_rfc3339(value)
-                            .expect("Timestamp to be in the rfc3339 format")
+                            .map_err(|e| anyhow::anyhow!("Invalid timestamp: {}", e))?
                             .into(),
-                    )
+                    );
                 }
                 _ => {
                     if tree_hash.is_none() {
-                        panic!("Tree MUST come first");
+                        anyhow::bail!("Tree must come before metadata");
                     }
                     if timestamp.is_none() {
-                        panic!("Timestamp MUST come second");
+                        anyhow::bail!("Timestamp must come before metadata");
                     }
-                    if let Some(_) = metadata.insert(key.to_string(), value.trim().to_string()) {
-                        panic!("No duplicate keys allowed within Index Metadata");
+                    if metadata.contains_key(key) {
+                        anyhow::bail!("Duplicate key in metadata: {}", key);
                     }
+                    metadata.insert(key.to_string(), value.to_string());
                 }
             }
         }
 
-        Index {
-            tree: tree_hash.expect("tree to exist within artifact metadata"),
-            timestamp: timestamp.expect("timestamp to exist within artifact metadata"),
-            metadata: metadata,
-        }
+        Ok(Index {
+            tree: tree_hash.ok_or_else(|| anyhow::anyhow!("Missing tree hash in index"))?,
+            timestamp: timestamp.ok_or_else(|| anyhow::anyhow!("Missing timestamp in index"))?,
+            metadata,
+        })
     }
 
     fn to_data(&self) -> Vec<u8> {
@@ -109,7 +110,7 @@ pub struct Tree {
     pub contents: Vec<TreeEntry>,
 }
 impl Object for Tree {
-    fn  from_data(data: &[u8]) -> Self {
+    fn from_data(data: &[u8]) -> anyhow::Result<Self> {
         let mut contents = Vec::new();
 
         let mut index: usize = 0;
@@ -121,18 +122,23 @@ impl Object for Tree {
             let remaining = &data[index..];
 
             let Some(position) = remaining.iter().position(|v| *v == 0) else {
-                panic!("Entry must contain null char");
+                anyhow::bail!("Entry must contain null char");
             };
 
-            let string = from_utf8(&remaining[..position]).expect("Entry must be valid utf8");
+            let string = from_utf8(&remaining[..position])
+                .map_err(|e| anyhow::anyhow!("Invalid UTF-8 in tree entry: {}", e))?;
             let position = position + 1;
 
             let (mode, name) = string
                 .split_once(' ')
-                .expect("mode and filename to be seperated by space");
-            let mode = Mode::from_str(mode).expect("valid mode");
+                .ok_or_else(|| anyhow::anyhow!("mode and filename must be separated by space"))?;
+            let mode = Mode::from_str(mode)
+                .ok_or_else(|| anyhow::anyhow!("Invalid mode: {}", mode))?;
 
-            let hash = Hash::try_from(&remaining[position..position + 64]).expect("Hash to be valid");
+            if position + 64 > remaining.len() {
+                anyhow::bail!("Insufficient data for hash: need {} bytes, have {}", position + 64, remaining.len());
+            }
+            let hash = Hash::try_from(&remaining[position..position + 64])?;
             contents.push(TreeEntry {
                 hash,
                 mode,
@@ -142,7 +148,7 @@ impl Object for Tree {
             index += position + 64;
         }
 
-        Tree { contents }
+        Ok(Tree { contents })
     }
 
     fn to_data(&self) -> Vec<u8> {

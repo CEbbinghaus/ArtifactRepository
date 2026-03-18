@@ -1,48 +1,41 @@
 use anyhow::anyhow;
 use serde::de::{self, Visitor};
-use serde::{Deserialize, Deserializer, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use sha2::digest::FixedOutput;
-
 use sha2::Sha512;
-use std::path::PathBuf;
 use std::fmt::{self, Debug, Display};
+use std::path::PathBuf;
 use std::str::FromStr;
-// use std::hash::Hash;
 
-#[derive(Clone, Serialize)]
+#[derive(Clone)]
 pub struct Hash {
-    // Sha512 Hash value
-    #[serde(skip)]
     pub hash: [u8; 64],
-    hash_string: String,
 }
 
 impl Hash {
-    pub fn get_parts(&self) -> (&str, &str) {
-        (&self.hash_string[..2], &self.hash_string[2..])
+    /// Parse a 128-char hex string into a Hash, returning an error on invalid input.
+    fn from_hex(hex_str: &str) -> Result<Self, anyhow::Error> {
+        if hex_str.len() != 128 {
+            return Err(anyhow!("Invalid length. Hash has to be 128 characters long"));
+        }
+
+        let mut hash = [0u8; 64];
+        hex::decode_to_slice(hex_str, &mut hash)?;
+
+        Ok(Self { hash })
     }
 
-	pub fn as_str(&self) -> &str {
-		&self.hash_string
-	}
+    pub fn get_parts(&self) -> (String, String) {
+        let s = self.as_str();
+        (s[..2].to_owned(), s[2..].to_owned())
+    }
+
+    pub fn as_str(&self) -> String {
+        hex::encode(&self.hash)
+    }
 
     pub fn from_string(value: &String) -> Option<Self> {
-        let value = value.as_str();
-
-        if value.len() != 128 {
-            return None;
-        }
-
-        let hash = hex::decode(value).ok()?;
-
-        if hash.len() != 64 {
-            return None;
-        }
-
-        Some(Self {
-            hash: hash.try_into().unwrap(),
-            hash_string: value.to_owned(),
-        })
+        Self::from_hex(value.as_str()).ok()
     }
 
     pub fn get_path(&self, cache_dir: &PathBuf) -> PathBuf {
@@ -62,12 +55,9 @@ impl Hash {
             return None;
         }
 
-        Some(Self::try_from(
-            directory.to_str()?.to_owned() + filename.to_str()?,
-        ).ok()?)
+        Self::try_from(directory.to_str()?.to_owned() + filename.to_str()?).ok()
     }
 }
-
 
 impl std::hash::Hash for Hash {
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
@@ -87,7 +77,7 @@ impl FromStr for Hash {
     type Err = anyhow::Error;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        s.try_into()
+        Self::from_hex(s)
     }
 }
 
@@ -95,17 +85,7 @@ impl TryFrom<String> for Hash {
     type Error = anyhow::Error;
 
     fn try_from(value: String) -> Result<Self, Self::Error> {
-        if value.len() != 128 {
-            return Err(anyhow!("Invalid length. Hash has to be 128 characters long"));
-        }
-
-        let mut hash = [0u8; 64];
-        hex::decode_to_slice(&value, &mut hash)?;
-
-        Ok(Self {
-            hash,
-            hash_string: value
-        })
+        Self::from_hex(&value)
     }
 }
 
@@ -113,42 +93,26 @@ impl TryFrom<&str> for Hash {
     type Error = anyhow::Error;
 
     fn try_from(value: &str) -> Result<Self, Self::Error> {
-        if value.len() != 128 {
-            return Err(anyhow!("Invalid length. Hash has to be 128 characters long"));
-        }
-
-        let mut hash = [0u8; 64];
-        hex::decode_to_slice(value, &mut hash)?;
-
-        Ok(Self {
-            hash,
-            hash_string: value.to_owned(),
-        })
+        Self::from_hex(value)
     }
 }
 
 impl TryFrom<&[u8]> for Hash {
     type Error = anyhow::Error;
-    
+
     fn try_from(value: &[u8]) -> Result<Self, Self::Error> {
         if value.len() != 64 {
             return Err(anyhow!("Invalid length. Slice must be 64 bytes long"));
         }
 
         let data: [u8; 64] = value.try_into()?;
-        Ok(Self {
-            hash_string: hex::encode(&value),
-            hash: data,
-        })
+        Ok(Self { hash: data })
     }
 }
 
 impl From<[u8; 64]> for Hash {
     fn from(value: [u8; 64]) -> Self {
-        Self {
-            hash_string: hex::encode(&value),
-            hash: value,
-        }
+        Self { hash: value }
     }
 }
 
@@ -160,17 +124,24 @@ impl From<Sha512> for Hash {
 
 impl Debug for Hash {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_tuple("Hash").field(&self.hash_string).finish()
+        f.debug_tuple("Hash").field(&self.as_str()).finish()
     }
 }
 
 impl Display for Hash {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", self.hash_string)
+        write!(f, "{}", self.as_str())
     }
 }
 
-
+impl Serialize for Hash {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_str(&self.as_str())
+    }
+}
 
 impl<'de> Deserialize<'de> for Hash {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
@@ -186,18 +157,21 @@ impl<'de> Deserialize<'de> for Hash {
                 formatter.write_str("Sha512 hex string Hash")
             }
 
-            fn visit_string<E>(self, value: String) -> Result<Self::Value, E>
-                where
-                    E: serde::de::Error, {
-                
-                if value.len() != 128 {
-                    return Err(de::Error::invalid_length(value.len(), &"A hex string with 128 characters"));
-                }
+            fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
+            where
+                E: de::Error,
+            {
+                Hash::from_hex(value).map_err(de::Error::custom)
+            }
 
-                value.try_into().map_err(de::Error::custom)
+            fn visit_string<E>(self, value: String) -> Result<Self::Value, E>
+            where
+                E: de::Error,
+            {
+                self.visit_str(&value)
             }
         }
-        
-        deserializer.deserialize_string( HashVisitor)
+
+        deserializer.deserialize_string(HashVisitor)
     }
 }

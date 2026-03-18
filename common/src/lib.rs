@@ -2,12 +2,15 @@ use std::{
     collections::HashMap, fs::File, io::{BufRead, BufReader, Read, Write}, str::from_utf8
 };
 
+use sha2::{Digest, Sha512};
+
 use futures::AsyncReadExt;
 
 pub use crate::constants::{BLOB_KEY, INDEX_KEY, TREE_KEY};
 pub use crate::hash::Hash;
 pub use crate::header::Header;
-use crate::{object_body::Object as ObjectTrait, store::Store};
+use crate::object_body::Object as _;
+use crate::store::Store;
 pub use crate::primitives::{Mode, ObjectType};
 pub use crate::object::Object;
 
@@ -72,29 +75,32 @@ pub async fn read_object_into_headers(
             return Err(anyhow::anyhow!("Indexes cannot exist within a tree. Likely a hash collision 😳"));
         }
 
-        headers.insert(current_hash.clone(), object.header.clone());
-        
-        if object.header.object_type == ObjectType::Blob {
+        let header = object.header;
+
+        if header.object_type == ObjectType::Blob {
+            headers.insert(current_hash, header);
             continue;
         }
 
         let mut data = Vec::new();
         let bytes_read = object.read_to_end(&mut data).await?;
 
-        assert!(bytes_read as u64 == object.header.size, "Read size must match header size");
-    
-        let tree = crate::object_body::Tree::from_data(&data);
+        anyhow::ensure!(bytes_read as u64 == header.size, "Read size must match header size");
+
+        let tree = crate::object_body::Tree::from_data(&data)?;
 
         for entry in &tree.contents {
             stack.push(entry.hash.clone());
         }
+
+        headers.insert(current_hash, header);
     }
 
     Ok(())
 }
 
 pub fn pipe<'a, 'b>(reader: &'a mut dyn Read, writer: &'b mut dyn Write) -> anyhow::Result<()> {
-    let mut buffer: [u8; 1024] = [0; 1024];
+    let mut buffer: [u8; 65536] = [0; 65536];
     loop {
         let read = reader.read(&mut buffer)?;
         
@@ -102,8 +108,16 @@ pub fn pipe<'a, 'b>(reader: &'a mut dyn Read, writer: &'b mut dyn Write) -> anyh
             break;
         }
 
-        writer.write(&buffer[..read])?;
+        writer.write_all(&buffer[..read])?;
     }
 
     Ok(())
+}
+
+pub fn compute_hash(key: &str, data: &[u8]) -> Hash {
+    let mut hasher = Sha512::new();
+    let prefix = format!("{} {}\0", key, data.len());
+    hasher.write_all(prefix.as_bytes()).unwrap();
+    hasher.write_all(data).unwrap();
+    Hash::from(hasher)
 }
