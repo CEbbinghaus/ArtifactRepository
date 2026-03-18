@@ -342,7 +342,6 @@ dependencies = [
  "hex",
  "lzma-rust2",
  "opendal",
- "sha2",
  "tokio",
  "ureq",
 ]

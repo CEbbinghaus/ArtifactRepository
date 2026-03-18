@@ -8,7 +8,6 @@ common = { path = "../common" }
 chrono = "0.4.41"
 clap = { version = "4.5.40", features = ["derive"] }
 hex = "0.4.3"
-sha2 = "0.10.9"
 ureq = "3.0.12"
 anyhow = "1.0.100"
 lzma-rust2 = "0.15.1"

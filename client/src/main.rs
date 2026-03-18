@@ -7,11 +7,10 @@ use common::{
     compute_hash, object_body, read_header_and_body, read_header_from_slice, read_object_into_headers,
     store::{Store, StoreObject},
 };
-use sha2::{Digest, Sha512};
+
 use std::{
     collections::HashMap,
     path::PathBuf,
-    io::Write,
 };
 
 use futures::io::AsyncReadExt as FuturesReadExt;
@@ -58,7 +57,7 @@ fn build_tree_from_dir<'a>(
         while let Some(entry) = dir_entries.next_entry().await? {
             let entry_path = entry.path();
 
-            if tokio::fs::metadata(&entry_path).await?.is_dir() {
+            if entry.file_type().await?.is_dir() {
                 let (tree_hash, subtree_size) = build_tree_from_dir(store, &entry_path).await?;
                 total_size += subtree_size;
                 entries.push(object_body::TreeEntry {
@@ -67,28 +66,20 @@ fn build_tree_from_dir<'a>(
                     hash: tree_hash,
                 });
             } else {
-                // Stream file for hashing without loading entirely into memory
-                let file_meta = tokio::fs::metadata(&entry_path).await?;
-                let size = file_meta.len();
-                total_size += size as u128;
-
-                let hash = {
-                    let mut file = File::open(&entry_path).await?;
-                    let mut hasher = Sha512::new();
-                    let prefix = format!("{} {}\0", BLOB_KEY, size);
-                    hasher.write_all(prefix.as_bytes())?;
-                    let mut buffer = [0u8; 65536];
-                    loop {
-                        let n = AsyncReadExt::read(&mut file, &mut buffer).await?;
-                        if n == 0 { break; }
-                        hasher.write_all(&buffer[..n])?;
+                // Read file and compute hash in a single spawn_blocking call
+                let (data, hash) = tokio::task::spawn_blocking({
+                    let path = entry_path.clone();
+                    move || -> anyhow::Result<(Vec<u8>, Hash)> {
+                        let data = std::fs::read(&path)?;
+                        let hash = compute_hash(BLOB_KEY, &data);
+                        Ok((data, hash))
                     }
-                    Hash::from(hasher)
-                };
+                }).await??;
+                let size = data.len() as u64;
+                total_size += size as u128;
 
                 // Write blob to store only if it doesn't already exist
                 if !store.exists(&hash).await.unwrap_or(false) {
-                    let data = tokio::fs::read(&entry_path).await?;
                     let header = Header::new(ObjectType::Blob, size);
                     let reader = futures::io::Cursor::new(data);
                     let store_obj = StoreObject::new_with_header(header, reader);
@@ -134,7 +125,7 @@ async fn commit_directory(store: &Store, path: &PathBuf) -> anyhow::Result<()> {
     let path_meta = tokio::fs::metadata(path).await?;
     anyhow::ensure!(path_meta.is_dir(), "Path must be a directory");
 
-    let path = std::fs::canonicalize(path).context(format!("unable to canonicalize {path:?}"))?;
+    let path = tokio::fs::canonicalize(path).await.context(format!("unable to canonicalize {path:?}"))?;
 
     let (_index, index_hash, total_size) = build_index_from_path(store, &path).await?;
 
@@ -185,9 +176,16 @@ fn validate_tree_at_path<'a>(
                     validate_tree_at_path(store, &subtree, &entry_path).await?;
                 }
                 ObjectType::Blob => {
-                    let data = tokio::fs::read(&entry_path).await?;
-                    let computed_hash = compute_hash(BLOB_KEY, &data);
-                    anyhow::ensure!(computed_hash == entry.hash, "Hash mismatch for {}", entry.path);
+                    let expected_hash = entry.hash.clone();
+                    let entry_name = entry.path.clone();
+                    let computed_hash = tokio::task::spawn_blocking({
+                        let path = entry_path.clone();
+                        move || -> anyhow::Result<Hash> {
+                            let data = std::fs::read(&path)?;
+                            Ok(compute_hash(BLOB_KEY, &data))
+                        }
+                    }).await??;
+                    anyhow::ensure!(computed_hash == expected_hash, "Hash mismatch for {}", entry_name);
                 }
                 ObjectType::Index => anyhow::bail!("Invalid ObjectType in tree"),
             }
@@ -360,7 +358,10 @@ async fn pull_cache(cache: &PathBuf, url: &String, hash: Hash) -> anyhow::Result
 }
 
 async fn upload_object(hash: &Hash, file: &PathBuf, url: &String) -> anyhow::Result<()> {
-    let file_data = tokio::fs::read(file).await.context("File should exist")?;
+    let file_data = tokio::task::spawn_blocking({
+        let file = file.clone();
+        move || std::fs::read(&file)
+    }).await?.context("File should exist")?;
 
     let header = read_header_from_slice(
         &file_data[..file_data.iter().position(|&b| b == 0).unwrap_or(file_data.len())]
