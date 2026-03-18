@@ -2,6 +2,11 @@
 resolver = "3"
 members = ["client", "common", "server"]
 
+[profile.release]
+lto = "thin"
+codegen-units = 1
+panic = "abort"
+
 [profile.profiling]
 inherits = "release"
 debug = true
