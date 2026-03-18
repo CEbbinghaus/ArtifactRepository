@@ -6,10 +6,12 @@ use sha2::Sha512;
 use std::fmt::{self, Debug, Display};
 use std::path::PathBuf;
 use std::str::FromStr;
+use std::sync::OnceLock;
 
 #[derive(Clone)]
 pub struct Hash {
     pub hash: [u8; 64],
+    hex_cache: OnceLock<String>,
 }
 
 impl Hash {
@@ -22,7 +24,7 @@ impl Hash {
         let mut hash = [0u8; 64];
         hex::decode_to_slice(hex_str, &mut hash)?;
 
-        Ok(Self { hash })
+        Ok(Self { hash, hex_cache: OnceLock::new() })
     }
 
     pub fn get_parts(&self) -> (String, String) {
@@ -30,8 +32,8 @@ impl Hash {
         (s[..2].to_owned(), s[2..].to_owned())
     }
 
-    pub fn as_str(&self) -> String {
-        hex::encode(&self.hash)
+    pub fn as_str(&self) -> &str {
+        self.hex_cache.get_or_init(|| hex::encode(&self.hash))
     }
 
     pub fn from_string(value: &String) -> Option<Self> {
@@ -106,13 +108,13 @@ impl TryFrom<&[u8]> for Hash {
         }
 
         let data: [u8; 64] = value.try_into()?;
-        Ok(Self { hash: data })
+        Ok(Self { hash: data, hex_cache: OnceLock::new() })
     }
 }
 
 impl From<[u8; 64]> for Hash {
     fn from(value: [u8; 64]) -> Self {
-        Self { hash: value }
+        Self { hash: value, hex_cache: OnceLock::new() }
     }
 }
 

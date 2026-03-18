@@ -2,3 +2,7 @@
 
 cache
 store
+
+flamegraph.svg
+perf.data
+profile.json.gz

@@ -116,8 +116,11 @@ pub fn pipe<'a, 'b>(reader: &'a mut dyn Read, writer: &'b mut dyn Write) -> anyh
 
 pub fn compute_hash(key: &str, data: &[u8]) -> Hash {
     let mut hasher = Sha512::new();
-    let prefix = format!("{} {}\0", key, data.len());
-    hasher.write_all(prefix.as_bytes()).unwrap();
-    hasher.write_all(data).unwrap();
+    hasher.update(key.as_bytes());
+    hasher.update(b" ");
+    let mut buf = itoa::Buffer::new();
+    hasher.update(buf.format(data.len()).as_bytes());
+    hasher.update(b"\0");
+    hasher.update(data);
     Hash::from(hasher)
 }
