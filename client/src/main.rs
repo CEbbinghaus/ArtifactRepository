@@ -11,12 +11,14 @@ use common::{
 use std::{
     collections::HashMap,
     path::PathBuf,
+    sync::Arc,
 };
 
 use futures::io::AsyncReadExt as FuturesReadExt;
 use tokio::{
     fs::{File, create_dir, create_dir_all, read_dir},
     io::{AsyncReadExt, AsyncWriteExt, AsyncBufReadExt, BufReader, BufWriter},
+    task::JoinSet,
 };
 use opendal;
 
@@ -24,7 +26,7 @@ use opendal;
 async fn build_index_from_path(store: &Store, path: &PathBuf) -> anyhow::Result<(object_body::Index, Hash, u128)> {
     anyhow::ensure!(path.is_dir(), "Path must be a directory");
 
-    let (tree_hash, total_size) = build_tree_from_dir(store, path).await?;
+    let (tree_hash, total_size) = build_tree_from_dir(store.clone(), path.clone()).await?;
 
     let index = object_body::Index {
         tree: tree_hash,
@@ -44,31 +46,57 @@ async fn build_index_from_path(store: &Store, path: &PathBuf) -> anyhow::Result<
     Ok((index, index_hash, total_size))
 }
 
-fn build_tree_from_dir<'a>(
-    store: &'a Store,
-    path: &'a PathBuf,
-) -> std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<(Hash, u128)>> + Send + 'a>> {
+fn build_tree_from_dir(
+    store: Store,
+    path: PathBuf,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<(Hash, u128)>> + Send>> {
     Box::pin(async move {
         anyhow::ensure!(path.is_dir(), "Path must be a directory");
-        let mut entries = Vec::new();
         let mut dir_entries = read_dir(&path).await?;
-        let mut total_size: u128 = 0;
 
+        // Collect all entries first so we can process them concurrently
+        let mut dir_paths = Vec::new();
+        let mut file_paths = Vec::new();
         while let Some(entry) = dir_entries.next_entry().await? {
             let entry_path = entry.path();
-
             if entry.file_type().await?.is_dir() {
-                let (tree_hash, subtree_size) = build_tree_from_dir(store, &entry_path).await?;
-                total_size += subtree_size;
-                entries.push(object_body::TreeEntry {
-                    mode: Mode::Tree,
-                    path: entry_path.file_name().context("missing filename")?.to_string_lossy().to_string(),
-                    hash: tree_hash,
-                });
+                dir_paths.push(entry_path);
             } else {
-                // Read file and compute hash in a single spawn_blocking call
+                file_paths.push(entry_path);
+            }
+        }
+
+        let mut total_size: u128 = 0;
+        let mut entries = Vec::new();
+
+        // Process subdirectories concurrently
+        let mut dir_set = JoinSet::new();
+        for dir_path in dir_paths {
+            let store_clone = store.clone();
+            dir_set.spawn(async move {
+                let name = dir_path.file_name()
+                    .map(|n| n.to_string_lossy().to_string())
+                    .unwrap_or_default();
+                let (hash, size) = build_tree_from_dir(store_clone, dir_path).await?;
+                Ok::<_, anyhow::Error>((name, hash, size))
+            });
+        }
+
+        // Process files concurrently with bounded parallelism
+        let semaphore = Arc::new(tokio::sync::Semaphore::new(64));
+        let mut file_set = JoinSet::new();
+        for file_path in file_paths {
+            let store_clone = store.clone();
+            let sem = semaphore.clone();
+            file_set.spawn(async move {
+                let _permit = sem.acquire().await
+                    .map_err(|e| anyhow::anyhow!("semaphore: {e}"))?;
+                let name = file_path.file_name()
+                    .map(|n| n.to_string_lossy().to_string())
+                    .unwrap_or_default();
+
                 let (data, hash) = tokio::task::spawn_blocking({
-                    let path = entry_path.clone();
+                    let path = file_path.clone();
                     move || -> anyhow::Result<(Vec<u8>, Hash)> {
                         let data = std::fs::read(&path)?;
                         let hash = compute_hash(BLOB_KEY, &data);
@@ -76,29 +104,45 @@ fn build_tree_from_dir<'a>(
                     }
                 }).await??;
                 let size = data.len() as u64;
-                total_size += size as u128;
 
-                // Write blob to store only if it doesn't already exist
-                if !store.exists(&hash).await.unwrap_or(false) {
+                if !store_clone.exists(&hash).await.unwrap_or(false) {
                     let header = Header::new(ObjectType::Blob, size);
                     let reader = futures::io::Cursor::new(data);
                     let store_obj = StoreObject::new_with_header(header, reader);
-                    store.put_object(&hash, store_obj).await?;
+                    store_clone.put_object(&hash, store_obj).await?;
                 }
 
-                entries.push(object_body::TreeEntry {
-                    mode: Mode::Normal,
-                    path: entry_path.file_name().context("missing filename")?.to_string_lossy().to_string(),
-                    hash,
-                });
-            }
+                Ok::<_, anyhow::Error>((name, hash, size))
+            });
         }
 
+        // Collect directory results
+        while let Some(result) = dir_set.join_next().await {
+            let (name, hash, size) = result??;
+            total_size += size;
+            entries.push(object_body::TreeEntry {
+                mode: Mode::Tree,
+                path: name,
+                hash,
+            });
+        }
+
+        // Collect file results
+        while let Some(result) = file_set.join_next().await {
+            let (name, hash, size) = result??;
+            total_size += size as u128;
+            entries.push(object_body::TreeEntry {
+                mode: Mode::Normal,
+                path: name,
+                hash,
+            });
+        }
+
+        // Build and store tree
         let tree = object_body::Tree { contents: entries };
         let tree_data = object_body::Object::to_data(&tree);
         let hash = compute_hash(TREE_KEY, &tree_data);
 
-        // Write tree to store if it doesn't already exist
         if !store.exists(&hash).await.unwrap_or(false) {
             let header = Header::new(ObjectType::Tree, tree_data.len() as u64);
             let reader = futures::io::Cursor::new(tree_data);
