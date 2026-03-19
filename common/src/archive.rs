@@ -379,7 +379,10 @@ mod tests {
     use sha2::Digest;
     use std::collections::HashMap;
     use std::io::Cursor;
-    use crate::object_body::Index;
+    use chrono::DateTime;
+    use crate::compute_hash;
+    use crate::object_body::{Index, Tree, TreeEntry};
+    use crate::Mode;
 
     fn make_hash(fill: u8) -> Hash {
         Hash::from([fill; 64])
@@ -660,5 +663,214 @@ mod tests {
         assert_eq!(recovered.index.tree, make_hash(0x02));
         assert_eq!(recovered.body.entries.len(), 1);
         assert_eq!(recovered.body.entries[0].0, b"test");
+    }
+
+    const KNOWN_ARCHIVE_HEX: &str = "\
+        617278610000\
+        c13812d5a5db2775e58935686f7e9976171a6d0263fb9ee1314880c9c1a84b79\
+        cfb66358a2988c3506fc980e89d7b41b09b7d649d55ef1f0374c4564b36a02dc\
+        747265653a2032346436396661643937376233323933666465623963313761386464643836\
+        613033626332636131626531303665626661623533323839633139656534613036623233313630\
+        616261353235363836393361373164386335383538393565626662323132346161663437613934\
+        373134656165323832666236633433326336370a74696d657374616d703a20323032352d30312d\
+        30315430303a30303a30302b30303a30300a0a00\
+        0000000000000002\
+        24d69fad977b3293fdeb9c17a8ddd86a03bc2ca1be106ebfab53289c19ee4a06\
+        b23160aba52568693a71d8c585895ebfb2124aaf47a94714eae282fb6c432c67\
+        0000000000000000\
+        0000000000000058\
+        bcf8802ae6e118cea3197843ac168b21b766f06276324ecd2cfcf77546918dbb\
+        8877bb59719e6e33a0d458baf66374b39f475ceb070f7e123e4403b8f8a8094a\
+        0000000000000058\
+        0000000000000010\
+        747265652038300031303036343420746573742e74787400\
+        bcf8802ae6e118cea3197843ac168b21b766f06276324ecd2cfcf77546918dbb\
+        8877bb59719e6e33a0d458baf66374b39f475ceb070f7e123e4403b8f8a8094a\
+        626c6f62203900746573742064617461";
+
+    const BLOB_HASH_HEX: &str = "\
+        bcf8802ae6e118cea3197843ac168b21b766f06276324ecd2cfcf77546918dbb\
+        8877bb59719e6e33a0d458baf66374b39f475ceb070f7e123e4403b8f8a8094a";
+    const TREE_HASH_HEX: &str = "\
+        24d69fad977b3293fdeb9c17a8ddd86a03bc2ca1be106ebfab53289c19ee4a06\
+        b23160aba52568693a71d8c585895ebfb2124aaf47a94714eae282fb6c432c67";
+    const INDEX_HASH_HEX: &str = "\
+        c13812d5a5db2775e58935686f7e9976171a6d0263fb9ee1314880c9c1a84b79\
+        cfb66358a2988c3506fc980e89d7b41b09b7d649d55ef1f0374c4564b36a02dc";
+
+    fn make_known_tree() -> Tree {
+        let blob_hash = Hash::try_from(BLOB_HASH_HEX).unwrap();
+        Tree {
+            contents: vec![TreeEntry {
+                mode: Mode::Normal,
+                path: "test.txt".to_string(),
+                hash: blob_hash,
+            }],
+        }
+    }
+
+    fn make_known_index() -> Index {
+        let tree_hash = Hash::try_from(TREE_HASH_HEX).unwrap();
+        let ts: DateTime<Utc> = DateTime::parse_from_rfc3339("2025-01-01T00:00:00+00:00")
+            .unwrap()
+            .into();
+        Index {
+            tree: tree_hash,
+            timestamp: ts,
+            metadata: HashMap::new(),
+        }
+    }
+
+    #[test]
+    fn synthetic_archive_deserialize_known_bytes() {
+        let archive_bytes = hex::decode(KNOWN_ARCHIVE_HEX).unwrap();
+        let archive =
+            Archive::<RawEntryData>::from_data(&mut Cursor::new(archive_bytes)).unwrap();
+
+        // Magic header
+        assert_eq!(archive.header, HEADER);
+
+        // Compression
+        assert!(matches!(archive.compression, Compression::None));
+
+        // Index hash
+        assert_eq!(archive.hash, Hash::try_from(INDEX_HASH_HEX).unwrap());
+
+        // Index tree hash
+        assert_eq!(archive.index.tree, Hash::try_from(TREE_HASH_HEX).unwrap());
+
+        // Index timestamp
+        let expected_ts: DateTime<Utc> =
+            DateTime::parse_from_rfc3339("2025-01-01T00:00:00+00:00")
+                .unwrap()
+                .into();
+        assert_eq!(archive.index.timestamp, expected_ts);
+
+        // Body has 2 entries
+        assert_eq!(archive.body.entries.len(), 2);
+
+        // Blob entry (second) - strip "blob 9\0" prefix
+        let blob_entry = &archive.body.entries[1].0;
+        let blob_prefix = b"blob 9\0";
+        assert_eq!(&blob_entry[..blob_prefix.len()], blob_prefix);
+        assert_eq!(&blob_entry[blob_prefix.len()..], b"test data");
+
+        // Tree entry (first) - strip "tree 80\0" prefix and parse
+        let tree_entry = &archive.body.entries[0].0;
+        let tree_prefix = b"tree 80\0";
+        assert_eq!(&tree_entry[..tree_prefix.len()], tree_prefix);
+        let tree = Tree::from_data(&tree_entry[tree_prefix.len()..]).unwrap();
+        assert_eq!(tree.contents.len(), 1);
+        assert_eq!(tree.contents[0].path, "test.txt");
+    }
+
+    #[test]
+    fn synthetic_archive_serialize_matches_expected_bytes() {
+        let blob_data = b"test data";
+        let blob_hash = compute_hash("blob", blob_data);
+        let tree = make_known_tree();
+        let tree_data = tree.to_data();
+        let tree_hash = compute_hash("tree", &tree_data);
+        let index = make_known_index();
+        let index_data = index.to_data();
+        let index_hash = compute_hash("indx", &index_data);
+
+        // Build prefixed entry data (matching object store format)
+        let mut tree_entry_data = format!("tree {}\0", tree_data.len()).into_bytes();
+        tree_entry_data.extend_from_slice(&tree_data);
+
+        let mut blob_entry_data = format!("blob {}\0", blob_data.len()).into_bytes();
+        blob_entry_data.extend_from_slice(blob_data);
+
+        let tree_entry_hash = compute_entry_hash(&tree_entry_data);
+        let blob_entry_hash = compute_entry_hash(&blob_entry_data);
+
+        // Verify entry hashes match compute_hash (the prefix format is identical)
+        assert_eq!(tree_entry_hash, tree_hash);
+        assert_eq!(blob_entry_hash, blob_hash);
+
+        let archive = Archive {
+            header: HEADER,
+            compression: Compression::None,
+            hash: index_hash,
+            index: make_known_index(),
+            body: ArchiveBody {
+                header: vec![
+                    ArchiveHeaderEntry {
+                        hash: tree_entry_hash,
+                        index: 0,
+                        length: tree_entry_data.len() as u64,
+                    },
+                    ArchiveHeaderEntry {
+                        hash: blob_entry_hash,
+                        index: tree_entry_data.len() as u64,
+                        length: blob_entry_data.len() as u64,
+                    },
+                ],
+                entries: vec![
+                    RawEntryData(tree_entry_data),
+                    RawEntryData(blob_entry_data),
+                ],
+            },
+        };
+
+        let mut output = Vec::new();
+        archive.to_data(&mut output).unwrap();
+
+        let expected = hex::decode(KNOWN_ARCHIVE_HEX).unwrap();
+        assert_eq!(output, expected, "Serialized archive must match known bytes exactly");
+    }
+
+    #[test]
+    fn synthetic_archive_object_hashes_stable() {
+        // Blob hash
+        let blob_hash = compute_hash("blob", b"test data");
+        assert_eq!(blob_hash, Hash::try_from(BLOB_HASH_HEX).unwrap());
+
+        // Tree hash
+        let tree = make_known_tree();
+        let tree_data = tree.to_data();
+        let tree_hash = compute_hash("tree", &tree_data);
+        assert_eq!(tree_hash, Hash::try_from(TREE_HASH_HEX).unwrap());
+
+        // Index hash
+        let index = make_known_index();
+        let index_data = index.to_data();
+        let index_hash = compute_hash("indx", &index_data);
+        assert_eq!(index_hash, Hash::try_from(INDEX_HASH_HEX).unwrap());
+    }
+
+    #[test]
+    fn synthetic_archive_tree_binary_format_stable() {
+        let tree = make_known_tree();
+        let data = tree.to_data();
+
+        assert_eq!(data.len(), 80);
+        assert_eq!(&data[0..6], b"100644", "mode");
+        assert_eq!(data[6], 0x20, "space separator");
+        assert_eq!(&data[7..15], b"test.txt", "filename");
+        assert_eq!(data[15], 0x00, "null separator");
+
+        let expected_blob_hash = hex::decode(BLOB_HASH_HEX).unwrap();
+        assert_eq!(&data[16..80], &expected_blob_hash[..], "raw 64-byte blob hash");
+    }
+
+    #[test]
+    fn synthetic_archive_index_text_format_stable() {
+        let index = make_known_index();
+        let data = index.to_data();
+
+        assert_eq!(data.len(), 173);
+        assert!(data.starts_with(b"tree: "), "must start with 'tree: '");
+
+        let text = std::str::from_utf8(&data).unwrap();
+        let tree_hex_in_output = &text[6..6 + 128];
+        assert_eq!(tree_hex_in_output, TREE_HASH_HEX);
+
+        assert!(
+            text.contains("\ntimestamp: 2025-01-01T00:00:00+00:00\n"),
+            "must contain timestamp line"
+        );
+        assert!(text.ends_with("\n\n"), "must end with double newline");
     }
 }

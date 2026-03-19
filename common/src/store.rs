@@ -4,14 +4,12 @@ use futures::io::copy;
 use futures::{AsyncBufRead, AsyncRead, AsyncWriteExt};
 use opendal::{Builder, FuturesAsyncReader, Operator};
 
-pub struct StoreObject<T>
-{
+pub struct StoreObject<T> {
     pub header: Header,
     body: T,
 }
 
-impl<T> StoreObject<T>
-{
+impl<T> StoreObject<T> {
     pub fn new_with_header(header: Header, reader: T) -> Self {
         Self {
             header,
@@ -22,7 +20,7 @@ impl<T> StoreObject<T>
 
 impl<T> AsyncRead for StoreObject<T>
 where
-    T: AsyncBufRead + AsyncRead + Unpin
+    T: AsyncBufRead + AsyncRead + Unpin,
 {
     fn poll_read(
         self: std::pin::Pin<&mut Self>,
@@ -36,7 +34,7 @@ where
 
 impl<T> AsyncBufRead for StoreObject<T>
 where
-    T: AsyncBufRead + AsyncRead + Unpin
+    T: AsyncBufRead + AsyncRead + Unpin,
 {
     fn poll_fill_buf(
         self: std::pin::Pin<&mut Self>,
@@ -58,17 +56,17 @@ pub struct Store {
 }
 
 impl Store {
-	pub fn new(operator: Operator) -> Self {
-		Self { operator }
-	}
+    pub fn new(operator: Operator) -> Self {
+        Self { operator }
+    }
 
     pub fn from_builder(builder: impl Builder) -> Result<Self> {
         Ok(Self::new(Operator::new(builder)?.finish()))
     }
 
-	pub async fn exists(&self, hash: &Hash) -> Result<bool> {
-		Ok(self.operator.exists(&hash.as_str()).await?)
-	}
+    pub async fn exists(&self, hash: &Hash) -> Result<bool> {
+        Ok(self.operator.exists(&hash.as_str()).await?)
+    }
 
     pub async fn get_object(&self, hash: &Hash) -> Result<StoreObject<FuturesAsyncReader>> {
         let mut reader = self
@@ -93,12 +91,12 @@ impl Store {
             .await?
             .into_futures_async_write();
 
-		object.header.write_to_async(&mut writer).await?;
-		copy(&mut object.body, &mut writer).await?;
+        object.header.write_to_async(&mut writer).await?;
+        copy(&mut object.body, &mut writer).await?;
 
-		writer.close().await?;
+        writer.close().await?;
 
-		Ok(())
+        Ok(())
     }
 }
 
@@ -143,7 +141,9 @@ mod tests {
         assert_eq!(retrieved.header.size, 5);
 
         let mut body = Vec::new();
-        futures::AsyncReadExt::read_to_end(&mut retrieved, &mut body).await.unwrap();
+        futures::AsyncReadExt::read_to_end(&mut retrieved, &mut body)
+            .await
+            .unwrap();
         assert_eq!(body, b"world");
     }
 
@@ -179,7 +179,9 @@ mod tests {
         assert!(store.exists(&hash).await.unwrap());
         let mut retrieved = store.get_object(&hash).await.unwrap();
         let mut body = Vec::new();
-        futures::AsyncReadExt::read_to_end(&mut retrieved, &mut body).await.unwrap();
+        futures::AsyncReadExt::read_to_end(&mut retrieved, &mut body)
+            .await
+            .unwrap();
         assert_eq!(body, b"data");
     }
 }
