@@ -1,19 +1,27 @@
+use std::collections::HashMap;
+use std::io::{Cursor, Write};
+
 use axum::{
     body::Body,
     debug_handler,
-    extract::{Path as AxumPath, Request, State},
+    extract::{Path as AxumPath, Query, Request, State},
     http::{HeaderMap, Response, StatusCode},
     routing::{get, put},
     Router,
 };
 use common::{
-    Hash, Header, ObjectType, store::{Store, StoreObject}
+    Hash, Header, Mode, ObjectType,
+    archive::{Archive, ArchiveBody, ArchiveHeaderEntry, Compression, RawEntryData, HEADER},
+    object_body::{Index, Object as _, Tree},
+    read_object_into_headers,
+    store::{Store, StoreObject},
 };
+use serde::Deserialize;
 
 use tokio_util::compat::FuturesAsyncReadCompatExt;
 use tokio_util::io::ReaderStream;
 
-use futures::{StreamExt, TryStreamExt};
+use futures::{AsyncReadExt, StreamExt, TryStreamExt};
 
 #[derive(Clone)]
 struct ServerState {
@@ -114,10 +122,202 @@ async fn get_object(
     Ok(response)
 }
 
+#[derive(Deserialize)]
+struct CompressionQuery {
+    compression: Option<String>,
+}
+
+async fn read_index_from_store(store: &Store, index_hash: &Hash) -> Result<Index, ServerError> {
+    match store.exists(index_hash).await {
+        Ok(true) => Ok(()),
+        Ok(false) => Err(ServerError::NotFound("Index not found".into())),
+        Err(err) => Err(ServerError::Internal(err.to_string())),
+    }?;
+
+    let mut store_obj = store
+        .get_object(index_hash)
+        .await
+        .map_err(|err| ServerError::Internal(err.to_string()))?;
+
+    if store_obj.header.object_type != ObjectType::Index {
+        return Err(ServerError::BadRequest("Object is not an Index".into()));
+    }
+
+    let mut body = Vec::new();
+    store_obj
+        .read_to_end(&mut body)
+        .await
+        .map_err(|err| ServerError::Internal(err.to_string()))?;
+
+    Index::from_data(&body).map_err(|err| ServerError::Internal(err.to_string()))
+}
+
+#[debug_handler]
+async fn get_archive(
+    AxumPath(index_hash): AxumPath<Hash>,
+    Query(query): Query<CompressionQuery>,
+    State(ServerState { store }): State<ServerState>,
+) -> Result<Response<Body>, ServerError> {
+    let compression = match query.compression.as_deref() {
+        Some(s) => s
+            .parse::<Compression>()
+            .map_err(|_| ServerError::BadRequest("Invalid compression type".into()))?,
+        None => Compression::Zstd,
+    };
+
+    let index = read_index_from_store(&store, &index_hash).await?;
+
+    let mut headers: HashMap<Hash, (Header, Vec<u8>)> = HashMap::new();
+    read_object_into_headers(&store, &mut headers, &index.tree)
+        .await
+        .map_err(|err| ServerError::Internal(err.to_string()))?;
+
+    let mut offset: u64 = 0;
+    let mut header_entries: Vec<ArchiveHeaderEntry> = Vec::new();
+
+    for (hash, (header, data)) in &headers {
+        let prefix_length = header.to_string().len() as u64;
+        let length = prefix_length + data.len() as u64;
+
+        header_entries.push(ArchiveHeaderEntry {
+            hash: hash.clone(),
+            index: offset,
+            length,
+        });
+
+        offset += length;
+    }
+
+    let archive = Archive {
+        header: HEADER,
+        compression,
+        hash: index_hash.clone(),
+        index,
+        body: ArchiveBody {
+            header: header_entries,
+            entries: headers
+                .into_iter()
+                .map(|(_hash, (header, data))| {
+                    let prefix = header.to_string();
+                    let mut full_data = Vec::with_capacity(prefix.len() + data.len());
+                    full_data.extend_from_slice(prefix.as_bytes());
+                    full_data.extend(data);
+                    RawEntryData(full_data)
+                })
+                .collect(),
+        },
+    };
+
+    let mut buf = Vec::new();
+    archive
+        .to_data(&mut Cursor::new(&mut buf))
+        .map_err(|err| ServerError::Internal(err.to_string()))?;
+
+    let short_hash = &index_hash.as_str()[..12];
+    let mut response = Response::new(Body::from(buf));
+    let headers = response.headers_mut();
+    headers.insert("Content-Type", "application/octet-stream".parse().unwrap());
+    headers.insert(
+        "Content-Disposition",
+        format!("attachment; filename=\"{}.arx\"", short_hash)
+            .parse()
+            .unwrap(),
+    );
+
+    Ok(response)
+}
+
+fn collect_files<'a>(
+    store: &'a Store,
+    tree_hash: &'a Hash,
+    prefix: &'a str,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<Vec<(String, Vec<u8>)>>> + Send + 'a>>
+{
+    Box::pin(async move {
+        let mut store_obj = store.get_object(tree_hash).await?;
+        let mut body = Vec::new();
+        store_obj.read_to_end(&mut body).await?;
+        let tree = Tree::from_data(&body)?;
+
+        let mut files: Vec<(String, Vec<u8>)> = Vec::new();
+
+        for entry in &tree.contents {
+            let entry_path = if prefix.is_empty() {
+                entry.path.clone()
+            } else {
+                format!("{}/{}", prefix, entry.path)
+            };
+
+            match entry.mode {
+                Mode::Tree => {
+                    let sub_files = collect_files(store, &entry.hash, &entry_path).await?;
+                    files.extend(sub_files);
+                }
+                _ => {
+                    let mut blob_obj = store.get_object(&entry.hash).await?;
+                    let mut data = Vec::new();
+                    blob_obj.read_to_end(&mut data).await?;
+                    files.push((entry_path, data));
+                }
+            }
+        }
+
+        Ok(files)
+    })
+}
+
+#[debug_handler]
+async fn get_zip(
+    AxumPath(index_hash): AxumPath<Hash>,
+    State(ServerState { store }): State<ServerState>,
+) -> Result<Response<Body>, ServerError> {
+    let index = read_index_from_store(&store, &index_hash).await?;
+
+    let files = collect_files(&store, &index.tree, "")
+        .await
+        .map_err(|err| ServerError::Internal(err.to_string()))?;
+
+    let mut buf = Vec::new();
+    {
+        let cursor = Cursor::new(&mut buf);
+        let mut zip_writer = zip::ZipWriter::new(cursor);
+        let options = zip::write::SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Deflated);
+
+        for (path, data) in &files {
+            zip_writer
+                .start_file(path, options)
+                .map_err(|err| ServerError::Internal(err.to_string()))?;
+            zip_writer
+                .write_all(data)
+                .map_err(|err| ServerError::Internal(err.to_string()))?;
+        }
+
+        zip_writer
+            .finish()
+            .map_err(|err| ServerError::Internal(err.to_string()))?;
+    }
+
+    let short_hash = &index_hash.as_str()[..12];
+    let mut response = Response::new(Body::from(buf));
+    let headers = response.headers_mut();
+    headers.insert("Content-Type", "application/zip".parse().unwrap());
+    headers.insert(
+        "Content-Disposition",
+        format!("attachment; filename=\"{}.zip\"", short_hash)
+            .parse()
+            .unwrap(),
+    );
+
+    Ok(response)
+}
+
 /// Build the application router with the given store.
 pub fn create_router(store: Store) -> Router {
     Router::new()
         .route("/object/{object_id}", put(put_object))
         .route("/object/{object_id}", get(get_object))
+        .route("/archive/{index_hash}", get(get_archive))
+        .route("/zip/{index_hash}", get(get_zip))
         .with_state(ServerState { store })
 }

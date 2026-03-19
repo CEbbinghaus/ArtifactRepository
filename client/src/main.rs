@@ -596,6 +596,285 @@ async fn unpack_archive(cache: &PathBuf, path: &PathBuf) -> anyhow::Result<()> {
     Ok(())
 }
 
+async fn extract_archive(file: &PathBuf, directory: &PathBuf) -> anyhow::Result<()> {
+    if tokio::fs::metadata(directory).await.is_err() {
+        create_dir_all(directory).await.context("Failed to create output directory")?;
+    }
+
+    let dir_meta = tokio::fs::metadata(directory).await?;
+    anyhow::ensure!(dir_meta.is_dir(), "Output path must be a directory");
+
+    let mut entries = read_dir(directory).await?;
+    anyhow::ensure!(entries.next_entry().await?.is_none(), "Output directory must be empty");
+
+    let file = file.clone();
+    let archive = tokio::task::spawn_blocking(move || {
+        let f = std::fs::File::open(&file)?;
+        let mut reader = std::io::BufReader::new(f);
+        Archive::<RawEntryData>::from_data(&mut reader)
+    }).await??;
+
+    anyhow::ensure!(
+        archive.body.entries.len() == archive.body.header.len(),
+        "Archive entries and headers length mismatch"
+    );
+
+    println!("Index: {}", archive.hash);
+
+    let mut data_map: HashMap<Hash, Vec<u8>> = HashMap::with_capacity(archive.body.header.len());
+    for (header_entry, raw_entry) in archive.body.header.into_iter().zip(archive.body.entries.into_iter()) {
+        data_map.insert(header_entry.hash, raw_entry.0);
+    }
+
+    let root_tree_hash = archive.index.tree;
+    let data_map = Arc::new(data_map);
+    let file_count = extract_tree(&data_map, &root_tree_hash, directory).await?;
+
+    println!("Extracted {} files to {:?}", file_count, directory);
+
+    Ok(())
+}
+
+fn extract_tree<'a>(
+    data_map: &'a Arc<HashMap<Hash, Vec<u8>>>,
+    tree_hash: &'a Hash,
+    path: &'a PathBuf,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<usize>> + Send + 'a>> {
+    Box::pin(async move {
+        let raw_data = data_map.get(tree_hash)
+            .ok_or_else(|| anyhow::anyhow!("Tree hash {} not found in archive", tree_hash))?;
+
+        let (_header, body) = read_header_and_body(raw_data)
+            .ok_or_else(|| anyhow::anyhow!("Failed to parse header for tree {}", tree_hash))?;
+
+        let tree: object_body::Tree = object_body::Object::from_data(body)?;
+
+        let semaphore = Arc::new(tokio::sync::Semaphore::new(64));
+        let mut set = JoinSet::new();
+        let mut file_count: usize = 0;
+
+        for entry in tree.contents {
+            let entry_path = path.join(&entry.path);
+
+            match entry.mode {
+                Mode::Tree => {
+                    create_dir(&entry_path).await
+                        .context(format!("Failed to create directory {:?}", entry_path))?;
+                    file_count += extract_tree(data_map, &entry.hash, &entry_path).await?;
+                }
+                Mode::Normal | Mode::Executable => {
+                    file_count += 1;
+                    let dm = data_map.clone();
+                    let sem = semaphore.clone();
+                    set.spawn(async move {
+                        let _permit = sem.acquire().await
+                            .map_err(|e| anyhow::anyhow!("semaphore: {e}"))?;
+
+                        let raw = dm.get(&entry.hash)
+                            .ok_or_else(|| anyhow::anyhow!("Blob hash {} not found in archive", entry.hash))?;
+
+                        let (_hdr, blob_body) = read_header_and_body(raw)
+                            .ok_or_else(|| anyhow::anyhow!("Failed to parse header for blob {}", entry.hash))?;
+
+                        tokio::fs::write(&entry_path, blob_body).await
+                            .context(format!("Failed to write file {:?}", entry_path))?;
+
+                        Ok::<_, anyhow::Error>(())
+                    });
+                }
+                _ => {
+                    anyhow::bail!("Unsupported mode {} for entry {}", entry.mode.as_str(), entry.path);
+                }
+            }
+        }
+
+        while let Some(result) = set.join_next().await {
+            result??;
+        }
+
+        Ok(file_count)
+    })
+}
+
+fn archive_build_tree(
+    objects: Arc<tokio::sync::Mutex<HashMap<Hash, Vec<u8>>>>,
+    path: PathBuf,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<Hash>> + Send>> {
+    Box::pin(async move {
+        anyhow::ensure!(path.is_dir(), "Path must be a directory");
+        let mut dir_entries = read_dir(&path).await?;
+
+        let mut dir_paths = Vec::new();
+        let mut file_paths = Vec::new();
+        while let Some(entry) = dir_entries.next_entry().await? {
+            let entry_path = entry.path();
+            if entry.file_type().await?.is_dir() {
+                dir_paths.push(entry_path);
+            } else {
+                file_paths.push(entry_path);
+            }
+        }
+
+        let mut entries = Vec::new();
+
+        // Process subdirectories concurrently
+        let mut dir_set = JoinSet::new();
+        for dir_path in dir_paths {
+            let objects_clone = objects.clone();
+            dir_set.spawn(async move {
+                let name = dir_path.file_name()
+                    .map(|n| n.to_string_lossy().to_string())
+                    .unwrap_or_default();
+                let hash = archive_build_tree(objects_clone, dir_path).await?;
+                Ok::<_, anyhow::Error>((name, hash))
+            });
+        }
+
+        // Process files concurrently with bounded parallelism
+        let semaphore = Arc::new(tokio::sync::Semaphore::new(64));
+        let mut file_set = JoinSet::new();
+        for file_path in file_paths {
+            let objects_clone = objects.clone();
+            let sem = semaphore.clone();
+            file_set.spawn(async move {
+                let _permit = sem.acquire().await
+                    .map_err(|e| anyhow::anyhow!("semaphore: {e}"))?;
+                let name = file_path.file_name()
+                    .map(|n| n.to_string_lossy().to_string())
+                    .unwrap_or_default();
+
+                let (data, hash) = tokio::task::spawn_blocking({
+                    let path = file_path.clone();
+                    move || -> anyhow::Result<(Vec<u8>, Hash)> {
+                        let data = std::fs::read(&path)?;
+                        let hash = compute_hash(BLOB_KEY, &data);
+                        Ok((data, hash))
+                    }
+                }).await??;
+
+                {
+                    let mut map = objects_clone.lock().await;
+                    if !map.contains_key(&hash) {
+                        let header = Header::new(ObjectType::Blob, data.len() as u64);
+                        let prefix = header.to_string();
+                        let mut full_data = Vec::with_capacity(prefix.len() + data.len());
+                        full_data.extend_from_slice(prefix.as_bytes());
+                        full_data.extend(data);
+                        map.insert(hash.clone(), full_data);
+                    }
+                }
+
+                Ok::<_, anyhow::Error>((name, hash))
+            });
+        }
+
+        // Collect directory results
+        while let Some(result) = dir_set.join_next().await {
+            let (name, hash) = result??;
+            entries.push(object_body::TreeEntry {
+                mode: Mode::Tree,
+                path: name,
+                hash,
+            });
+        }
+
+        // Collect file results
+        while let Some(result) = file_set.join_next().await {
+            let (name, hash) = result??;
+            entries.push(object_body::TreeEntry {
+                mode: Mode::Normal,
+                path: name,
+                hash,
+            });
+        }
+
+        // Build tree
+        let tree = object_body::Tree { contents: entries };
+        let tree_data = object_body::Object::to_data(&tree);
+        let hash = compute_hash(TREE_KEY, &tree_data);
+
+        {
+            let mut map = objects.lock().await;
+            if !map.contains_key(&hash) {
+                let header = Header::new(ObjectType::Tree, tree_data.len() as u64);
+                let prefix = header.to_string();
+                let mut full_data = Vec::with_capacity(prefix.len() + tree_data.len());
+                full_data.extend_from_slice(prefix.as_bytes());
+                full_data.extend(tree_data);
+                map.insert(hash.clone(), full_data);
+            }
+        }
+
+        Ok(hash)
+    })
+}
+
+async fn archive_directory(directory: &PathBuf, file: &PathBuf, compression: Compression) -> anyhow::Result<()> {
+    anyhow::ensure!(tokio::fs::metadata(file).await.is_err(), "Output file already exists");
+    anyhow::ensure!(
+        file.parent().map(|p| p.exists() && p.is_dir()) == Some(true),
+        "Parent directory must exist and be a directory"
+    );
+
+    let path = tokio::fs::canonicalize(directory).await
+        .context(format!("unable to canonicalize {directory:?}"))?;
+    anyhow::ensure!(path.is_dir(), "Path must be a directory");
+
+    let objects: Arc<tokio::sync::Mutex<HashMap<Hash, Vec<u8>>>> =
+        Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+
+    let root_hash = archive_build_tree(objects.clone(), path).await?;
+
+    // Build index
+    let index = object_body::Index {
+        tree: root_hash,
+        timestamp: Utc::now(),
+        metadata: HashMap::new(),
+    };
+    let index_data = object_body::Object::to_data(&index);
+    let index_hash = compute_hash(INDEX_KEY, &index_data);
+
+    // Build archive from collected objects
+    let objects = Arc::try_unwrap(objects)
+        .map_err(|_| anyhow::anyhow!("Failed to unwrap Arc"))?
+        .into_inner();
+
+    let objects_vec: Vec<(Hash, Vec<u8>)> = objects.into_iter().collect();
+
+    let mut i: u64 = 0;
+    let mut header_entries: Vec<ArchiveHeaderEntry> = Vec::new();
+    for (hash, data) in &objects_vec {
+        let length = data.len() as u64;
+        header_entries.push(ArchiveHeaderEntry {
+            hash: hash.clone(),
+            index: i,
+            length,
+        });
+        i += length;
+    }
+
+    let archive = Archive {
+        header: HEADER,
+        compression,
+        hash: index_hash.clone(),
+        index,
+        body: ArchiveBody {
+            header: header_entries,
+            entries: objects_vec.into_iter()
+                .map(|(_, data)| RawEntryData(data))
+                .collect(),
+        },
+    };
+
+    let arx_file = std::fs::File::create(file)?;
+    let mut writer = std::io::BufWriter::new(arx_file);
+    archive.to_data(&mut writer)?;
+
+    println!("{}", index_hash);
+    println!("Archive written to {:?}", file);
+
+    Ok(())
+}
 
 #[derive(Parser)]
 #[command(version, about, long_about = None)]
@@ -661,6 +940,22 @@ enum Commands {
     Unpack {
         #[arg(long)]
         file: PathBuf,
+    },
+
+    Extract {
+        #[arg(short, long)]
+        file: PathBuf,
+        #[arg(short, long)]
+        directory: PathBuf,
+    },
+
+    Archive {
+        #[arg(short, long)]
+        directory: PathBuf,
+        #[arg(short, long)]
+        file: PathBuf,
+        #[arg(short, long)]
+        compression: Compression,
     },
 }
 
@@ -1009,6 +1304,48 @@ mod tests {
 
         assert_dirs_equal(source.path(), &restore_path).await;
     }
+
+    async fn extract_roundtrip_with_compression(compression: Compression) {
+        let source = TempDir::new().unwrap();
+        let store_dir = TempDir::new().unwrap();
+
+        tokio::fs::write(source.path().join("hello.txt"), b"Hello, extract world!").await.unwrap();
+        let sub = source.path().join("sub");
+        tokio::fs::create_dir(&sub).await.unwrap();
+        tokio::fs::write(sub.join("data.txt"), b"Nested extract data").await.unwrap();
+
+        // Commit to store
+        let store = create_store(store_dir.path());
+        let source_path = source.path().to_path_buf();
+        let (_, index_hash, _) = build_index_from_path(&store, &source_path).await.unwrap();
+
+        // Pack to .arx file
+        let arx_dir = TempDir::new().unwrap();
+        let arx_path = arx_dir.path().join("test.arx");
+        pack_archive(&store, &arx_path, &index_hash, compression).await.unwrap();
+
+        // Extract directly to directory (no intermediate store)
+        let extract_dir = TempDir::new().unwrap();
+        let extract_path = extract_dir.path().join("output");
+        extract_archive(&arx_path, &extract_path).await.unwrap();
+
+        assert_dirs_equal(source.path(), &extract_path).await;
+    }
+
+    #[tokio::test]
+    async fn extract_roundtrip_none() {
+        extract_roundtrip_with_compression(Compression::None).await;
+    }
+
+    #[tokio::test]
+    async fn extract_roundtrip_zstd() {
+        extract_roundtrip_with_compression(Compression::Zstd).await;
+    }
+
+    #[tokio::test]
+    async fn extract_roundtrip_gzip() {
+        extract_roundtrip_with_compression(Compression::Gzip).await;
+    }
 }
 
 async fn run(cli: Cli) -> anyhow::Result<()> {
@@ -1038,6 +1375,12 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
         }
         Commands::Unpack { file } => {
             unpack_archive(&cli.store, &file).await?
+        }
+        Commands::Extract { file, directory } => {
+            extract_archive(&file, &directory).await?
+        }
+        Commands::Archive { directory, file, compression } => {
+            archive_directory(&directory, &file, compression).await?
         }
     }
     Ok(())
