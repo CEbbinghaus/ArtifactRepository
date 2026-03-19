@@ -101,3 +101,85 @@ impl Store {
 		Ok(())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use futures::io::Cursor;
+
+    fn make_hash(fill: u8) -> Hash {
+        Hash::from([fill; 64])
+    }
+
+    fn make_store(dir: &std::path::Path) -> Store {
+        let builder = opendal::services::Fs::default().root(dir.to_str().unwrap());
+        Store::from_builder(builder).unwrap()
+    }
+
+    #[tokio::test]
+    async fn put_then_exists_returns_true() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = make_store(tmp.path());
+        let hash = make_hash(0x11);
+        let header = Header::new(crate::ObjectType::Blob, 5);
+        let data = Cursor::new(b"hello".to_vec());
+        let obj = StoreObject::new_with_header(header, data);
+        store.put_object(&hash, obj).await.unwrap();
+        assert!(store.exists(&hash).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn put_then_get_returns_same_data() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = make_store(tmp.path());
+        let hash = make_hash(0x22);
+        let header = Header::new(crate::ObjectType::Blob, 5);
+        let data = Cursor::new(b"world".to_vec());
+        let obj = StoreObject::new_with_header(header, data);
+        store.put_object(&hash, obj).await.unwrap();
+
+        let mut retrieved = store.get_object(&hash).await.unwrap();
+        assert_eq!(retrieved.header.object_type, crate::ObjectType::Blob);
+        assert_eq!(retrieved.header.size, 5);
+
+        let mut body = Vec::new();
+        futures::AsyncReadExt::read_to_end(&mut retrieved, &mut body).await.unwrap();
+        assert_eq!(body, b"world");
+    }
+
+    #[tokio::test]
+    async fn exists_returns_false_for_missing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = make_store(tmp.path());
+        let hash = make_hash(0x33);
+        assert!(!store.exists(&hash).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn get_object_missing_returns_error() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = make_store(tmp.path());
+        let hash = make_hash(0x44);
+        assert!(store.get_object(&hash).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn put_same_object_twice_is_idempotent() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = make_store(tmp.path());
+        let hash = make_hash(0x55);
+
+        for _ in 0..2 {
+            let header = Header::new(crate::ObjectType::Tree, 4);
+            let data = Cursor::new(b"data".to_vec());
+            let obj = StoreObject::new_with_header(header, data);
+            store.put_object(&hash, obj).await.unwrap();
+        }
+
+        assert!(store.exists(&hash).await.unwrap());
+        let mut retrieved = store.get_object(&hash).await.unwrap();
+        let mut body = Vec::new();
+        futures::AsyncReadExt::read_to_end(&mut retrieved, &mut body).await.unwrap();
+        assert_eq!(body, b"data");
+    }
+}

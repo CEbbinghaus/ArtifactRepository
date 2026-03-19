@@ -119,3 +119,113 @@ pub fn compute_hash(key: &str, data: &[u8]) -> Hash {
     hasher.update(data);
     Hash::from(hasher)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn compute_hash_deterministic() {
+        let h1 = compute_hash("blob", b"hello world");
+        let h2 = compute_hash("blob", b"hello world");
+        assert_eq!(h1, h2);
+    }
+
+    #[test]
+    fn compute_hash_different_keys_different_hashes() {
+        let h1 = compute_hash("blob", b"data");
+        let h2 = compute_hash("tree", b"data");
+        assert_ne!(h1, h2);
+    }
+
+    #[test]
+    fn compute_hash_different_data_different_hashes() {
+        let h1 = compute_hash("blob", b"data1");
+        let h2 = compute_hash("blob", b"data2");
+        assert_ne!(h1, h2);
+    }
+
+    #[test]
+    fn compute_hash_empty_data() {
+        let h = compute_hash("blob", b"");
+        // Just verify it doesn't panic and produces a valid hash
+        assert_eq!(h.as_str().len(), 128);
+    }
+
+    #[test]
+    fn pipe_copies_exact_bytes() {
+        let input = b"hello world, this is test data!";
+        let mut reader = &input[..];
+        let mut writer = Vec::new();
+        pipe(&mut reader, &mut writer).unwrap();
+        assert_eq!(writer, input);
+    }
+
+    #[test]
+    fn pipe_empty_reader() {
+        let input: &[u8] = b"";
+        let mut reader = input;
+        let mut writer = Vec::new();
+        pipe(&mut reader, &mut writer).unwrap();
+        assert!(writer.is_empty());
+    }
+
+    #[test]
+    fn pipe_large_data() {
+        let input: Vec<u8> = (0..200_000).map(|i| (i % 256) as u8).collect();
+        let mut reader = &input[..];
+        let mut writer = Vec::new();
+        pipe(&mut reader, &mut writer).unwrap();
+        assert_eq!(writer, input);
+    }
+
+    #[test]
+    fn read_header_and_body_splits_on_null() {
+        let data = b"blob 5\0hello";
+        let (header, body) = read_header_and_body(data).unwrap();
+        assert_eq!(header.object_type, ObjectType::Blob);
+        assert_eq!(header.size, 5);
+        assert_eq!(body, b"hello");
+    }
+
+    #[test]
+    fn read_header_and_body_no_null_returns_none() {
+        let data = b"blob 5 hello";
+        assert!(read_header_and_body(data).is_none());
+    }
+
+    #[test]
+    fn read_header_from_slice_parses_correctly() {
+        let data = b"blob 42";
+        let h = read_header_from_slice(data).unwrap();
+        assert_eq!(h.object_type, ObjectType::Blob);
+        assert_eq!(h.size, 42);
+    }
+
+    #[test]
+    fn read_header_from_slice_tree() {
+        let data = b"tree 100";
+        let h = read_header_from_slice(data).unwrap();
+        assert_eq!(h.object_type, ObjectType::Tree);
+        assert_eq!(h.size, 100);
+    }
+
+    #[test]
+    fn read_header_from_slice_invalid_type() {
+        let data = b"unknown 42";
+        assert!(read_header_from_slice(data).is_none());
+    }
+
+    #[test]
+    fn read_slice_until_byte_finds_byte() {
+        let data = b"hello\0world";
+        let result = read_slice_until_byte(data, 0).unwrap();
+        assert_eq!(result, b"hello");
+    }
+
+    #[test]
+    fn read_slice_until_byte_not_found() {
+        let data = b"hello world";
+        assert!(read_slice_until_byte(data, 0).is_none());
+    }
+}

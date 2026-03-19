@@ -94,3 +94,91 @@ impl Header {
         Self::from_buf(&buffer)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn to_string_produces_expected_format() {
+        let h = Header::new(ObjectType::Blob, 42);
+        assert_eq!(h.to_string(), "blob 42\0");
+    }
+
+    #[test]
+    fn to_string_tree_type() {
+        let h = Header::new(ObjectType::Tree, 0);
+        assert_eq!(h.to_string(), "tree 0\0");
+    }
+
+    #[test]
+    fn to_string_index_type() {
+        let h = Header::new(ObjectType::Index, 1024);
+        assert_eq!(h.to_string(), "indx 1024\0");
+    }
+
+    #[test]
+    fn from_str_round_trip() {
+        let original = Header::new(ObjectType::Blob, 999);
+        let s = original.to_string();
+        // Strip the null byte for from_str
+        let s = &s[..s.len() - 1];
+        let recovered = Header::from_str(s).unwrap();
+        assert_eq!(recovered.object_type, original.object_type);
+        assert_eq!(recovered.size, original.size);
+    }
+
+    #[test]
+    fn from_data_with_null_byte() {
+        let data = b"blob 42\0";
+        let h = Header::from_data(data).unwrap();
+        assert_eq!(h.object_type, ObjectType::Blob);
+        assert_eq!(h.size, 42);
+    }
+
+    #[test]
+    fn from_data_without_null_byte() {
+        let data = b"tree 100";
+        let h = Header::from_data(data).unwrap();
+        assert_eq!(h.object_type, ObjectType::Tree);
+        assert_eq!(h.size, 100);
+    }
+
+    #[test]
+    fn write_to_read_from_sync_round_trip() {
+        let original = Header::new(ObjectType::Blob, 512);
+        let mut buf = Vec::new();
+        original.write_to(&mut buf).unwrap();
+
+        // Append some body data to make it realistic
+        buf.extend_from_slice(b"some body data here");
+
+        let mut cursor = std::io::Cursor::new(&buf);
+        let recovered = Header::read_from(&mut cursor).unwrap();
+        assert_eq!(recovered.object_type, original.object_type);
+        assert_eq!(recovered.size, original.size);
+    }
+
+    #[test]
+    fn from_str_rejects_missing_space() {
+        assert!(Header::from_str("blob42").is_err());
+    }
+
+    #[test]
+    fn from_str_rejects_invalid_type() {
+        assert!(Header::from_str("unknown 42").is_err());
+    }
+
+    #[test]
+    fn from_data_rejects_empty() {
+        assert!(Header::from_data(b"").is_err());
+    }
+
+    #[test]
+    fn from_buf_extracts_header_before_null() {
+        let buf = b"blob 100\0body data here";
+        let h = Header::from_buf(buf).unwrap();
+        assert_eq!(h.object_type, ObjectType::Blob);
+        assert_eq!(h.size, 100);
+    }
+}

@@ -55,3 +55,68 @@ impl Object {
 		Ok(())
 	}
 }
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	#[test]
+	fn to_data_from_data_round_trip() {
+		let obj = Object {
+			header: Header::new(crate::ObjectType::Blob, 5),
+			data: b"hello".to_vec(),
+		};
+		let bytes = obj.to_data();
+		let recovered = Object::from_data(&bytes).unwrap();
+		assert_eq!(recovered.header.object_type, crate::ObjectType::Blob);
+		assert_eq!(recovered.header.size, 5);
+		assert_eq!(recovered.data, b"hello");
+	}
+
+	#[test]
+	fn to_hash_deterministic() {
+		let obj1 = Object {
+			header: Header::new(crate::ObjectType::Blob, 3),
+			data: b"abc".to_vec(),
+		};
+		let obj2 = Object {
+			header: Header::new(crate::ObjectType::Blob, 3),
+			data: b"abc".to_vec(),
+		};
+		assert_eq!(obj1.to_hash(), obj2.to_hash());
+	}
+
+	#[test]
+	fn to_hash_different_data_different_hash() {
+		let obj1 = Object {
+			header: Header::new(crate::ObjectType::Blob, 3),
+			data: b"abc".to_vec(),
+		};
+		let obj2 = Object {
+			header: Header::new(crate::ObjectType::Blob, 3),
+			data: b"xyz".to_vec(),
+		};
+		assert_ne!(obj1.to_hash(), obj2.to_hash());
+	}
+
+	#[test]
+	fn write_to_read_from_round_trip() {
+		let obj = Object {
+			header: Header::new(crate::ObjectType::Tree, 11),
+			data: b"tree body!!".to_vec(),
+		};
+		let mut buf = Vec::new();
+		obj.write_to(&mut buf).unwrap();
+
+		let mut cursor = std::io::Cursor::new(&buf);
+		let recovered = Object::read_from(&mut cursor).unwrap();
+		assert_eq!(recovered.header.object_type, crate::ObjectType::Tree);
+		assert_eq!(recovered.header.size, 11);
+		assert_eq!(recovered.data, b"tree body!!");
+	}
+
+	#[test]
+	fn from_data_returns_none_for_garbage() {
+		assert!(Object::from_data(b"no null byte here").is_none());
+	}
+}

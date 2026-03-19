@@ -171,3 +171,183 @@ impl Object for Tree {
         data
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::TimeZone;
+
+    fn make_hash(fill: u8) -> Hash {
+        Hash::from([fill; 64])
+    }
+
+    // --- Index tests ---
+
+    #[test]
+    fn index_round_trip_no_metadata() {
+        let ts = Utc.with_ymd_and_hms(2024, 1, 15, 12, 0, 0).unwrap();
+        let idx = Index {
+            tree: make_hash(0xaa),
+            timestamp: ts,
+            metadata: HashMap::new(),
+        };
+        let data = idx.to_data();
+        let recovered = Index::from_data(&data).unwrap();
+        assert_eq!(recovered.tree, make_hash(0xaa));
+        assert_eq!(recovered.timestamp, ts);
+        assert!(recovered.metadata.is_empty());
+    }
+
+    #[test]
+    fn index_round_trip_with_metadata() {
+        let ts = Utc.with_ymd_and_hms(2025, 6, 1, 8, 30, 0).unwrap();
+        let mut meta = HashMap::new();
+        meta.insert("version".to_string(), "1.0".to_string());
+        meta.insert("author".to_string(), "test".to_string());
+        let idx = Index {
+            tree: make_hash(0xbb),
+            timestamp: ts,
+            metadata: meta,
+        };
+        let data = idx.to_data();
+        let recovered = Index::from_data(&data).unwrap();
+        assert_eq!(recovered.tree, make_hash(0xbb));
+        assert_eq!(recovered.timestamp, ts);
+        assert_eq!(recovered.metadata.get("version").unwrap(), "1.0");
+        assert_eq!(recovered.metadata.get("author").unwrap(), "test");
+    }
+
+    #[test]
+    fn index_body_ends_with_double_newline() {
+        let ts = Utc.with_ymd_and_hms(2024, 1, 1, 0, 0, 0).unwrap();
+        let idx = Index {
+            tree: make_hash(0x00),
+            timestamp: ts,
+            metadata: HashMap::new(),
+        };
+        let data = idx.to_data();
+        let s = std::str::from_utf8(&data).unwrap();
+        assert!(s.ends_with("\n\n"), "Index body must end with \\n\\n");
+    }
+
+    #[test]
+    fn index_tree_must_be_first_line() {
+        // Metadata before tree should fail
+        let bad = format!(
+            "custom_key: value\ntree: {}\ntimestamp: {}\n\n",
+            make_hash(0x00).as_str(),
+            Utc.with_ymd_and_hms(2024, 1, 1, 0, 0, 0).unwrap().to_rfc3339(),
+        );
+        let result = Index::from_data(bad.as_bytes());
+        assert!(result.is_err(), "Metadata before tree/timestamp should fail");
+    }
+
+    #[test]
+    fn index_rejects_missing_double_newline() {
+        let ts = Utc.with_ymd_and_hms(2024, 1, 1, 0, 0, 0).unwrap();
+        let bad = format!(
+            "tree: {}\ntimestamp: {}\n",
+            make_hash(0x00).as_str(),
+            ts.to_rfc3339(),
+        );
+        let result = Index::from_data(bad.as_bytes());
+        assert!(result.is_err());
+    }
+
+    // --- Tree tests ---
+
+    #[test]
+    fn tree_round_trip_empty() {
+        let tree = Tree { contents: vec![] };
+        let data = tree.to_data();
+        assert!(data.is_empty());
+        let recovered = Tree::from_data(&data).unwrap();
+        assert!(recovered.contents.is_empty());
+    }
+
+    #[test]
+    fn tree_round_trip_single_normal_entry() {
+        let tree = Tree {
+            contents: vec![TreeEntry {
+                mode: Mode::Normal,
+                path: "file.txt".to_string(),
+                hash: make_hash(0x11),
+            }],
+        };
+        let data = tree.to_data();
+        let recovered = Tree::from_data(&data).unwrap();
+        assert_eq!(recovered.contents.len(), 1);
+        assert_eq!(recovered.contents[0].path, "file.txt");
+        assert_eq!(recovered.contents[0].hash, make_hash(0x11));
+        assert_eq!(recovered.contents[0].mode.as_str(), "100644");
+    }
+
+    #[test]
+    fn tree_round_trip_mixed_entries() {
+        let entries = vec![
+            TreeEntry {
+                mode: Mode::Tree,
+                path: "subdir".to_string(),
+                hash: make_hash(0x01),
+            },
+            TreeEntry {
+                mode: Mode::Normal,
+                path: "readme.md".to_string(),
+                hash: make_hash(0x02),
+            },
+            TreeEntry {
+                mode: Mode::Executable,
+                path: "run.sh".to_string(),
+                hash: make_hash(0x03),
+            },
+        ];
+        let tree = Tree { contents: entries };
+        let data = tree.to_data();
+        let recovered = Tree::from_data(&data).unwrap();
+        assert_eq!(recovered.contents.len(), 3);
+        assert_eq!(recovered.contents[0].mode.as_str(), "040000");
+        assert_eq!(recovered.contents[0].path, "subdir");
+        assert_eq!(recovered.contents[1].mode.as_str(), "100644");
+        assert_eq!(recovered.contents[1].path, "readme.md");
+        assert_eq!(recovered.contents[2].mode.as_str(), "100755");
+        assert_eq!(recovered.contents[2].path, "run.sh");
+    }
+
+    #[test]
+    fn tree_entry_ordering_preserved() {
+        let entries = vec![
+            TreeEntry { mode: Mode::Normal, path: "z_last".to_string(), hash: make_hash(0x0a) },
+            TreeEntry { mode: Mode::Normal, path: "a_first".to_string(), hash: make_hash(0x0b) },
+            TreeEntry { mode: Mode::Normal, path: "m_middle".to_string(), hash: make_hash(0x0c) },
+        ];
+        let tree = Tree { contents: entries };
+        let data = tree.to_data();
+        let recovered = Tree::from_data(&data).unwrap();
+        assert_eq!(recovered.contents[0].path, "z_last");
+        assert_eq!(recovered.contents[1].path, "a_first");
+        assert_eq!(recovered.contents[2].path, "m_middle");
+    }
+
+    #[test]
+    fn tree_filenames_with_special_characters() {
+        let entries = vec![
+            TreeEntry { mode: Mode::Normal, path: "file with spaces.txt".to_string(), hash: make_hash(0xdd) },
+            TreeEntry { mode: Mode::Normal, path: "file-with-dashes".to_string(), hash: make_hash(0xee) },
+            TreeEntry { mode: Mode::Normal, path: "file.multiple.dots.rs".to_string(), hash: make_hash(0xff) },
+        ];
+        let tree = Tree { contents: entries };
+        let data = tree.to_data();
+        let recovered = Tree::from_data(&data).unwrap();
+        assert_eq!(recovered.contents[0].path, "file with spaces.txt");
+        assert_eq!(recovered.contents[1].path, "file-with-dashes");
+        assert_eq!(recovered.contents[2].path, "file.multiple.dots.rs");
+    }
+
+    #[test]
+    fn tree_entry_mode_values() {
+        assert_eq!(Mode::Tree.as_str(), "040000");
+        assert_eq!(Mode::Normal.as_str(), "100644");
+        assert_eq!(Mode::Executable.as_str(), "100755");
+        assert_eq!(Mode::SymbolicLink.as_str(), "120000");
+    }
+}

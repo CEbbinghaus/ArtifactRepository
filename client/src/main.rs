@@ -673,6 +673,344 @@ async fn main() {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::{BTreeMap, BTreeSet};
+    use tempfile::TempDir;
+
+    fn create_store(dir: &std::path::Path) -> Store {
+        let builder = opendal::services::Fs::default().root(dir.to_str().unwrap());
+        Store::from_builder(builder).unwrap()
+    }
+
+    fn collect_files_recursive<'a>(
+        base: &'a std::path::Path,
+        current: &'a std::path::Path,
+        result: &'a mut BTreeMap<String, Vec<u8>>,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'a>> {
+        Box::pin(async move {
+            let mut entries = tokio::fs::read_dir(current).await.unwrap();
+            while let Some(entry) = entries.next_entry().await.unwrap() {
+                let path = entry.path();
+                let rel = path.strip_prefix(base).unwrap().to_string_lossy().to_string();
+                if entry.file_type().await.unwrap().is_dir() {
+                    collect_files_recursive(base, &path, result).await;
+                } else {
+                    let data = tokio::fs::read(&path).await.unwrap();
+                    result.insert(rel, data);
+                }
+            }
+        })
+    }
+
+    fn collect_dirs_recursive<'a>(
+        base: &'a std::path::Path,
+        current: &'a std::path::Path,
+        result: &'a mut BTreeSet<String>,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'a>> {
+        Box::pin(async move {
+            let mut entries = tokio::fs::read_dir(current).await.unwrap();
+            while let Some(entry) = entries.next_entry().await.unwrap() {
+                let path = entry.path();
+                let rel = path.strip_prefix(base).unwrap().to_string_lossy().to_string();
+                if entry.file_type().await.unwrap().is_dir() {
+                    result.insert(rel);
+                    collect_dirs_recursive(base, &path, result).await;
+                }
+            }
+        })
+    }
+
+    async fn assert_dirs_equal(dir_a: &std::path::Path, dir_b: &std::path::Path) {
+        let mut files_a = BTreeMap::new();
+        let mut files_b = BTreeMap::new();
+        collect_files_recursive(dir_a, dir_a, &mut files_a).await;
+        collect_files_recursive(dir_b, dir_b, &mut files_b).await;
+        assert_eq!(
+            files_a.keys().collect::<Vec<_>>(),
+            files_b.keys().collect::<Vec<_>>(),
+            "File paths differ"
+        );
+        for (path, content_a) in &files_a {
+            let content_b = files_b.get(path).unwrap();
+            assert_eq!(content_a, content_b, "Content differs for {}", path);
+        }
+
+        let mut dirs_a = BTreeSet::new();
+        let mut dirs_b = BTreeSet::new();
+        collect_dirs_recursive(dir_a, dir_a, &mut dirs_a).await;
+        collect_dirs_recursive(dir_b, dir_b, &mut dirs_b).await;
+        assert_eq!(dirs_a, dirs_b, "Directory structure differs");
+    }
+
+    /// Load unpacked cache (2-char prefix layout) into an opendal Store.
+    async fn load_cache_into_store(
+        cache_dir: &std::path::Path,
+        store: &Store,
+    ) -> anyhow::Result<()> {
+        let mut dirs = tokio::fs::read_dir(cache_dir).await?;
+        while let Some(dir_entry) = dirs.next_entry().await? {
+            if !dir_entry.file_type().await?.is_dir() {
+                continue;
+            }
+            let dir_name = dir_entry.file_name().to_string_lossy().to_string();
+            if dir_name.len() != 2 {
+                continue;
+            }
+            let mut files = tokio::fs::read_dir(dir_entry.path()).await?;
+            while let Some(file_entry) = files.next_entry().await? {
+                if !file_entry.file_type().await?.is_file() {
+                    continue;
+                }
+                let file_name = file_entry.file_name().to_string_lossy().to_string();
+                let hex = format!("{}{}", dir_name, file_name);
+                let hash = Hash::try_from(hex.as_str())?;
+
+                let raw_data = tokio::fs::read(file_entry.path()).await?;
+                let (header, body) = read_header_and_body(&raw_data)
+                    .ok_or_else(|| anyhow::anyhow!("Failed to parse header from cache file"))?;
+
+                let reader = futures::io::Cursor::new(body.to_vec());
+                let store_obj = StoreObject::new_with_header(header, reader);
+                store.put_object(&hash, store_obj).await?;
+            }
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn commit_restore_roundtrip() {
+        let source = TempDir::new().unwrap();
+        let store_dir = TempDir::new().unwrap();
+
+        tokio::fs::write(source.path().join("hello.txt"), b"Hello, world!").await.unwrap();
+        tokio::fs::write(source.path().join("data.bin"), b"Some binary data \x00\x01\x02").await.unwrap();
+        let sub = source.path().join("subdir");
+        tokio::fs::create_dir(&sub).await.unwrap();
+        tokio::fs::write(sub.join("nested.txt"), b"I am nested").await.unwrap();
+
+        let store = create_store(store_dir.path());
+        let source_path = source.path().to_path_buf();
+        let (_, index_hash, _) = build_index_from_path(&store, &source_path).await.unwrap();
+
+        let restore = TempDir::new().unwrap();
+        let restore_path = restore.path().join("output");
+        restore_directory(&store, &restore_path, index_hash, false).await.unwrap();
+
+        assert_dirs_equal(source.path(), &restore_path).await;
+    }
+
+    #[tokio::test]
+    async fn commit_empty_directory() {
+        let source = TempDir::new().unwrap();
+        let store_dir = TempDir::new().unwrap();
+
+        let store = create_store(store_dir.path());
+        let source_path = source.path().to_path_buf();
+        let (_, index_hash, total_size) = build_index_from_path(&store, &source_path).await.unwrap();
+
+        assert_eq!(total_size, 0);
+
+        let restore = TempDir::new().unwrap();
+        let restore_path = restore.path().join("output");
+        restore_directory(&store, &restore_path, index_hash, false).await.unwrap();
+
+        let mut entries = tokio::fs::read_dir(&restore_path).await.unwrap();
+        assert!(
+            entries.next_entry().await.unwrap().is_none(),
+            "Restored empty directory should have no entries"
+        );
+    }
+
+    #[tokio::test]
+    async fn commit_nested_directories() {
+        let source = TempDir::new().unwrap();
+        let store_dir = TempDir::new().unwrap();
+
+        let deep = source.path().join("a").join("b").join("c");
+        tokio::fs::create_dir_all(&deep).await.unwrap();
+        tokio::fs::write(deep.join("file.txt"), b"deep file").await.unwrap();
+
+        let x_dir = source.path().join("x");
+        tokio::fs::create_dir(&x_dir).await.unwrap();
+        tokio::fs::write(x_dir.join("file.txt"), b"x file").await.unwrap();
+
+        let store = create_store(store_dir.path());
+        let source_path = source.path().to_path_buf();
+        let (_, index_hash, _) = build_index_from_path(&store, &source_path).await.unwrap();
+
+        let restore = TempDir::new().unwrap();
+        let restore_path = restore.path().join("output");
+        restore_directory(&store, &restore_path, index_hash, false).await.unwrap();
+
+        assert_dirs_equal(source.path(), &restore_path).await;
+    }
+
+    #[tokio::test]
+    async fn deduplication_identical_files() {
+        let source = TempDir::new().unwrap();
+        let store_dir = TempDir::new().unwrap();
+
+        let content = b"IDENTICAL CONTENT FOR DEDUP TEST";
+
+        let dir_a = source.path().join("dir_a");
+        let dir_b = source.path().join("dir_b");
+        tokio::fs::create_dir(&dir_a).await.unwrap();
+        tokio::fs::create_dir(&dir_b).await.unwrap();
+        tokio::fs::write(dir_a.join("file.txt"), content).await.unwrap();
+        tokio::fs::write(dir_b.join("file.txt"), content).await.unwrap();
+
+        let store = create_store(store_dir.path());
+        let source_path = source.path().to_path_buf();
+        let (index, _, _) = build_index_from_path(&store, &source_path).await.unwrap();
+
+        // Read root tree and collect file hashes from subtrees
+        let root_tree = read_tree_from_store(&store, &index.tree).await.unwrap();
+        let mut file_hashes = Vec::new();
+        for entry in &root_tree.contents {
+            let subtree = read_tree_from_store(&store, &entry.hash).await.unwrap();
+            for sub_entry in &subtree.contents {
+                if sub_entry.path == "file.txt" {
+                    file_hashes.push(sub_entry.hash.clone());
+                }
+            }
+        }
+
+        assert_eq!(file_hashes.len(), 2);
+        assert_eq!(
+            file_hashes[0], file_hashes[1],
+            "Identical files must produce the same blob hash"
+        );
+
+        let expected_hash = compute_hash(BLOB_KEY, content);
+        assert_eq!(file_hashes[0], expected_hash);
+
+        // Verify only one blob file exists in the store for that hash
+        assert!(store.exists(&expected_hash).await.unwrap());
+    }
+
+    async fn pack_unpack_roundtrip_with_compression(compression: Compression) {
+        let source = TempDir::new().unwrap();
+        let store_a_dir = TempDir::new().unwrap();
+
+        tokio::fs::write(source.path().join("hello.txt"), b"Hello, archive world!").await.unwrap();
+        let sub = source.path().join("sub");
+        tokio::fs::create_dir(&sub).await.unwrap();
+        tokio::fs::write(sub.join("data.txt"), b"Nested archive data").await.unwrap();
+
+        // Commit to store A
+        let store_a = create_store(store_a_dir.path());
+        let source_path = source.path().to_path_buf();
+        let (_, index_hash, _) = build_index_from_path(&store_a, &source_path).await.unwrap();
+
+        // Pack to .arx file
+        let arx_dir = TempDir::new().unwrap();
+        let arx_path = arx_dir.path().join("test.arx");
+        pack_archive(&store_a, &arx_path, &index_hash, compression).await.unwrap();
+        assert!(tokio::fs::metadata(&arx_path).await.is_ok(), ".arx file should exist");
+
+        // Unpack to cache B (file-based 2-char prefix layout)
+        let cache_b = TempDir::new().unwrap();
+        let cache_b_path = cache_b.path().to_path_buf();
+        unpack_archive(&cache_b_path, &arx_path).await.unwrap();
+
+        // Load cache B objects into a new opendal Store
+        let store_b_dir = TempDir::new().unwrap();
+        let store_b = create_store(store_b_dir.path());
+        load_cache_into_store(cache_b.path(), &store_b).await.unwrap();
+
+        // Restore from store B
+        let restore = TempDir::new().unwrap();
+        let restore_path = restore.path().join("output");
+        restore_directory(&store_b, &restore_path, index_hash, false).await.unwrap();
+
+        assert_dirs_equal(source.path(), &restore_path).await;
+    }
+
+    #[tokio::test]
+    async fn pack_unpack_roundtrip_none() {
+        pack_unpack_roundtrip_with_compression(Compression::None).await;
+    }
+
+    #[tokio::test]
+    async fn pack_unpack_roundtrip_zstd() {
+        pack_unpack_roundtrip_with_compression(Compression::Zstd).await;
+    }
+
+    #[tokio::test]
+    async fn pack_unpack_roundtrip_gzip() {
+        pack_unpack_roundtrip_with_compression(Compression::Gzip).await;
+    }
+
+    #[tokio::test]
+    async fn restore_with_validate() {
+        let source = TempDir::new().unwrap();
+        let store_dir = TempDir::new().unwrap();
+
+        tokio::fs::write(source.path().join("test.txt"), b"Validate me!").await.unwrap();
+        let sub = source.path().join("inner");
+        tokio::fs::create_dir(&sub).await.unwrap();
+        tokio::fs::write(sub.join("deep.txt"), b"Validate deep too").await.unwrap();
+
+        let store = create_store(store_dir.path());
+        let source_path = source.path().to_path_buf();
+        let (_, index_hash, _) = build_index_from_path(&store, &source_path).await.unwrap();
+
+        let restore = TempDir::new().unwrap();
+        let restore_path = restore.path().join("output");
+        // validate=true: re-reads restored files and checks hashes match
+        restore_directory(&store, &restore_path, index_hash, true).await.unwrap();
+
+        assert_dirs_equal(source.path(), &restore_path).await;
+    }
+
+    #[tokio::test]
+    async fn large_file_roundtrip() {
+        let source = TempDir::new().unwrap();
+        let store_dir = TempDir::new().unwrap();
+
+        // 1MB file with repeating pattern
+        let pattern = b"ABCDEFGHIJKLMNOP";
+        let large_data: Vec<u8> = pattern.iter().cycle().take(1024 * 1024).cloned().collect();
+        tokio::fs::write(source.path().join("large.bin"), &large_data).await.unwrap();
+
+        let store = create_store(store_dir.path());
+        let source_path = source.path().to_path_buf();
+        let (_, index_hash, _) = build_index_from_path(&store, &source_path).await.unwrap();
+
+        let restore = TempDir::new().unwrap();
+        let restore_path = restore.path().join("output");
+        restore_directory(&store, &restore_path, index_hash, false).await.unwrap();
+
+        let restored = tokio::fs::read(restore_path.join("large.bin")).await.unwrap();
+        assert_eq!(restored.len(), large_data.len());
+        assert_eq!(restored, large_data);
+    }
+
+    #[tokio::test]
+    async fn special_filenames_roundtrip() {
+        let source = TempDir::new().unwrap();
+        let store_dir = TempDir::new().unwrap();
+
+        tokio::fs::write(source.path().join("file with spaces.txt"), b"spaces").await.unwrap();
+        tokio::fs::write(source.path().join("file.multiple.dots.txt"), b"dots").await.unwrap();
+        tokio::fs::write(source.path().join("file-with-hyphens.txt"), b"hyphens").await.unwrap();
+        tokio::fs::write(source.path().join(".hidden-file"), b"hidden").await.unwrap();
+        tokio::fs::write(source.path().join("UPPERCASE.TXT"), b"upper").await.unwrap();
+
+        let store = create_store(store_dir.path());
+        let source_path = source.path().to_path_buf();
+        let (_, index_hash, _) = build_index_from_path(&store, &source_path).await.unwrap();
+
+        let restore = TempDir::new().unwrap();
+        let restore_path = restore.path().join("output");
+        restore_directory(&store, &restore_path, index_hash, false).await.unwrap();
+
+        assert_dirs_equal(source.path(), &restore_path).await;
+    }
+}
+
 async fn run(cli: Cli) -> anyhow::Result<()> {
     // Ensure store directory exists
     if tokio::fs::metadata(&cli.store).await.is_err() {

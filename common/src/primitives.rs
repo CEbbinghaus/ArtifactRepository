@@ -71,3 +71,70 @@ impl ObjectType {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn mode_round_trip_tree() {
+        let m = Mode::from_str("040000").unwrap();
+        assert_eq!(m.as_str(), "040000");
+    }
+
+    #[test]
+    fn mode_round_trip_normal() {
+        let m = Mode::from_str("100644").unwrap();
+        assert_eq!(m.as_str(), "100644");
+    }
+
+    #[test]
+    fn mode_round_trip_executable() {
+        let m = Mode::from_str("100755").unwrap();
+        assert_eq!(m.as_str(), "100755");
+    }
+
+    #[test]
+    fn mode_round_trip_symlink() {
+        let m = Mode::from_str("120000").unwrap();
+        assert_eq!(m.as_str(), "120000");
+    }
+
+    #[test]
+    fn mode_unknown_returns_none() {
+        assert!(Mode::from_str("999999").is_none());
+        assert!(Mode::from_str("").is_none());
+        assert!(Mode::from_str("blob").is_none());
+    }
+
+    #[test]
+    fn mode_display_matches_as_str() {
+        let m = Mode::Normal;
+        assert_eq!(format!("{}", m), m.as_str());
+    }
+
+    #[test]
+    fn object_type_round_trip_blob() {
+        let t = ObjectType::from_str("blob").unwrap();
+        assert_eq!(t.to_str(), "blob");
+    }
+
+    #[test]
+    fn object_type_round_trip_tree() {
+        let t = ObjectType::from_str("tree").unwrap();
+        assert_eq!(t.to_str(), "tree");
+    }
+
+    #[test]
+    fn object_type_round_trip_index() {
+        let t = ObjectType::from_str("indx").unwrap();
+        assert_eq!(t.to_str(), "indx");
+    }
+
+    #[test]
+    fn object_type_unknown_returns_none() {
+        assert!(ObjectType::from_str("unknown").is_none());
+        assert!(ObjectType::from_str("").is_none());
+        assert!(ObjectType::from_str("BLOB").is_none());
+    }
+}
