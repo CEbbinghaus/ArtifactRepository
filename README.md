@@ -1,76 +1,52 @@
 # ArtifactRepository
 
-This project aims to create a service, commandline, package/archive format allowing for the creation and distribution of "Artifact". An Artifact is any kind of file structure with some metadata attached to it. It could represent anything, as long as it can be defined through a file hirachy.
+A content-addressed artifact storage and distribution system built on SHA-512 Merkle trees. Create, store, and distribute file-based artifacts with automatic deduplication — if two artifacts share files, only one copy is stored.
 
-## Design
+## How It Works
 
-The ArtifactRepository design is based on a Sha-512 Merkel Tree which serves as the foundation of the Artifact. Each file within an Artifact is content addressed by its sha512 hash and directories are stored in an identical format to git. In general the object structure closely matches that of git. 
+Artifacts are directory trees hashed and stored as three object types — **Blobs** (files), **Trees** (directories), and **Indexes** (root pointers with metadata). Objects are identified by their SHA-512 hash, so identical content is automatically deduplicated across artifacts.
 
-The very top level of an Artifact is called an **Index** (git calls it a commit). This defines the artifact and contains any and all relevant metadata, such as the timestamp of creation. But since it simply contains any and all metadata in a simple key value format similar to HTTP headers, it allows for the same level of flexibility and metadata to be attached to an index.
-Some possibilities could include:
-* Git has of source that produced output
-* Version number of produced artifact
-* Deployment configuration (Debug vs Release)
-* GPG Signature
-* Artifact type
+```
+Index (root)
+  └─ Tree (directory)
+       ├─ Blob (file)
+       ├─ Blob (file)
+       └─ Tree (subdirectory)
+            └─ Blob (file)
+```
 
-One required key however is the `tree` key which defines the hash of the top level tree which forms the root of the artifact. This tree can be iterated over to discover more trees and blobs which together make up the entirety of the artifact.
+## Quick Start
 
-Trees & Blobs are directly inherited from Git's design and would be interoperable if it weren't for the differing hash sizes.
+```bash
+# Commit a directory into the local store
+client -s ./store commit --directory ./my-build-output/
 
-## Benefits
+# Pack into a distributable archive
+client -s ./store pack --index <hash> --file output.arx --compression zstd
 
-One of the key benefits of going with a merkel tree approach very similar to git is the automatic deduplication which occurs. Since Artifacts are stored as individual files indexed by their content on the server, One file contained within multiple artifacts (multiple copies of a library) is deduplicated amongst them all and only 1 copy is stored. This also works perfectly for horizontally scaling multiple servers which can operate on the same exact data store without running into conflicts (deletion can still cause problems but that is not the primary focus).
+# Unpack an archive into a store
+client -s ./store unpack --file output.arx
 
-This deduplication extends all the way into the Artifact archive format which thanks to the hashes will also only store a single copy of each file. This makes for an incredibly efficient archive format when many duplicate files are to be expected.
+# Restore files from a store
+client -s ./store restore --index <hash> --directory ./output/
+```
 
-## Client
+## Components
 
-The AR Client is a small commandline utility allowing for local creation of Artifacts, Either in the .ar archive format or as a local artifact store similar to the one in the server (useful when creating multiple artifacts on the same machine and deduplication is desired)
+| Crate | Description |
+|-------|-------------|
+| **common** | Shared library — object model, store abstraction, archive format |
+| **client** | CLI tool — commit, restore, pack, unpack, push, pull |
+| **server** | HTTP API — content-addressed object storage with optional S3 backing |
 
-It supports Uploading and Downloading Indexes to/from the ArtifactRepository Server which allows for distribution of artifacts amongst clients via the index hash.
+## Documentation
 
-## Server
+- [Architecture](docs/architecture.md) — system design, data model, component interactions
+- [Store Format](docs/store-format.md) — byte-level specification of stored objects
+- [Archive Format](docs/archive-format.md) — byte-level specification of `.arx` archives
+- [Usage Guide](docs/usage.md) — client CLI and server API reference
+- [Benchmarks](docs/benchmarks.md) — performance measurements
 
-The ArtifactRepository Server is a simple HTTP server which with basic REST calls allows uploading & downloading artifacts. Internally it stores these in its content addressed store which allows for multiple servers to back onto the same data source, enabling horizontal scaling.
+## License
 
-One of the key functionalities of a server is that it allows for exactly one upstream to defined which makes the server act in a sort of relay mode. Any artifacts uploaded to it will be mirrored to the upstream, and any artifacts requested will be queried against the upstream if they are not present locally. This allows for multi-tiered caching through the use of machine local, region local and global instances which mirror data between them depending on where the data is required.
-
-Another key consideration is the ability to back a sever onto local file systems as well as S3 compatible object storage API's for global replication and high availability.
-## Artifact File Format
-
-The artifact file format `.ar` is an Archive format which is purpose built for artifacts.
-
-It is structured as follows:
-
-| Data    | Description                         |
-| ------- | ----------------------------------- |
-| [u8; 4] | header / magic number               |
-| [u8; 2] | compression method                  |
-| [u8; N] | data (compressed with above method) |
-
-With the data layout being as follows
-
-| Section       | Description |
-| ------------- | ------------- |
-| [HEADER]      | Archive header |
-| [INDEX]       | Index file |
-| [BLOBS/TREES] | Collection of Blobs & Trees |
-
-The HEADER must be laid out as follows:
-| Data | Description |
-| ---- | ----------- |
-| [entry; N] | Entries |
-| [u8; 1] | Null Terminator |
-
-with each entry as follows:
-
-| Data    | Description |
-| ------- | ----------- |
-| [u8;64] | Hash        |
-| [u64]   | Offset      |
-| [u64]   | Length      |
-
-All data within the data should be stored in its uncompressed form and taken directly from the binary object records.
-
-A supplementary artifact format `.sar` is entirely identical but without the requirement for every blob/tree to be present. Only those within the HEADER are guaranteed to exist within the archive and as such can aid in cutting down on data transmitted when a server/client is only missing a small number of files.
+See [LICENSE](LICENSE).
