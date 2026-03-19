@@ -20,11 +20,11 @@ use tokio::{
     io::{AsyncReadExt, AsyncWriteExt, AsyncBufReadExt, BufReader, BufWriter},
     task::JoinSet,
 };
-use opendal;
 
 // Helper to build Index from filesystem
+#[allow(clippy::ptr_arg)]
 async fn build_index_from_path(store: &Store, path: &PathBuf) -> anyhow::Result<(object_body::Index, Hash, u128)> {
-    anyhow::ensure!(path.is_dir(), "Path must be a directory");
+    anyhow::ensure!(path.is_dir(), "path must be a directory");
 
     let (tree_hash, total_size) = build_tree_from_dir(store.clone(), path.clone()).await?;
 
@@ -46,12 +46,13 @@ async fn build_index_from_path(store: &Store, path: &PathBuf) -> anyhow::Result<
     Ok((index, index_hash, total_size))
 }
 
+#[allow(clippy::type_complexity)]
 fn build_tree_from_dir(
     store: Store,
     path: PathBuf,
 ) -> std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<(Hash, u128)>> + Send>> {
     Box::pin(async move {
-        anyhow::ensure!(path.is_dir(), "Path must be a directory");
+        anyhow::ensure!(path.is_dir(), "path must be a directory");
         let mut dir_entries = read_dir(&path).await?;
 
         // Collect all entries first so we can process them concurrently
@@ -157,7 +158,7 @@ fn build_tree_from_dir(
 // Helper to read Tree from Store
 async fn read_tree_from_store(store: &Store, hash: &Hash) -> anyhow::Result<object_body::Tree> {
     let mut store_obj = store.get_object(hash).await?;
-    anyhow::ensure!(store_obj.header.object_type == ObjectType::Tree, "Expected Tree object");
+    anyhow::ensure!(store_obj.header.object_type == ObjectType::Tree, "expected tree object");
 
     let mut data = Vec::new();
     store_obj.read_to_end(&mut data).await?;
@@ -167,7 +168,7 @@ async fn read_tree_from_store(store: &Store, hash: &Hash) -> anyhow::Result<obje
 
 async fn commit_directory(store: &Store, path: &PathBuf) -> anyhow::Result<()> {
     let path_meta = tokio::fs::metadata(path).await?;
-    anyhow::ensure!(path_meta.is_dir(), "Path must be a directory");
+    anyhow::ensure!(path_meta.is_dir(), "path must be a directory");
 
     let path = tokio::fs::canonicalize(path).await.context(format!("unable to canonicalize {path:?}"))?;
 
@@ -180,14 +181,14 @@ async fn commit_directory(store: &Store, path: &PathBuf) -> anyhow::Result<()> {
 
 async fn restore_directory(store: &Store, path: &PathBuf, index_hash: Hash, validate: bool) -> anyhow::Result<()> {
     if tokio::fs::metadata(path).await.is_err() {
-        create_dir_all(path).await.context("Failed to create directory")?;
+        create_dir_all(path).await.context("failed to create directory")?;
     }
 
     let path_meta = tokio::fs::metadata(path).await?;
-    anyhow::ensure!(path_meta.is_dir(), "Path provided must be a valid directory");
+    anyhow::ensure!(path_meta.is_dir(), "path must be a valid directory");
 
     let mut entries = read_dir(path).await?;
-    anyhow::ensure!(entries.next_entry().await?.is_none(), "Path provided must be an empty directory");
+    anyhow::ensure!(entries.next_entry().await?.is_none(), "path must be an empty directory");
 
     let mut store_obj = store.get_object(&index_hash).await?;
     let mut index_data = Vec::new();
@@ -204,6 +205,7 @@ async fn restore_directory(store: &Store, path: &PathBuf, index_hash: Hash, vali
     Ok(())
 }
 
+#[allow(clippy::ptr_arg)]
 fn validate_tree_at_path<'a>(
     store: &'a Store,
     tree: &'a object_body::Tree,
@@ -229,49 +231,63 @@ fn validate_tree_at_path<'a>(
                             Ok(compute_hash(BLOB_KEY, &data))
                         }
                     }).await??;
-                    anyhow::ensure!(computed_hash == expected_hash, "Hash mismatch for {}", entry_name);
+                    anyhow::ensure!(computed_hash == expected_hash, "hash mismatch for {}", entry_name);
                 }
-                ObjectType::Index => anyhow::bail!("Invalid ObjectType in tree"),
+                ObjectType::Index => anyhow::bail!("invalid object type in tree"),
             }
         }
         Ok(())
     })
 }
 
+#[allow(clippy::ptr_arg)]
 fn write_tree_to_path<'a>(
     store: &'a Store,
     tree: &'a object_body::Tree,
     path: &'a PathBuf,
 ) -> std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<()>> + Send + 'a>> {
     Box::pin(async move {
+        let semaphore = Arc::new(tokio::sync::Semaphore::new(64));
+        let mut blob_set = JoinSet::new();
+
         for entry in &tree.contents {
             let entry_path = path.join(&entry.path);
             let header = store.get_object(&entry.hash).await?.header;
 
             match header.object_type {
                 ObjectType::Tree => {
-                    create_dir(&entry_path).await.context("Failed to create directory")?;
+                    create_dir(&entry_path).await.context("failed to create directory")?;
                     let subtree = read_tree_from_store(store, &entry.hash).await?;
                     write_tree_to_path(store, &subtree, &entry_path).await?;
                 }
                 ObjectType::Blob => {
-                    let file = File::create(&entry_path).await.context("Failed to create file")?;
-                    let mut writer = BufWriter::new(file);
-                    let mut store_obj = store.get_object(&entry.hash).await?;
+                    let store_clone = store.clone();
+                    let hash = entry.hash.clone();
+                    let sem = semaphore.clone();
+                    blob_set.spawn(async move {
+                        let _permit = sem.acquire().await
+                            .map_err(|e| anyhow::anyhow!("semaphore: {e}"))?;
 
-                    let mut data = [0u8; 65536];
-                    loop {
-                        let num = store_obj.read(&mut data).await?;
-                        if num == 0 {
-                            break;
-                        }
-                        writer.write_all(&data[..num]).await?;
-                    }
-                    writer.flush().await?;
+                        let mut store_obj = store_clone.get_object(&hash).await?;
+                        let mut data = Vec::with_capacity(store_obj.header.size as usize);
+                        store_obj.read_to_end(&mut data).await?;
+
+                        let path = entry_path;
+                        tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+                            std::fs::write(&path, &data)
+                                .context(format!("failed to write file {:?}", path))?;
+                            Ok(())
+                        }).await?
+                    });
                 }
-                ObjectType::Index => anyhow::bail!("Invalid ObjectType in tree"),
+                ObjectType::Index => anyhow::bail!("invalid object type in tree"),
             }
         }
+
+        while let Some(result) = blob_set.join_next().await {
+            result??;
+        }
+
         Ok(())
     })
 }
@@ -331,7 +347,7 @@ async fn push_cache(cache: &PathBuf, url: &String, hash: Option<Hash>) -> anyhow
                 prefix.to_string_lossy(),
                 sub_entry.file_name().to_string_lossy()
             );
-            let hash = Hash::try_from(name).context("Invalid hash")?;
+            let hash = Hash::try_from(name).context("invalid hash")?;
 
             let sub_path = sub_entry.path();
             upload_object(&hash, &sub_path, url).await?;
@@ -347,28 +363,28 @@ fn pull_tree<'a>(cache: &'a PathBuf, url: &'a String, tree_hash: &'a Hash) -> st
         // tree already exists locally so we can skip downloading it
         if tokio::fs::metadata(&tree_path).await.is_err() {
             let header = download_object(tree_hash, &tree_path, url).await
-                .context(format!("Unable to download object with hash {tree_hash}"))?;
-            anyhow::ensure!(header.object_type == ObjectType::Tree, "Expected Tree object");
+                .context(format!("unable to download object with hash {tree_hash}"))?;
+            anyhow::ensure!(header.object_type == ObjectType::Tree, "expected tree object");
         }
 
-        let mut file = File::open(tree_path).await.context("Tree file should exist")?;
+        let mut file = File::open(tree_path).await.context("tree file should exist")?;
         let mut index_data = Vec::new();
         let _ = file
             .read_to_end(&mut index_data)
             .await
-            .context("File should be readable")?;
+            .context("file should be readable")?;
 
         let (_, data) =
-            read_header_and_body(&index_data).context("Tree should be in the correct format")?;
+            read_header_and_body(&index_data).context("tree should be in the correct format")?;
 
         let index_body: object_body::Tree = object_body::Object::from_data(data)?;
 
         for entry in index_body.contents {
             let obj_path = entry.hash.get_path(cache);
             let header = download_object(&entry.hash, &obj_path, url).await
-                .context(format!("Unable to download object with hash {}", entry.hash))?;
+                .context(format!("unable to download object with hash {}", entry.hash))?;
 
-            anyhow::ensure!(header.object_type != ObjectType::Index, "Unexpected Index object in tree");
+            anyhow::ensure!(header.object_type != ObjectType::Index, "unexpected index object in tree");
 
             if header.object_type == ObjectType::Tree {
                 pull_tree(cache, url, &entry.hash).await?;
@@ -381,19 +397,19 @@ fn pull_tree<'a>(cache: &'a PathBuf, url: &'a String, tree_hash: &'a Hash) -> st
 async fn pull_cache(cache: &PathBuf, url: &String, hash: Hash) -> anyhow::Result<()> {
     let index_path = hash.get_path(cache);
     let header = download_object(&hash, &index_path, url).await
-        .context(format!("Unable to download object with hash {hash}"))?;
+        .context(format!("unable to download object with hash {hash}"))?;
 
-    anyhow::ensure!(header.object_type == ObjectType::Index, "Expected Index object");
+    anyhow::ensure!(header.object_type == ObjectType::Index, "expected index object");
 
-    let mut file = File::open(index_path).await.context("Index file should exist")?;
+    let mut file = File::open(index_path).await.context("index file should exist")?;
     let mut index_data = Vec::new();
     let _ = file
         .read_to_end(&mut index_data)
         .await
-        .context("File should be readable")?;
+        .context("file should be readable")?;
 
     let (_, data) =
-        read_header_and_body(&index_data).context("Index should be in the correct format")?;
+        read_header_and_body(&index_data).context("index should be in the correct format")?;
 
     let index_body: object_body::Index = object_body::Object::from_data(data)?;
 
@@ -401,15 +417,16 @@ async fn pull_cache(cache: &PathBuf, url: &String, hash: Hash) -> anyhow::Result
     Ok(())
 }
 
+#[allow(clippy::ptr_arg)]
 async fn upload_object(hash: &Hash, file: &PathBuf, url: &String) -> anyhow::Result<()> {
     let file_data = tokio::task::spawn_blocking({
         let file = file.clone();
         move || std::fs::read(&file)
-    }).await?.context("File should exist")?;
+    }).await?.context("file should exist")?;
 
     let header = read_header_from_slice(
         &file_data[..file_data.iter().position(|&b| b == 0).unwrap_or(file_data.len())]
-    ).context("File should be a valid object")?;
+    ).context("file should be a valid object")?;
 
     let url = format!("{url}/object/{hash}");
 
@@ -423,7 +440,7 @@ async fn upload_object(hash: &Hash, file: &PathBuf, url: &String) -> anyhow::Res
         .header("Object-Type", header.object_type.to_str())
         .header("Object-Size", &header.size.to_string())
         .send(body)
-        .context("Failed to upload object")?;
+        .context("failed to upload object")?;
 
     Ok(())
 }
@@ -431,48 +448,48 @@ async fn upload_object(hash: &Hash, file: &PathBuf, url: &String) -> anyhow::Res
 async fn download_object(hash: &Hash, file: &PathBuf, url: &String) -> anyhow::Result<Header> {
     let url = format!("{url}/object/{hash}");
 
-    let dir = file.parent().context("Path should not be at root")?;
-    create_dir_all(dir).await.context("Failed to create directory")?;
+    let dir = file.parent().context("path should not be at root")?;
+    create_dir_all(dir).await.context("failed to create directory")?;
 
     if tokio::fs::metadata(file).await.is_ok() {
-        let file_handle = File::open(file).await.context("File should exist")?;
+        let file_handle = File::open(file).await.context("file should exist")?;
         let mut reader = BufReader::new(file_handle);
 
         let mut buffer = Vec::new();
         reader
             .read_until(0, &mut buffer)
             .await
-            .context("Header should exist within file")?;
+            .context("header should exist within file")?;
 
         // subtract one to get rid of the null byte
         return read_header_from_slice(&buffer[..buffer.len() - 1])
-            .context("Invalid header in file");
+            .context("invalid header in file");
     }
 
     println!("Sending get request to {url}");
 
     let mut response = ureq::get(&url).call()
-        .context("Failed to send GET request")?;
+        .context("failed to send GET request")?;
 
-    let file_handle = File::create(file).await.context("Failed to create file")?;
+    let file_handle = File::create(file).await.context("failed to create file")?;
     let mut writer = BufWriter::new(file_handle);
 
     let response_headers = response.headers();
     let object_type: ObjectType = ObjectType::from_str(
         response_headers
             .get("Object-Type")
-            .context("Object-Type header missing from response")?
+            .context("object-type header missing from response")?
             .to_str()
-            .context("Object-Type header not valid ASCII")?,
+            .context("object-type header not valid ASCII")?,
     )
-    .context("Invalid ObjectType in header")?;
+    .context("invalid object type in header")?;
     let object_size: u64 = response_headers
         .get("Object-Size")
-        .context("Object-Size header missing from response")?
+        .context("object-size header missing from response")?
         .to_str()
-        .context("Object-Size header not valid ASCII")?
+        .context("object-size header not valid ASCII")?
         .parse()
-        .context("Object-Size header not a valid number")?;
+        .context("object-size header not a valid number")?;
 
     let header = Header::new(object_type, object_size);
 
@@ -495,20 +512,21 @@ async fn download_object(hash: &Hash, file: &PathBuf, url: &String) -> anyhow::R
 }
 
 async fn pack_archive(store: &Store, path: &PathBuf, index_hash: &Hash, compression: Compression) -> anyhow::Result<()> {
-    anyhow::ensure!(tokio::fs::metadata(path).await.is_err(), "Output file already exists");
+    anyhow::ensure!(tokio::fs::metadata(path).await.is_err(), "output file already exists");
     anyhow::ensure!(
         path.parent().map(|p| p.exists() && p.is_dir()) == Some(true),
         "Parent directory must exist and be a directory"
     );
 
     let index: object_body::Index = {
-        let mut store_obj = store.get_object(index_hash).await.context("Index object not found in store")?;
-        anyhow::ensure!(store_obj.header.object_type == ObjectType::Index, "Expected Index object type");
+        let mut store_obj = store.get_object(index_hash).await.context("index object not found in store")?;
+        anyhow::ensure!(store_obj.header.object_type == ObjectType::Index, "expected index object type");
         let mut body = Vec::new();
         store_obj.read_to_end(&mut body).await?;
         object_body::Object::from_data(&body)?
     };
 
+    #[allow(clippy::mutable_key_type)]
     let mut headers: HashMap<Hash, (Header, Vec<u8>)> = HashMap::new();
     read_object_into_headers(store, &mut headers, &index.tree).await?;
 
@@ -559,23 +577,23 @@ async fn pack_archive(store: &Store, path: &PathBuf, index_hash: &Hash, compress
 
 async fn unpack_archive(cache: &PathBuf, path: &PathBuf) -> anyhow::Result<()> {
     let path_meta = tokio::fs::metadata(path).await?;
-    anyhow::ensure!(path_meta.is_file(), "Path must be a file");
+    anyhow::ensure!(path_meta.is_file(), "path must be a file");
 
     let file = std::fs::File::open(path)?;
     let mut file = std::io::BufReader::new(file);
 
     let archive = Archive::<RawEntryData>::from_data(&mut file)?;
 
-    anyhow::ensure!(archive.body.entries.len() == archive.body.header.len(), "Archive entries and headers length mismatch");
+    anyhow::ensure!(archive.body.entries.len() == archive.body.header.len(), "archive entries and headers length mismatch");
 
     println!("Successfully read archive, Index {}", archive.hash);
 
     let index_data = object_body::Object::to_data(&archive.index);
     let computed_hash = compute_hash(INDEX_KEY, &index_data);
-    anyhow::ensure!(computed_hash == archive.hash, "Index hash mismatch");
+    anyhow::ensure!(computed_hash == archive.hash, "index hash mismatch");
 
     let index_file_path = archive.hash.get_path(cache);
-    let _ = create_dir_all(index_file_path.parent().context("Path should not be at root")?).await;
+    let _ = create_dir_all(index_file_path.parent().context("path should not be at root")?).await;
 
     {
         let index_header = Header::new(ObjectType::Index, index_data.len() as u64);
@@ -584,28 +602,61 @@ async fn unpack_archive(cache: &PathBuf, path: &PathBuf) -> anyhow::Result<()> {
         index_file.write_all(&index_data).await?;
     }
 
+    // Pre-create all needed parent directories
+    let mut dirs_to_create = std::collections::HashSet::new();
+    for header in &archive.body.header {
+        let object_path = header.hash.get_path(cache);
+        if let Some(parent) = object_path.parent() {
+            dirs_to_create.insert(parent.to_path_buf());
+        }
+    }
+    for dir in dirs_to_create {
+        let _ = create_dir_all(&dir).await;
+    }
+
+    let semaphore = Arc::new(tokio::sync::Semaphore::new(64));
+    let mut set = JoinSet::new();
+
     for (header, entry) in archive.body.header.into_iter().zip(archive.body.entries.into_iter()) {
         let object_path = header.hash.get_path(cache);
-        let _ = create_dir_all(object_path.parent().context("Path should not be at root")?).await;
+        let sem = semaphore.clone();
+        set.spawn(async move {
+            let _permit = sem.acquire().await
+                .map_err(|e| anyhow::anyhow!("semaphore: {e}"))?;
 
-        let mut file = File::create(object_path).await?;
-        let data = entry.turn_into_vec();
-        file.write_all(&data).await?;
+            // Skip if already exists (cheap check)
+            if tokio::fs::metadata(&object_path).await.is_ok() {
+                return Ok::<_, anyhow::Error>(());
+            }
+
+            let data = entry.turn_into_vec();
+            tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+                std::fs::write(&object_path, &data)?;
+                Ok(())
+            }).await??;
+
+            Ok(())
+        });
+    }
+
+    while let Some(result) = set.join_next().await {
+        result??;
     }
 
     Ok(())
 }
 
+#[allow(clippy::ptr_arg)]
 async fn extract_archive(file: &PathBuf, directory: &PathBuf) -> anyhow::Result<()> {
     if tokio::fs::metadata(directory).await.is_err() {
-        create_dir_all(directory).await.context("Failed to create output directory")?;
+        create_dir_all(directory).await.context("failed to create output directory")?;
     }
 
     let dir_meta = tokio::fs::metadata(directory).await?;
-    anyhow::ensure!(dir_meta.is_dir(), "Output path must be a directory");
+    anyhow::ensure!(dir_meta.is_dir(), "output path must be a directory");
 
     let mut entries = read_dir(directory).await?;
-    anyhow::ensure!(entries.next_entry().await?.is_none(), "Output directory must be empty");
+    anyhow::ensure!(entries.next_entry().await?.is_none(), "output directory must be empty");
 
     let file = file.clone();
     let archive = tokio::task::spawn_blocking(move || {
@@ -616,11 +667,12 @@ async fn extract_archive(file: &PathBuf, directory: &PathBuf) -> anyhow::Result<
 
     anyhow::ensure!(
         archive.body.entries.len() == archive.body.header.len(),
-        "Archive entries and headers length mismatch"
+        "archive entries and headers length mismatch"
     );
 
     println!("Index: {}", archive.hash);
 
+    #[allow(clippy::mutable_key_type)]
     let mut data_map: HashMap<Hash, Vec<u8>> = HashMap::with_capacity(archive.body.header.len());
     for (header_entry, raw_entry) in archive.body.header.into_iter().zip(archive.body.entries.into_iter()) {
         data_map.insert(header_entry.hash, raw_entry.0);
@@ -635,6 +687,7 @@ async fn extract_archive(file: &PathBuf, directory: &PathBuf) -> anyhow::Result<
     Ok(())
 }
 
+#[allow(clippy::ptr_arg, clippy::mutable_key_type)]
 fn extract_tree<'a>(
     data_map: &'a Arc<HashMap<Hash, Vec<u8>>>,
     tree_hash: &'a Hash,
@@ -642,10 +695,10 @@ fn extract_tree<'a>(
 ) -> std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<usize>> + Send + 'a>> {
     Box::pin(async move {
         let raw_data = data_map.get(tree_hash)
-            .ok_or_else(|| anyhow::anyhow!("Tree hash {} not found in archive", tree_hash))?;
+            .ok_or_else(|| anyhow::anyhow!("tree hash {} not found in archive", tree_hash))?;
 
         let (_header, body) = read_header_and_body(raw_data)
-            .ok_or_else(|| anyhow::anyhow!("Failed to parse header for tree {}", tree_hash))?;
+            .ok_or_else(|| anyhow::anyhow!("failed to parse header for tree {}", tree_hash))?;
 
         let tree: object_body::Tree = object_body::Object::from_data(body)?;
 
@@ -659,7 +712,7 @@ fn extract_tree<'a>(
             match entry.mode {
                 Mode::Tree => {
                     create_dir(&entry_path).await
-                        .context(format!("Failed to create directory {:?}", entry_path))?;
+                        .context(format!("failed to create directory {:?}", entry_path))?;
                     file_count += extract_tree(data_map, &entry.hash, &entry_path).await?;
                 }
                 Mode::Normal | Mode::Executable => {
@@ -671,19 +724,19 @@ fn extract_tree<'a>(
                             .map_err(|e| anyhow::anyhow!("semaphore: {e}"))?;
 
                         let raw = dm.get(&entry.hash)
-                            .ok_or_else(|| anyhow::anyhow!("Blob hash {} not found in archive", entry.hash))?;
+                            .ok_or_else(|| anyhow::anyhow!("blob hash {} not found in archive", entry.hash))?;
 
                         let (_hdr, blob_body) = read_header_and_body(raw)
-                            .ok_or_else(|| anyhow::anyhow!("Failed to parse header for blob {}", entry.hash))?;
+                            .ok_or_else(|| anyhow::anyhow!("failed to parse header for blob {}", entry.hash))?;
 
                         tokio::fs::write(&entry_path, blob_body).await
-                            .context(format!("Failed to write file {:?}", entry_path))?;
+                            .context(format!("failed to write file {:?}", entry_path))?;
 
                         Ok::<_, anyhow::Error>(())
                     });
                 }
                 _ => {
-                    anyhow::bail!("Unsupported mode {} for entry {}", entry.mode.as_str(), entry.path);
+                    anyhow::bail!("unsupported mode {} for entry {}", entry.mode.as_str(), entry.path);
                 }
             }
         }
@@ -701,7 +754,7 @@ fn archive_build_tree(
     path: PathBuf,
 ) -> std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<Hash>> + Send>> {
     Box::pin(async move {
-        anyhow::ensure!(path.is_dir(), "Path must be a directory");
+        anyhow::ensure!(path.is_dir(), "path must be a directory");
         let mut dir_entries = read_dir(&path).await?;
 
         let mut dir_paths = Vec::new();
@@ -810,7 +863,7 @@ fn archive_build_tree(
 }
 
 async fn archive_directory(directory: &PathBuf, file: &PathBuf, compression: Compression) -> anyhow::Result<()> {
-    anyhow::ensure!(tokio::fs::metadata(file).await.is_err(), "Output file already exists");
+    anyhow::ensure!(tokio::fs::metadata(file).await.is_err(), "output file already exists");
     anyhow::ensure!(
         file.parent().map(|p| p.exists() && p.is_dir()) == Some(true),
         "Parent directory must exist and be a directory"
@@ -818,8 +871,9 @@ async fn archive_directory(directory: &PathBuf, file: &PathBuf, compression: Com
 
     let path = tokio::fs::canonicalize(directory).await
         .context(format!("unable to canonicalize {directory:?}"))?;
-    anyhow::ensure!(path.is_dir(), "Path must be a directory");
+    anyhow::ensure!(path.is_dir(), "path must be a directory");
 
+    #[allow(clippy::mutable_key_type)]
     let objects: Arc<tokio::sync::Mutex<HashMap<Hash, Vec<u8>>>> =
         Arc::new(tokio::sync::Mutex::new(HashMap::new()));
 
@@ -835,8 +889,9 @@ async fn archive_directory(directory: &PathBuf, file: &PathBuf, compression: Com
     let index_hash = compute_hash(INDEX_KEY, &index_data);
 
     // Build archive from collected objects
+    #[allow(clippy::mutable_key_type)]
     let objects = Arc::try_unwrap(objects)
-        .map_err(|_| anyhow::anyhow!("Failed to unwrap Arc"))?
+        .map_err(|_| anyhow::anyhow!("failed to unwrap Arc"))?
         .into_inner();
 
     let objects_vec: Vec<(Hash, Vec<u8>)> = objects.into_iter().collect();
@@ -877,11 +932,13 @@ async fn archive_directory(directory: &PathBuf, file: &PathBuf, compression: Com
 }
 
 #[derive(Parser)]
-#[command(version, about, long_about = None)]
+#[command(version, about = "Artifact repository client for content-addressable storage", long_about = None)]
 struct Cli {
+    /// Path to the local object store directory
     #[arg(short, long, value_name = "Store")]
     store: PathBuf,
 
+    /// Increase debug verbosity (can be repeated)
     #[arg(short, long, action = clap::ArgAction::Count)]
     debug: u8,
 
@@ -891,69 +948,96 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
+    /// Commit a directory into the object store
     Commit {
+        /// Path to the directory to commit
         #[arg(short, long)]
         directory: PathBuf,
     },
 
+    /// Restore a directory from the object store using an index hash
     Restore {
+        /// Output directory to restore into (must be empty or non-existent)
         #[arg(short, long)]
         directory: PathBuf,
+        /// Hash of the index object to restore
         #[arg(short, long)]
         index: Hash,
+        /// Re-read restored files and verify hashes match
         #[arg(long)]
         validate: bool,
     },
 
+    /// Print the raw contents of an object to stdout
     Cat {
+        /// Hash of the object to display
         #[arg(long)]
         hash: Hash,
     },
 
+    /// Push objects from the local store to a remote server
     Push {
+        /// Base URL of the remote artifact server
         #[arg(long)]
         url: String,
 
+        /// Optional index hash to push (pushes all objects if omitted)
         #[arg(long)]
         index: Option<Hash>,
     },
 
+    /// Pull objects from a remote server into the local store
     Pull {
+        /// Base URL of the remote artifact server
         #[arg(long)]
         url: String,
 
+        /// Hash of the index object to pull
         #[arg(long)]
         index: Hash,
     },
 
+    /// Pack stored objects into an archive file
     Pack {
+        /// Hash of the index object to pack
         #[arg(long)]
         index: Hash,
 
+        /// Output archive file path
         #[arg(long)]
         file: PathBuf,
 
+        /// Compression algorithm (none, gzip, deflate, lzma2, zstd)
         #[arg(long)]
         compression: Compression,
     },
 
+    /// Unpack an archive file into the local store
     Unpack {
+        /// Path to the archive file to unpack
         #[arg(long)]
         file: PathBuf,
     },
 
+    /// Extract an archive directly to a directory (no intermediate store)
     Extract {
+        /// Path to the archive file
         #[arg(short, long)]
         file: PathBuf,
+        /// Output directory (must be empty or non-existent)
         #[arg(short, long)]
         directory: PathBuf,
     },
 
+    /// Create an archive directly from a directory (no intermediate store)
     Archive {
+        /// Source directory to archive
         #[arg(short, long)]
         directory: PathBuf,
+        /// Output archive file path
         #[arg(short, long)]
         file: PathBuf,
+        /// Compression algorithm (none, gzip, deflate, lzma2, zstd)
         #[arg(short, long)]
         compression: Compression,
     },
@@ -1346,17 +1430,107 @@ mod tests {
     async fn extract_roundtrip_gzip() {
         extract_roundtrip_with_compression(Compression::Gzip).await;
     }
+
+    async fn archive_extract_roundtrip_with_compression(compression: Compression) {
+        let source = TempDir::new().unwrap();
+
+        tokio::fs::write(source.path().join("hello.txt"), b"Hello, archive world!").await.unwrap();
+        let sub = source.path().join("sub");
+        tokio::fs::create_dir(&sub).await.unwrap();
+        tokio::fs::write(sub.join("data.txt"), b"Nested archive data").await.unwrap();
+
+        // archive_directory → .arx file
+        let arx_dir = TempDir::new().unwrap();
+        let arx_path = arx_dir.path().join("test.arx");
+        let source_path = source.path().to_path_buf();
+        archive_directory(&source_path, &arx_path, compression).await.unwrap();
+        assert!(tokio::fs::metadata(&arx_path).await.is_ok(), ".arx file should exist");
+
+        // extract_archive → output directory
+        let extract_dir = TempDir::new().unwrap();
+        let extract_path = extract_dir.path().join("output");
+        extract_archive(&arx_path, &extract_path).await.unwrap();
+
+        assert_dirs_equal(source.path(), &extract_path).await;
+    }
+
+    #[tokio::test]
+    async fn archive_extract_roundtrip() {
+        archive_extract_roundtrip_with_compression(Compression::None).await;
+    }
+
+    #[tokio::test]
+    async fn archive_extract_roundtrip_zstd() {
+        archive_extract_roundtrip_with_compression(Compression::Zstd).await;
+    }
+
+    #[tokio::test]
+    async fn archive_nested_directories() {
+        let source = TempDir::new().unwrap();
+
+        let deep = source.path().join("a").join("b").join("c");
+        tokio::fs::create_dir_all(&deep).await.unwrap();
+        tokio::fs::write(deep.join("file.txt"), b"deep file").await.unwrap();
+
+        let x_dir = source.path().join("x");
+        tokio::fs::create_dir(&x_dir).await.unwrap();
+        tokio::fs::write(x_dir.join("file.txt"), b"x file").await.unwrap();
+
+        let arx_dir = TempDir::new().unwrap();
+        let arx_path = arx_dir.path().join("nested.arx");
+        let source_path = source.path().to_path_buf();
+        archive_directory(&source_path, &arx_path, Compression::None).await.unwrap();
+
+        let extract_dir = TempDir::new().unwrap();
+        let extract_path = extract_dir.path().join("output");
+        extract_archive(&arx_path, &extract_path).await.unwrap();
+
+        assert_dirs_equal(source.path(), &extract_path).await;
+    }
+
+    #[tokio::test]
+    async fn archive_deduplication() {
+        let source = TempDir::new().unwrap();
+
+        let content = b"IDENTICAL CONTENT FOR ARCHIVE DEDUP TEST";
+        let dir_a = source.path().join("dir_a");
+        let dir_b = source.path().join("dir_b");
+        tokio::fs::create_dir(&dir_a).await.unwrap();
+        tokio::fs::create_dir(&dir_b).await.unwrap();
+        tokio::fs::write(dir_a.join("file.txt"), content).await.unwrap();
+        tokio::fs::write(dir_b.join("file.txt"), content).await.unwrap();
+
+        let arx_dir = TempDir::new().unwrap();
+        let arx_path = arx_dir.path().join("dedup.arx");
+        let source_path = source.path().to_path_buf();
+        archive_directory(&source_path, &arx_path, Compression::None).await.unwrap();
+
+        // Read back the archive and check that there's only one blob entry
+        let arx_data = std::fs::read(&arx_path).unwrap();
+        let archive = Archive::<RawEntryData>::from_data(&mut std::io::Cursor::new(arx_data)).unwrap();
+
+        let blob_hash = compute_hash(BLOB_KEY, content);
+        let blob_entries: Vec<_> = archive.body.header
+            .iter()
+            .filter(|e| e.hash == blob_hash)
+            .collect();
+        assert_eq!(
+            blob_entries.len(),
+            1,
+            "Identical files should produce only one blob entry in the archive"
+        );
+    }
 }
 
 async fn run(cli: Cli) -> anyhow::Result<()> {
     // Ensure store directory exists
     if tokio::fs::metadata(&cli.store).await.is_err() {
-        create_dir_all(&cli.store).await.context("Failed to create store directory")?;
+        create_dir_all(&cli.store).await.context("failed to create store directory")?;
     }
 
     // Create store from cache directory
-    let store = Store::from_builder(opendal::services::Fs::default().root(cli.store.to_str().context("Store path must be valid UTF-8")?))
-        .context("Failed to create store")?;
+    let store = Store::from_builder(opendal::services::Fs::default().root(cli.store.to_str().context("store path must be valid UTF-8")?))
+        .context("failed to create store")?;
 
     match cli.command {
         Commands::Commit { directory } => commit_directory(&store, &directory).await?,

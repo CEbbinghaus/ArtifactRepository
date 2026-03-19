@@ -27,7 +27,7 @@ impl Object {
 		let data = &buffer[..bytes_read];
 
 		let Some(header_end) = data.iter().position(|x| *x == 0) else {
-			return Err(anyhow!("Invalid header. No null byte in the first 32 bytes"));
+			return Err(anyhow!("invalid header: no null byte in the first 32 bytes"));
 		};
 
 		let header = Header::from_data(&data[..header_end])?;

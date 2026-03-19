@@ -2,8 +2,11 @@ use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use common::compute_hash;
 use common::store::Store;
+use common::{Mode, BLOB_KEY, INDEX_KEY, TREE_KEY};
+use common::object_body::{Index, Object as _, Tree, TreeEntry};
 use http_body_util::BodyExt;
 use server::create_router;
+use std::collections::HashMap;
 use tempfile::TempDir;
 use tower::ServiceExt;
 
@@ -207,4 +210,137 @@ async fn multiple_object_types() {
         let body = resp.into_body().collect().await.unwrap().to_bytes();
         assert_eq!(&body[..], data, "Body mismatch for {}", type_key);
     }
+}
+
+/// Helper: PUT a blob, tree, and index into the store via the HTTP API.
+/// Returns (blob_data, index_hash_str).
+async fn put_blob_tree_index(app: &axum::Router) -> (Vec<u8>, String) {
+    let blob_data = b"hello archive world";
+
+    // 1. PUT blob
+    let blob_hash = compute_hash(BLOB_KEY, blob_data);
+    let resp = app
+        .clone()
+        .oneshot(put_request(blob_hash.as_str(), blob_data, "blob", blob_data.len() as u64))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+
+    // 2. Build + PUT tree
+    let tree = Tree {
+        contents: vec![TreeEntry {
+            mode: Mode::Normal,
+            path: "file.txt".to_string(),
+            hash: blob_hash,
+        }],
+    };
+    let tree_data = tree.to_data();
+    let tree_hash = compute_hash(TREE_KEY, &tree_data);
+    let resp = app
+        .clone()
+        .oneshot(put_request(tree_hash.as_str(), &tree_data, "tree", tree_data.len() as u64))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+
+    // 3. Build + PUT index
+    let index = Index {
+        tree: tree_hash,
+        timestamp: chrono::Utc::now(),
+        metadata: HashMap::new(),
+    };
+    let index_data = index.to_data();
+    let index_hash = compute_hash(INDEX_KEY, &index_data);
+    let resp = app
+        .clone()
+        .oneshot(put_request(index_hash.as_str(), &index_data, "indx", index_data.len() as u64))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+
+    (blob_data.to_vec(), index_hash.as_str().to_string())
+}
+
+#[tokio::test]
+async fn get_archive_round_trip() {
+    let dir = TempDir::new().unwrap();
+    let app = create_router(make_store(&dir));
+
+    let (_blob_data, index_hash_str) = put_blob_tree_index(&app).await;
+
+    let req = Request::builder()
+        .method("GET")
+        .uri(format!("/archive/{}", index_hash_str))
+        .body(Body::empty())
+        .unwrap();
+
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(
+        resp.headers().get("Content-Type").unwrap(),
+        "application/octet-stream"
+    );
+
+    let body = resp.into_body().collect().await.unwrap().to_bytes();
+    // .arx magic bytes: 'a', 'r', 'x', 'a'
+    assert!(body.len() >= 4, "Archive response too short");
+    assert_eq!(&body[..4], b"arxa", "Archive must start with .arx magic bytes");
+}
+
+#[tokio::test]
+async fn get_archive_missing_index() {
+    let dir = TempDir::new().unwrap();
+    let app = create_router(make_store(&dir));
+
+    let fake_hash = compute_hash(INDEX_KEY, b"nonexistent");
+    let req = Request::builder()
+        .method("GET")
+        .uri(format!("/archive/{}", fake_hash.as_str()))
+        .body(Body::empty())
+        .unwrap();
+
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn get_zip_round_trip() {
+    let dir = TempDir::new().unwrap();
+    let app = create_router(make_store(&dir));
+
+    let (_blob_data, index_hash_str) = put_blob_tree_index(&app).await;
+
+    let req = Request::builder()
+        .method("GET")
+        .uri(format!("/zip/{}", index_hash_str))
+        .body(Body::empty())
+        .unwrap();
+
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(
+        resp.headers().get("Content-Type").unwrap(),
+        "application/zip"
+    );
+
+    let body = resp.into_body().collect().await.unwrap().to_bytes();
+    // ZIP magic bytes: PK\x03\x04
+    assert!(body.len() >= 4, "ZIP response too short");
+    assert_eq!(&body[..4], b"PK\x03\x04", "ZIP must start with PK magic bytes");
+}
+
+#[tokio::test]
+async fn get_zip_missing_index() {
+    let dir = TempDir::new().unwrap();
+    let app = create_router(make_store(&dir));
+
+    let fake_hash = compute_hash(INDEX_KEY, b"nonexistent");
+    let req = Request::builder()
+        .method("GET")
+        .uri(format!("/zip/{}", fake_hash.as_str()))
+        .body(Body::empty())
+        .unwrap();
+
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
 }

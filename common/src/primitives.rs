@@ -4,7 +4,7 @@ use crate::{BLOB_KEY, INDEX_KEY, TREE_KEY};
 
 #[derive(Debug)]
 pub enum Mode {
-    Tree = 040000,
+    Tree = 40000,
     Normal = 100644,
     Executable = 100755,
     SymbolicLink = 120000,
@@ -16,6 +16,7 @@ const EXECUTABLE_MODE: &str = "100755";
 const SYMBOLIC_LINK_MODE: &str = "120000";
 
 impl Mode {
+    #[allow(clippy::should_implement_trait)]
     pub fn from_str(value: &str) -> Option<Self> {
         match value {
             TREE_MODE => Some(Mode::Tree),
@@ -54,6 +55,7 @@ pub enum ObjectType {
 }
 
 impl ObjectType {
+    #[allow(clippy::should_implement_trait)]
     pub fn from_str(value: &str) -> Option<Self> {
         match value {
             BLOB_KEY => Some(Self::Blob),

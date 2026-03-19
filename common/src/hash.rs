@@ -18,7 +18,7 @@ impl Hash {
     /// Parse a 128-char hex string into a Hash, returning an error on invalid input.
     fn from_hex(hex_str: &str) -> Result<Self, anyhow::Error> {
         if hex_str.len() != 128 {
-            return Err(anyhow!("Invalid length. Hash has to be 128 characters long"));
+            return Err(anyhow!("invalid hash length: expected 128 hex characters"));
         }
 
         let mut hash = [0u8; 64];
@@ -33,18 +33,21 @@ impl Hash {
     }
 
     pub fn as_str(&self) -> &str {
-        self.hex_cache.get_or_init(|| hex::encode(&self.hash))
+        self.hex_cache.get_or_init(|| hex::encode(self.hash))
     }
 
+    #[allow(clippy::ptr_arg)]
     pub fn from_string(value: &String) -> Option<Self> {
         Self::from_hex(value.as_str()).ok()
     }
 
+    #[allow(clippy::ptr_arg)]
     pub fn get_path(&self, cache_dir: &PathBuf) -> PathBuf {
         let (dir, file) = self.get_parts();
         cache_dir.join(dir).join(file)
     }
 
+    #[allow(clippy::ptr_arg)]
     pub fn from_path(file: &PathBuf) -> Option<Self> {
         let filename = file.file_name()?;
         let directory = file.parent()?.file_name()?;
@@ -104,7 +107,7 @@ impl TryFrom<&[u8]> for Hash {
 
     fn try_from(value: &[u8]) -> Result<Self, Self::Error> {
         if value.len() != 64 {
-            return Err(anyhow!("Invalid length. Slice must be 64 bytes long"));
+            return Err(anyhow!("invalid hash length: expected 64 bytes"));
         }
 
         let data: [u8; 64] = value.try_into()?;
@@ -141,7 +144,7 @@ impl Serialize for Hash {
     where
         S: Serializer,
     {
-        serializer.serialize_str(&self.as_str())
+        serializer.serialize_str(self.as_str())
     }
 }
 

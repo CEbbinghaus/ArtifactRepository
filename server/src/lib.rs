@@ -56,30 +56,30 @@ async fn put_object(
 ) -> Result<StatusCode, ServerError> {
     match store.exists(&object_hash).await {
         Ok(false) => Ok(()),
-        Ok(true) => Err(ServerError::AlreadyExists("Object already exists".into())),
+        Ok(true) => Err(ServerError::AlreadyExists("object already exists".into())),
         Err(err) => Err(ServerError::Internal(err.to_string())),
     }?;
 
     let Some(object_type) = headers.get("Object-Type").and_then(|v| v.to_str().ok()) else {
-        return Err(ServerError::BadRequest("Missing Object-Type Header".into()));
+        return Err(ServerError::BadRequest("missing Object-Type header".into()));
     };
 
     let Some(object_type) = ObjectType::from_str(object_type) else {
-        return Err(ServerError::BadRequest("Invalid Object-Type Header".into()));
+        return Err(ServerError::BadRequest("invalid Object-Type header".into()));
     };
 
     let Some(object_size) = headers.get("Object-Size").and_then(|v| v.to_str().ok()) else {
-        return Err(ServerError::BadRequest("Missing Object-Size Header".into()));
+        return Err(ServerError::BadRequest("missing Object-Size header".into()));
     };
 
     let Some(object_size): Option<u64> = object_size.parse().ok() else {
-        return Err(ServerError::BadRequest("Invalid Object-Size Header".into()));
+        return Err(ServerError::BadRequest("invalid Object-Size header".into()));
     };
     let header = Header::new(object_type, object_size);
     let data_stream = request.into_body().into_data_stream();
 
     let buffered_reader = data_stream.map(|result| {
-        result.map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))
+        result.map_err(std::io::Error::other)
     }).into_async_read();
 
     let store_object = StoreObject::new_with_header(header, buffered_reader);
@@ -130,7 +130,7 @@ struct CompressionQuery {
 async fn read_index_from_store(store: &Store, index_hash: &Hash) -> Result<Index, ServerError> {
     match store.exists(index_hash).await {
         Ok(true) => Ok(()),
-        Ok(false) => Err(ServerError::NotFound("Index not found".into())),
+        Ok(false) => Err(ServerError::NotFound("index not found".into())),
         Err(err) => Err(ServerError::Internal(err.to_string())),
     }?;
 
@@ -140,7 +140,7 @@ async fn read_index_from_store(store: &Store, index_hash: &Hash) -> Result<Index
         .map_err(|err| ServerError::Internal(err.to_string()))?;
 
     if store_obj.header.object_type != ObjectType::Index {
-        return Err(ServerError::BadRequest("Object is not an Index".into()));
+        return Err(ServerError::BadRequest("object is not an index".into()));
     }
 
     let mut body = Vec::new();
@@ -161,12 +161,13 @@ async fn get_archive(
     let compression = match query.compression.as_deref() {
         Some(s) => s
             .parse::<Compression>()
-            .map_err(|_| ServerError::BadRequest("Invalid compression type".into()))?,
+            .map_err(|_| ServerError::BadRequest("invalid compression type".into()))?,
         None => Compression::Zstd,
     };
 
     let index = read_index_from_store(&store, &index_hash).await?;
 
+    #[allow(clippy::mutable_key_type)]
     let mut headers: HashMap<Hash, (Header, Vec<u8>)> = HashMap::new();
     read_object_into_headers(&store, &mut headers, &index.tree)
         .await
@@ -227,6 +228,7 @@ async fn get_archive(
     Ok(response)
 }
 
+#[allow(clippy::type_complexity)]
 fn collect_files<'a>(
     store: &'a Store,
     tree_hash: &'a Hash,

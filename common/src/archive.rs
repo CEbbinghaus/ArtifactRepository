@@ -39,7 +39,7 @@ impl FromStr for Compression {
             "deflate" => Ok(Compression::Deflate),
             "lzma2" => Ok(Compression::LZMA2),
             "zstd" => Ok(Compression::Zstd),
-            _ => Err(anyhow!("Invalid Compression Type")),
+            _ => Err(anyhow!("invalid compression type")),
         }
     }
 }
@@ -74,7 +74,7 @@ impl<T> Archive<T>
 where
     T: ArchiveEntryData,
 {
-    pub fn to_data<'a>(self, writer: &'a mut impl Write) -> anyhow::Result<()> {
+    pub fn to_data(self, writer: &mut impl Write) -> anyhow::Result<()> {
         writer.write_all(&HEADER)?;
         writer.write_all(&(self.compression as u16).to_be_bytes())?;
         writer.write_all(&self.hash.hash)?;
@@ -117,7 +117,7 @@ where
         Ok(())
     }
 
-    pub fn from_data<'a>(reader: &'a mut impl Read) -> anyhow::Result<Archive<RawEntryData>> {
+    pub fn from_data(reader: &mut impl Read) -> anyhow::Result<Archive<RawEntryData>> {
         let mut reader = BufReader::new(reader);
 
         let mut header: [u8; 4] = [0; 4];
@@ -129,7 +129,7 @@ where
 
         let compression: Compression = u16::from_be_bytes(compression)
             .try_into()
-            .map_err(|_| anyhow!("Invalid Compression"))?;
+            .map_err(|_| anyhow!("invalid compression"))?;
 
         let mut hash: [u8; 64] = [0; 64];
         reader.read_exact(&mut hash)?;
@@ -258,7 +258,7 @@ pub struct StoreEntryData {
     pub hash: Hash,
 }
 
-impl<'a> ArchiveEntryData for StoreEntryData {
+impl ArchiveEntryData for StoreEntryData {
     fn turn_into_vec(self) -> Vec<u8> {
         // Use block_in_place to avoid deadlocking the tokio runtime
         tokio::task::block_in_place(|| {
@@ -286,7 +286,8 @@ impl<T> ArchiveBody<T>
 where
     T: ArchiveEntryData,
 {
-    fn to_data<'a>(self, writer: &'a mut impl Write) -> anyhow::Result<()> {
+    #[allow(clippy::wrong_self_convention)]
+    fn to_data(self, writer: &mut impl Write) -> anyhow::Result<()> {
         writer.write_all(&(self.header.len() as u64).to_be_bytes())?;
         for entry in &self.header {
             writer.write_all(&entry.hash.hash)?;
@@ -303,12 +304,10 @@ where
         Ok(())
     }
 
-    fn from_data<'a>(reader: &'a mut impl Read) -> anyhow::Result<ArchiveBody<RawEntryData>> {
+    fn from_data(reader: &mut impl Read) -> anyhow::Result<ArchiveBody<RawEntryData>> {
         let mut long: [u8; 8] = [0; 8];
         reader.read_exact(&mut long)?;
         let count = u64::from_be_bytes(long);
-
-        println!("Loading {count} entries");
 
         if count == 0 {
             return Ok(ArchiveBody {
@@ -357,7 +356,7 @@ where
             reader.read_exact(&mut data[..])?;
 
             let mut hasher = Sha512::new();
-            hasher.write(&data)?;
+            hasher.write_all(&data)?;
             assert!(Hash::from(hasher) == entry.hash);
 
             entries.push(RawEntryData(data.to_vec()));

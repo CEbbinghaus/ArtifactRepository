@@ -1,3 +1,5 @@
+#![warn(unused_imports)]
+
 use std::{
     collections::HashMap, fs::File, io::{BufRead, BufReader, Read, Write}, str::from_utf8
 };
@@ -23,15 +25,13 @@ pub mod object_body;
 pub mod archive;
 pub mod store;
 
-pub fn read_slice_until_byte<'a>(data: &'a [u8], byte: u8) -> Option<&'a [u8]> {
-    let Some(position) = data.iter().position(|v| *v == byte) else {
-        return None;
-    };
+pub fn read_slice_until_byte(data: &[u8], byte: u8) -> Option<&[u8]> {
+    let position = data.iter().position(|v| *v == byte)?;
 
     Some(&data[..position])
 }
 
-pub fn read_header_and_body<'a>(data: &'a [u8]) -> Option<(Header, &'a [u8])> {
+pub fn read_header_and_body(data: &[u8]) -> Option<(Header, &[u8])> {
     let header = read_slice_until_byte(data, 0)?;
 
     let body_index = header.len() + 1; // one extra for the 0 byte
@@ -57,6 +57,7 @@ pub fn read_header_from_file(reader: &mut BufReader<File>) -> Option<Header> {
     read_header_from_slice(&vec[..vec.len() - 1])
 }
 
+#[allow(clippy::mutable_key_type)]
 pub async fn read_object_into_headers(
     store: &Store,
     headers: &mut HashMap<Hash, (Header, Vec<u8>)>,
@@ -72,7 +73,7 @@ pub async fn read_object_into_headers(
         let mut object = store.get_object(&current_hash).await?;
 
         if object.header.object_type == ObjectType::Index {
-            return Err(anyhow::anyhow!("Indexes cannot exist within a tree. Likely a hash collision 😳"));
+            return Err(anyhow::anyhow!("indexes cannot exist within a tree (possible hash collision)"));
         }
 
         let header = object.header;
@@ -94,7 +95,7 @@ pub async fn read_object_into_headers(
     Ok(())
 }
 
-pub fn pipe<'a, 'b>(reader: &'a mut dyn Read, writer: &'b mut dyn Write) -> anyhow::Result<()> {
+pub fn pipe(reader: &mut dyn Read, writer: &mut dyn Write) -> anyhow::Result<()> {
     let mut buffer: [u8; 65536] = [0; 65536];
     loop {
         let read = reader.read(&mut buffer)?;
