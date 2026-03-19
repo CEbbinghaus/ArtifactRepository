@@ -97,6 +97,7 @@ where
             }
             Compression::Zstd => {
                 let mut encoder = zstd::stream::write::Encoder::new(writer, 3)?;
+                encoder.multithread(std::thread::available_parallelism().map(|n| n.get() as u32).unwrap_or(1))?;
                 self.body.to_data(&mut encoder)?;
                 encoder.finish()?.flush()?;
             }
@@ -208,7 +209,7 @@ pub trait ArchiveEntryData {
     fn turn_into_vec(self) -> Vec<u8>;
 }
 
-pub struct RawEntryData(Vec<u8>);
+pub struct RawEntryData(pub Vec<u8>);
 
 impl ArchiveEntryData for RawEntryData {
     fn turn_into_vec(self) -> Vec<u8> {

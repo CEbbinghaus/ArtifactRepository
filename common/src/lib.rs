@@ -59,7 +59,7 @@ pub fn read_header_from_file(reader: &mut BufReader<File>) -> Option<Header> {
 
 pub async fn read_object_into_headers(
     store: &Store,
-    headers: &mut HashMap<Hash, Header>,
+    headers: &mut HashMap<Hash, (Header, Vec<u8>)>,
     object_hash: &Hash,
 ) -> anyhow::Result<()> {
     let mut stack = vec![object_hash.clone()];
@@ -77,23 +77,18 @@ pub async fn read_object_into_headers(
 
         let header = object.header;
 
-        if header.object_type == ObjectType::Blob {
-            headers.insert(current_hash, header);
-            continue;
-        }
-
         let mut data = Vec::new();
-        let bytes_read = object.read_to_end(&mut data).await?;
+        object.read_to_end(&mut data).await?;
 
-        anyhow::ensure!(bytes_read as u64 == header.size, "Read size must match header size");
+        if header.object_type == ObjectType::Tree {
+            let tree = crate::object_body::Tree::from_data(&data)?;
 
-        let tree = crate::object_body::Tree::from_data(&data)?;
-
-        for entry in &tree.contents {
-            stack.push(entry.hash.clone());
+            for entry in &tree.contents {
+                stack.push(entry.hash.clone());
+            }
         }
 
-        headers.insert(current_hash, header);
+        headers.insert(current_hash, (header, data));
     }
 
     Ok(())

@@ -3,7 +3,7 @@ use chrono::Utc;
 use clap::{Parser, Subcommand};
 use common::{
     BLOB_KEY, Hash, Header, INDEX_KEY, Mode, ObjectType, TREE_KEY,
-    archive::{Archive, ArchiveBody, ArchiveEntryData, ArchiveHeaderEntry, Compression, HEADER, RawEntryData, StoreEntryData},
+    archive::{Archive, ArchiveBody, ArchiveEntryData, ArchiveHeaderEntry, Compression, HEADER, RawEntryData},
     compute_hash, object_body, read_header_and_body, read_header_from_slice, read_object_into_headers,
     store::{Store, StoreObject},
 };
@@ -509,24 +509,23 @@ async fn pack_archive(store: &Store, path: &PathBuf, index_hash: &Hash, compress
         object_body::Object::from_data(&body)?
     };
 
-    let mut headers: HashMap<Hash, Header> = HashMap::new();
+    let mut headers: HashMap<Hash, (Header, Vec<u8>)> = HashMap::new();
     read_object_into_headers(store, &mut headers, &index.tree).await?;
 
     //TODO: Surely there is an algorithm to more efficiently lay out this data
     let mut i = 0;
     let mut header_entries: Vec<ArchiveHeaderEntry> = Vec::new();
 
-    for (hash, header) in &headers {
-        let prefix_length = header.to_string().len() as u64;
-        let total_length = header.size + prefix_length;
+    for (hash, (_header, data)) in &headers {
+        let length = data.len() as u64;
 
         header_entries.push(ArchiveHeaderEntry {
             hash: hash.clone(),
             index: i,
-            length: total_length,
+            length,
         });
 
-        i += total_length;
+        i += length;
     }
 
     let archive = Archive {
@@ -538,10 +537,7 @@ async fn pack_archive(store: &Store, path: &PathBuf, index_hash: &Hash, compress
             header: header_entries,
             entries: headers
                 .into_iter()
-                .map(|(hash, _header)| StoreEntryData {
-                    store: store.clone(),
-                    hash,
-                })
+                .map(|(_hash, (_header, data))| RawEntryData(data))
                 .collect(),
         },
     };
