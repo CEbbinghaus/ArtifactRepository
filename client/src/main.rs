@@ -516,8 +516,9 @@ async fn pack_archive(store: &Store, path: &PathBuf, index_hash: &Hash, compress
     let mut i = 0;
     let mut header_entries: Vec<ArchiveHeaderEntry> = Vec::new();
 
-    for (hash, (_header, data)) in &headers {
-        let length = data.len() as u64;
+    for (hash, (header, data)) in &headers {
+        let prefix_length = header.to_string().len() as u64;
+        let length = prefix_length + data.len() as u64;
 
         header_entries.push(ArchiveHeaderEntry {
             hash: hash.clone(),
@@ -537,7 +538,13 @@ async fn pack_archive(store: &Store, path: &PathBuf, index_hash: &Hash, compress
             header: header_entries,
             entries: headers
                 .into_iter()
-                .map(|(_hash, (_header, data))| RawEntryData(data))
+                .map(|(_hash, (header, data))| {
+                    let prefix = header.to_string();
+                    let mut full_data = Vec::with_capacity(prefix.len() + data.len());
+                    full_data.extend_from_slice(prefix.as_bytes());
+                    full_data.extend(data);
+                    RawEntryData(full_data)
+                })
                 .collect(),
         },
     };

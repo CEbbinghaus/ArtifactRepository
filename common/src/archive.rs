@@ -334,7 +334,7 @@ where
             reader.read_exact(&mut long)?;
             let length = u64::from_be_bytes(long);
 
-            println!("Read object {hash}");
+
             header_entries.push(ArchiveHeaderEntry {
                 hash,
                 index,
