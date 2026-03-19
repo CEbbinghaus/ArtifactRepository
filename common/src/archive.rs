@@ -259,13 +259,17 @@ pub struct StoreEntryData {
 
 impl<'a> ArchiveEntryData for StoreEntryData {
     fn turn_into_vec(self) -> Vec<u8> {
-        let mut object = futures::executor::block_on(self.store.get_object(&self.hash))
-            .expect("Object to be available in store");
+        // Use block_in_place to avoid deadlocking the tokio runtime
+        tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current().block_on(async {
+                let mut object = self.store.get_object(&self.hash).await
+                    .expect("Object to be available in store");
 
-        let mut data: Vec<u8> = Vec::new();
-        futures::executor::block_on(object.read_to_end(&mut data)).expect("Reading to work");
-
-        data
+                let mut data: Vec<u8> = Vec::new();
+                object.read_to_end(&mut data).await.expect("Reading to work");
+                data
+            })
+        })
     }
 }
 

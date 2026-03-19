@@ -3,7 +3,7 @@ use chrono::Utc;
 use clap::{Parser, Subcommand};
 use common::{
     BLOB_KEY, Hash, Header, INDEX_KEY, Mode, ObjectType, TREE_KEY,
-    archive::{Archive, ArchiveBody, ArchiveEntryData, ArchiveHeaderEntry, Compression, HEADER, RawEntryData, FileEntryData},
+    archive::{Archive, ArchiveBody, ArchiveEntryData, ArchiveHeaderEntry, Compression, HEADER, RawEntryData, StoreEntryData},
     compute_hash, object_body, read_header_and_body, read_header_from_slice, read_object_into_headers,
     store::{Store, StoreObject},
 };
@@ -494,7 +494,7 @@ async fn download_object(hash: &Hash, file: &PathBuf, url: &String) -> anyhow::R
     Ok(header)
 }
 
-async fn pack_archive(store: &Store, cache: &PathBuf, path: &PathBuf, index_hash: &Hash, compression: Compression) -> anyhow::Result<()> {
+async fn pack_archive(store: &Store, path: &PathBuf, index_hash: &Hash, compression: Compression) -> anyhow::Result<()> {
     anyhow::ensure!(tokio::fs::metadata(path).await.is_err(), "Output file already exists");
     anyhow::ensure!(
         path.parent().map(|p| p.exists() && p.is_dir()) == Some(true),
@@ -538,7 +538,10 @@ async fn pack_archive(store: &Store, cache: &PathBuf, path: &PathBuf, index_hash
             header: header_entries,
             entries: headers
                 .into_iter()
-                .map(|(hash, _header)| FileEntryData(hash.get_path(cache)))
+                .map(|(hash, _header)| StoreEntryData {
+                    store: store.clone(),
+                    hash,
+                })
                 .collect(),
         },
     };
@@ -690,7 +693,7 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
         }
         Commands::Pull { url, index } => pull_cache(&cli.store, &url, index).await?,
         Commands::Pack { index, file, compression } => {
-            pack_archive(&store, &cli.store, &file, &index, compression).await?
+            pack_archive(&store, &file, &index, compression).await?
         }
         Commands::Unpack { file } => {
             unpack_archive(&cli.store, &file).await?
