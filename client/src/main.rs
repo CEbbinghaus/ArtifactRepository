@@ -187,10 +187,11 @@ async fn restore_directory(store: &Store, path: &Path, index_hash: Hash, validat
     let mut entries = read_dir(path).await?;
     anyhow::ensure!(entries.next_entry().await?.is_none(), "path must be an empty directory");
 
-    let mut store_obj = store.get_object(&index_hash).await?;
-    let mut index_data = Vec::new();
-    store_obj.read_to_end(&mut index_data).await?;
-    let index: object_body::Index = object_body::Object::from_data(&index_data)?;
+    let raw = store.get_bytes_direct_blocking(&index_hash)
+        .context("index object not found in store")?;
+    let (_header, index_data) = read_header_and_body(&raw)
+        .ok_or_else(|| anyhow::anyhow!("failed to parse index object"))?;
+    let index: object_body::Index = object_body::Object::from_data(index_data)?;
 
     let tree = read_tree_from_store_blocking(store, &index.tree)?;
 
@@ -308,12 +309,31 @@ async fn push_cache(store: &Store, url: &str, hash: Option<Hash>) -> anyhow::Res
     }
 
     let hashes = store.list_hashes().await.context("failed to list objects in store")?;
+    let total = hashes.len();
+    tracing::info!("pushing {} objects", total);
+
+    // Upload concurrently with bounded parallelism
+    let semaphore = Arc::new(tokio::sync::Semaphore::new(64));
+    let mut set = JoinSet::new();
 
     for hash in hashes {
-        let raw_bytes = store.get_raw_bytes(&hash).await
-            .context(format!("failed to read object {}", hash))?;
-        upload_object(&hash, &raw_bytes, url).await?;
+        let store_clone = store.clone();
+        let url = url.to_string();
+        let sem = semaphore.clone();
+        set.spawn(async move {
+            let _permit = sem.acquire().await
+                .map_err(|e| anyhow::anyhow!("semaphore: {e}"))?;
+            let raw_bytes = store_clone.get_raw_bytes(&hash).await
+                .context(format!("failed to read object {}", hash))?;
+            upload_object(&hash, &raw_bytes, &url).await
+        });
     }
+
+    while let Some(result) = set.join_next().await {
+        result??;
+    }
+
+    tracing::info!("pushed {} objects", total);
     Ok(())
 }
 
@@ -334,16 +354,40 @@ fn pull_tree<'a>(store: &'a Store, url: &'a str, tree_hash: &'a Hash) -> std::pi
 
         let tree_body: object_body::Tree = object_body::Object::from_data(data)?;
 
+        // Download blob entries concurrently, recurse into tree entries
+        let semaphore = Arc::new(tokio::sync::Semaphore::new(64));
+        let mut blob_set = JoinSet::new();
+
         for entry in tree_body.contents {
-            let header = download_object(store, &entry.hash, url).await
-                .context(format!("unable to download object with hash {}", entry.hash))?;
-
-            anyhow::ensure!(header.object_type != ObjectType::Index, "unexpected index object in tree");
-
-            if header.object_type == ObjectType::Tree {
-                pull_tree(store, url, &entry.hash).await?;
+            match entry.mode {
+                Mode::Tree => {
+                    // Trees must be processed sequentially to discover children
+                    let header = download_object(store, &entry.hash, url).await
+                        .context(format!("unable to download object with hash {}", entry.hash))?;
+                    anyhow::ensure!(header.object_type != ObjectType::Index, "unexpected index object in tree");
+                    pull_tree(store, url, &entry.hash).await?;
+                }
+                _ => {
+                    let store_clone = store.clone();
+                    let url = url.to_string();
+                    let hash = entry.hash.clone();
+                    let sem = semaphore.clone();
+                    blob_set.spawn(async move {
+                        let _permit = sem.acquire().await
+                            .map_err(|e| anyhow::anyhow!("semaphore: {e}"))?;
+                        let header = download_object(&store_clone, &hash, &url).await
+                            .context(format!("unable to download object with hash {}", hash))?;
+                        anyhow::ensure!(header.object_type != ObjectType::Index, "unexpected index object in tree");
+                        Ok::<_, anyhow::Error>(())
+                    });
+                }
             }
         }
+
+        while let Some(result) = blob_set.join_next().await {
+            result??;
+        }
+
         Ok(())
     })
 }
@@ -387,14 +431,12 @@ async fn upload_object(hash: &Hash, raw_bytes: &[u8], url: &str) -> anyhow::Resu
 }
 
 async fn download_object(store: &Store, hash: &Hash, url: &str) -> anyhow::Result<Header> {
-    // If already in store, return its header
-    if store.exists(hash).await? {
-        let mut store_obj = store.get_object(hash).await
-            .context("object should exist in store")?;
-        // Consume body to drop the reader
-        let mut _discard = Vec::new();
-        store_obj.read_to_end(&mut _discard).await?;
-        return Ok(store_obj.header);
+    // If already in store, return its header without reading the full object
+    if store.exists_direct_blocking(hash)? {
+        let raw = store.get_bytes_direct_blocking(hash)?;
+        let (header, _) = read_header_and_body(&raw)
+            .ok_or_else(|| anyhow::anyhow!("failed to parse header for object {}", hash))?;
+        return Ok(header);
     }
 
     let url = format!("{url}/object/{hash}");
@@ -448,11 +490,12 @@ async fn pack_archive(store: &Store, path: &Path, index_hash: &Hash, compression
     );
 
     let index: object_body::Index = {
-        let mut store_obj = store.get_object(index_hash).await.context("index object not found in store")?;
-        anyhow::ensure!(store_obj.header.object_type == ObjectType::Index, "expected index object type");
-        let mut body = Vec::new();
-        store_obj.read_to_end(&mut body).await?;
-        object_body::Object::from_data(&body)?
+        let raw = store.get_bytes_direct_blocking(index_hash)
+            .context("index object not found in store")?;
+        let (header, body) = read_header_and_body(&raw)
+            .ok_or_else(|| anyhow::anyhow!("failed to parse index object"))?;
+        anyhow::ensure!(header.object_type == ObjectType::Index, "expected index object type");
+        object_body::Object::from_data(body)?
     };
 
     #[allow(clippy::mutable_key_type)]
@@ -508,11 +551,12 @@ async fn push_archive(store: &Store, url: &str, index_hash: &Hash, compression: 
     tracing::debug!(index = %index_hash, url, "starting push-archive");
     // 1. Read index from store
     let index: object_body::Index = {
-        let mut store_obj = store.get_object(index_hash).await.context("index object not found in store")?;
-        anyhow::ensure!(store_obj.header.object_type == ObjectType::Index, "expected index object type");
-        let mut body = Vec::new();
-        store_obj.read_to_end(&mut body).await?;
-        object_body::Object::from_data(&body)?
+        let raw = store.get_bytes_direct_blocking(index_hash)
+            .context("index object not found in store")?;
+        let (header, body) = read_header_and_body(&raw)
+            .ok_or_else(|| anyhow::anyhow!("failed to parse index object"))?;
+        anyhow::ensure!(header.object_type == ObjectType::Index, "expected index object type");
+        object_body::Object::from_data(body)?
     };
 
     // 2. Collect all objects reachable from the tree
