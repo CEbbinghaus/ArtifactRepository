@@ -571,7 +571,7 @@ async fn pack_archive(store: &Store, path: &PathBuf, index_hash: &Hash, compress
 }
 
 async fn push_archive(store: &Store, url: &str, index_hash: &Hash, compression: Compression) -> anyhow::Result<()> {
-    tracing::info!(index = %index_hash, url, "starting push-archive");
+    tracing::debug!(index = %index_hash, url, "starting push-archive");
     // 1. Read index from store
     let index: object_body::Index = {
         let mut store_obj = store.get_object(index_hash).await.context("index object not found in store")?;
@@ -1047,9 +1047,10 @@ async fn archive_directory(directory: &PathBuf, file: &PathBuf, compression: Com
 #[derive(Parser)]
 #[command(version, about = "Artifact repository client for content-addressable storage", long_about = None)]
 struct Cli {
-    /// Path to the local object store directory
-    #[arg(short, long, value_name = "Store")]
-    store: PathBuf,
+    /// Path to the local object store directory.
+    /// Falls back to ARTIFACT_STORE env var, then ~/.artifact/store
+    #[arg(short, long, value_name = "PATH", env = "ARTIFACT_STORE")]
+    store: Option<PathBuf>,
 
     /// Increase logging verbosity (-d = info, -dd = debug, -ddd = trace)
     #[arg(short, long, action = clap::ArgAction::Count)]
@@ -1057,6 +1058,18 @@ struct Cli {
 
     #[command(subcommand)]
     command: Commands,
+}
+
+/// Resolve the store path from CLI arg / env var / default (~/.artifact/store)
+fn resolve_store_path(explicit: Option<PathBuf>) -> anyhow::Result<PathBuf> {
+    if let Some(path) = explicit {
+        return Ok(path);
+    }
+    // Default: ~/.artifact/store
+    let home = dirs::home_dir().context(
+        "could not determine home directory; please set --store or ARTIFACT_STORE",
+    )?;
+    Ok(home.join(".artifact").join("store"))
 }
 
 #[derive(Subcommand)]
@@ -1084,14 +1097,13 @@ enum Commands {
     /// Print the raw contents of an object to stdout
     Cat {
         /// Hash of the object to display
-        #[arg(long)]
         hash: Hash,
     },
 
     /// Push objects from the local store to a remote server
     Push {
         /// Base URL of the remote artifact server
-        #[arg(long)]
+        #[arg(long, env = "ARTIFACT_URL")]
         url: String,
 
         /// Optional index hash to push (pushes all objects if omitted)
@@ -1102,7 +1114,7 @@ enum Commands {
     /// Pull objects from a remote server into the local store
     Pull {
         /// Base URL of the remote artifact server
-        #[arg(long)]
+        #[arg(long, env = "ARTIFACT_URL")]
         url: String,
 
         /// Hash of the index object to pull
@@ -1121,7 +1133,7 @@ enum Commands {
         file: PathBuf,
 
         /// Compression algorithm (none, gzip, deflate, lzma2, zstd)
-        #[arg(long)]
+        #[arg(long, default_value = "zstd")]
         compression: Compression,
     },
 
@@ -1151,19 +1163,19 @@ enum Commands {
         #[arg(short, long)]
         file: PathBuf,
         /// Compression algorithm (none, gzip, deflate, lzma2, zstd)
-        #[arg(short, long)]
+        #[arg(short, long, default_value = "zstd")]
         compression: Compression,
     },
 
     /// Push objects to a remote server, uploading only what's missing (deduplication)
     PushArchive {
         /// Base URL of the remote artifact server
-        #[arg(long)]
+        #[arg(long, env = "ARTIFACT_URL")]
         url: String,
         /// Hash of the index to push
         #[arg(long)]
         index: Hash,
-        /// Compression algorithm for the supplemental archive (default: zstd)
+        /// Compression algorithm for the supplemental archive
         #[arg(long, default_value = "zstd")]
         compression: Compression,
     },
@@ -1174,9 +1186,8 @@ async fn main() {
     let cli = Cli::parse();
 
     let level = match cli.debug {
-        0 => "warn",
-        1 => "info",
-        2 => "debug",
+        0 => "info",
+        1 => "debug",
         _ => "trace",
     };
 
@@ -1663,13 +1674,16 @@ mod tests {
 }
 
 async fn run(cli: Cli) -> anyhow::Result<()> {
+    let store_path = resolve_store_path(cli.store)?;
+    tracing::debug!("using store at {}", store_path.display());
+
     // Ensure store directory exists
-    if tokio::fs::metadata(&cli.store).await.is_err() {
-        create_dir_all(&cli.store).await.context("failed to create store directory")?;
+    if tokio::fs::metadata(&store_path).await.is_err() {
+        create_dir_all(&store_path).await.context("failed to create store directory")?;
     }
 
     // Create store from cache directory
-    let store = Store::from_builder(opendal::services::Fs::default().root(cli.store.to_str().context("store path must be valid UTF-8")?))
+    let store = Store::from_builder(opendal::services::Fs::default().root(store_path.to_str().context("store path must be valid UTF-8")?))
         .context("failed to create store")?;
 
     match cli.command {
@@ -1681,14 +1695,14 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
         } => restore_directory(&store, &directory, index, validate).await?,
         Commands::Cat { hash } => cat_object(&store, &hash).await?,
         Commands::Push { url, index } => {
-            push_cache(&cli.store, &url, index).await?
+            push_cache(&store_path, &url, index).await?
         }
-        Commands::Pull { url, index } => pull_cache(&cli.store, &url, index).await?,
+        Commands::Pull { url, index } => pull_cache(&store_path, &url, index).await?,
         Commands::Pack { index, file, compression } => {
             pack_archive(&store, &file, &index, compression).await?
         }
         Commands::Unpack { file } => {
-            unpack_archive(&cli.store, &file).await?
+            unpack_archive(&store_path, &file).await?
         }
         Commands::Extract { file, directory } => {
             extract_archive(&file, &directory).await?
