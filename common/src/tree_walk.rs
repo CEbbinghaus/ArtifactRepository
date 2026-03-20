@@ -143,11 +143,12 @@ async fn read_header(store: &Store, hash: &Hash) -> anyhow::Result<Header> {
     Ok(obj.header)
 }
 
-/// Recursive tree metadata mirroring the Merkle tree structure.
+/// Content-addressable metadata: index info + flat hash-keyed object map.
+/// Trees reference children by hash, enabling O(1) lookup and easy merging.
 #[derive(Debug, Clone, Serialize)]
 pub struct TreeMetadata {
     pub index: IndexInfo,
-    pub tree: TreeNode,
+    pub objects: HashMap<Hash, MetadataObject>,
 }
 
 /// Index object metadata.
@@ -159,30 +160,28 @@ pub struct IndexInfo {
     pub metadata: HashMap<String, String>,
 }
 
-/// A tree node containing its hash and child entries keyed by name.
+/// A directory entry referencing a child by hash.
 #[derive(Debug, Clone, Serialize)]
-pub struct TreeNode {
+pub struct TreeDirEntry {
+    pub mode: String,
     pub hash: Hash,
-    pub entries: BTreeMap<String, MetadataEntry>,
 }
 
-/// An entry within a tree — either a subtree (with nested entries) or a blob (with size).
+/// An object in the metadata map — either a tree (directory) or blob (file).
 #[derive(Debug, Clone, Serialize)]
-#[serde(untagged)]
-pub enum MetadataEntry {
+#[serde(tag = "type")]
+pub enum MetadataObject {
+    #[serde(rename = "tree")]
     Tree {
-        mode: String,
-        hash: Hash,
-        entries: BTreeMap<String, MetadataEntry>,
+        entries: BTreeMap<String, TreeDirEntry>,
     },
+    #[serde(rename = "blob")]
     Blob {
-        mode: String,
-        hash: Hash,
         size: u64,
     },
 }
 
-/// Walk an index's tree in the store and build a recursive tree structure.
+/// Walk an index's tree in the store and build a flat hash-keyed object map.
 pub async fn collect_tree_metadata(
     store: &Store,
     index_hash: &Hash,
@@ -203,7 +202,8 @@ pub async fn collect_tree_metadata(
     index_obj.read_to_end(&mut index_body).await?;
     let index = object_body::Index::from_data(&index_body)?;
 
-    let tree = build_tree_node(store, &index.tree).await?;
+    let mut objects = HashMap::new();
+    collect_objects(store, &index.tree, &mut objects).await?;
 
     Ok(TreeMetadata {
         index: IndexInfo {
@@ -212,11 +212,20 @@ pub async fn collect_tree_metadata(
             timestamp: index.timestamp,
             metadata: index.metadata,
         },
-        tree,
+        objects,
     })
 }
 
-async fn build_tree_node(store: &Store, tree_hash: &Hash) -> anyhow::Result<TreeNode> {
+#[allow(clippy::mutable_key_type)]
+async fn collect_objects(
+    store: &Store,
+    tree_hash: &Hash,
+    objects: &mut HashMap<Hash, MetadataObject>,
+) -> anyhow::Result<()> {
+    if objects.contains_key(tree_hash) {
+        return Ok(());
+    }
+
     let mut tree_obj = store.get_object(tree_hash).await?;
 
     if tree_obj.header.object_type != ObjectType::Tree {
@@ -232,31 +241,33 @@ async fn build_tree_node(store: &Store, tree_hash: &Hash) -> anyhow::Result<Tree
 
     let mut entries = BTreeMap::new();
     for entry in &tree.contents {
-        let value = match entry.mode {
+        entries.insert(
+            entry.path.clone(),
+            TreeDirEntry {
+                mode: entry.mode.as_str().to_string(),
+                hash: entry.hash.clone(),
+            },
+        );
+
+        match entry.mode {
             Mode::Tree => {
-                let child = Box::pin(build_tree_node(store, &entry.hash)).await?;
-                MetadataEntry::Tree {
-                    mode: entry.mode.as_str().to_string(),
-                    hash: entry.hash.clone(),
-                    entries: child.entries,
-                }
+                Box::pin(collect_objects(store, &entry.hash, objects)).await?;
             }
             _ => {
-                let blob_header = read_header(store, &entry.hash).await?;
-                MetadataEntry::Blob {
-                    mode: entry.mode.as_str().to_string(),
-                    hash: entry.hash.clone(),
-                    size: blob_header.size,
+                if !objects.contains_key(&entry.hash) {
+                    let blob_header = read_header(store, &entry.hash).await?;
+                    objects.insert(
+                        entry.hash.clone(),
+                        MetadataObject::Blob { size: blob_header.size },
+                    );
                 }
             }
-        };
-        entries.insert(entry.path.clone(), value);
+        }
     }
 
-    Ok(TreeNode {
-        hash: tree_hash.clone(),
-        entries,
-    })
+    objects.insert(tree_hash.clone(), MetadataObject::Tree { entries });
+
+    Ok(())
 }
 
 #[cfg(test)]
@@ -541,28 +552,30 @@ mod tests {
         assert_eq!(meta.index.tree, tree_hash);
         assert_eq!(meta.index.timestamp, ts);
         assert!(meta.index.metadata.is_empty());
-        assert_eq!(meta.tree.hash, tree_hash);
-        assert_eq!(meta.tree.entries.len(), 2);
 
-        // Verify entries are blobs keyed by name
-        let a_entry = &meta.tree.entries["a.txt"];
-        match a_entry {
-            MetadataEntry::Blob { mode, hash, size } => {
-                assert_eq!(mode, "100644");
-                assert_eq!(hash, &blob1_hash);
-                assert_eq!(*size, 5);
+        // 3 objects: 1 tree + 2 blobs
+        assert_eq!(meta.objects.len(), 3);
+
+        // Root tree has 2 entries
+        match &meta.objects[&tree_hash] {
+            MetadataObject::Tree { entries } => {
+                assert_eq!(entries.len(), 2);
+                assert_eq!(entries["a.txt"].mode, "100644");
+                assert_eq!(entries["a.txt"].hash, blob1_hash);
+                assert_eq!(entries["run.sh"].mode, "100755");
+                assert_eq!(entries["run.sh"].hash, blob2_hash);
             }
-            _ => panic!("expected Blob entry"),
+            _ => panic!("expected Tree"),
         }
 
-        let run_entry = &meta.tree.entries["run.sh"];
-        match run_entry {
-            MetadataEntry::Blob { mode, hash, size } => {
-                assert_eq!(mode, "100755");
-                assert_eq!(hash, &blob2_hash);
-                assert_eq!(*size, 6);
-            }
-            _ => panic!("expected Blob entry"),
+        // Blobs are O(1) lookup by hash
+        match &meta.objects[&blob1_hash] {
+            MetadataObject::Blob { size } => assert_eq!(*size, 5),
+            _ => panic!("expected Blob"),
+        }
+        match &meta.objects[&blob2_hash] {
+            MetadataObject::Blob { size } => assert_eq!(*size, 6),
+            _ => panic!("expected Blob"),
         }
     }
 
@@ -609,33 +622,31 @@ mod tests {
 
         let meta = collect_tree_metadata(&store, &index_hash).await.unwrap();
 
-        assert_eq!(meta.tree.hash, root_tree_hash);
-        assert_eq!(meta.tree.entries.len(), 2);
+        // 4 objects: 2 trees + 2 blobs
+        assert_eq!(meta.objects.len(), 4);
 
-        // Lookup subdir by key
-        let subdir_entry = &meta.tree.entries["subdir"];
-        match subdir_entry {
-            MetadataEntry::Tree { mode, hash, entries } => {
-                assert_eq!(mode, "040000");
-                assert_eq!(hash, &subtree_hash);
-                assert_eq!(entries.len(), 1);
-                match &entries["deep.txt"] {
-                    MetadataEntry::Blob { mode, hash, size } => {
-                        assert_eq!(mode, "100644");
-                        assert_eq!(hash, &blob_hash);
-                        assert_eq!(*size, 14);
-                    }
-                    _ => panic!("expected Blob entry in subdir"),
-                }
+        // Root tree references subdir by hash
+        match &meta.objects[&root_tree_hash] {
+            MetadataObject::Tree { entries } => {
+                assert_eq!(entries["subdir"].hash, subtree_hash);
+                assert_eq!(entries["subdir"].mode, "040000");
+                assert_eq!(entries["root.txt"].hash, root_blob_hash);
             }
-            _ => panic!("expected Tree entry"),
+            _ => panic!("expected Tree"),
         }
 
-        // Lookup root.txt by key
-        let root_entry = &meta.tree.entries["root.txt"];
-        match root_entry {
-            MetadataEntry::Blob { size, .. } => assert_eq!(*size, 9),
-            _ => panic!("expected Blob entry"),
+        // Subtree also in map, O(1) lookup
+        match &meta.objects[&subtree_hash] {
+            MetadataObject::Tree { entries } => {
+                assert_eq!(entries.len(), 1);
+                assert_eq!(entries["deep.txt"].hash, blob_hash);
+            }
+            _ => panic!("expected Tree"),
+        }
+
+        match &meta.objects[&blob_hash] {
+            MetadataObject::Blob { size } => assert_eq!(*size, 14),
+            _ => panic!("expected Blob"),
         }
     }
 
@@ -690,33 +701,32 @@ mod tests {
         assert!(idx["timestamp"].is_string());
         assert_eq!(idx["metadata"]["version"], "1.0");
 
-        // Tree root
-        let tree = &json["tree"];
-        assert!(tree["hash"].is_string());
-        let entries = tree["entries"].as_object().unwrap();
-        assert_eq!(entries.len(), 2);
+        // Objects is a hash-keyed map
+        let objects = json["objects"].as_object().unwrap();
 
-        // Blob entry (file.txt) — has "size", no "entries"
-        let blob_entry = &entries["file.txt"];
-        assert_eq!(blob_entry["mode"], "100644");
-        assert!(blob_entry["hash"].is_string());
-        assert_eq!(blob_entry["size"], 5);
-        assert!(blob_entry.get("entries").is_none());
+        // Root tree keyed by its hash
+        let root = &objects[root_tree_hash.as_str()];
+        assert_eq!(root["type"], "tree");
+        let entries = root["entries"].as_object().unwrap();
+        assert_eq!(entries["file.txt"]["hash"], blob_hash.as_str());
+        assert_eq!(entries["file.txt"]["mode"], "100644");
+        assert_eq!(entries["subdir"]["hash"], subtree_hash.as_str());
+        assert_eq!(entries["subdir"]["mode"], "040000");
 
-        // Tree entry (subdir) — has "entries" dict, no "size"
-        let tree_entry = &entries["subdir"];
-        assert_eq!(tree_entry["mode"], "040000");
-        assert!(tree_entry["hash"].is_string());
-        assert!(tree_entry.get("size").is_none());
-        let sub_entries = tree_entry["entries"].as_object().unwrap();
-        assert_eq!(sub_entries.len(), 1);
-        assert_eq!(sub_entries["nested.txt"]["size"], 5);
+        // Subtree keyed by its hash
+        let sub = &objects[subtree_hash.as_str()];
+        assert_eq!(sub["type"], "tree");
+        let sub_entries = sub["entries"].as_object().unwrap();
+        assert_eq!(sub_entries["nested.txt"]["hash"], blob_hash.as_str());
 
-        // Old flat fields should not exist
-        assert!(json.get("index_hash").is_none());
-        assert!(json.get("tree_hash").is_none());
+        // Blob keyed by its hash
+        let blob = &objects[blob_hash.as_str()];
+        assert_eq!(blob["type"], "blob");
+        assert_eq!(blob["size"], 5);
+
+        // Old fields gone
+        assert!(json.get("tree").is_none());
         assert!(json.get("files").is_none());
-        assert!(json.get("objects").is_none());
     }
 
     #[tokio::test]
@@ -736,8 +746,48 @@ mod tests {
         let index_hash = put_index(&store, &index).await;
 
         let meta = collect_tree_metadata(&store, &index_hash).await.unwrap();
-        assert_eq!(meta.tree.hash, tree_hash);
-        assert!(meta.tree.entries.is_empty());
+        // Just the empty root tree
+        assert_eq!(meta.objects.len(), 1);
+        match &meta.objects[&tree_hash] {
+            MetadataObject::Tree { entries } => assert!(entries.is_empty()),
+            _ => panic!("expected Tree"),
+        }
+    }
+
+    #[tokio::test]
+    async fn tree_metadata_deduplicates_shared_blobs() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = make_store(tmp.path());
+
+        // Same blob referenced twice under different names
+        let blob_hash = put_blob(&store, b"shared").await;
+        let tree = object_body::Tree {
+            contents: vec![
+                object_body::TreeEntry {
+                    mode: Mode::Normal,
+                    path: "copy1.txt".to_string(),
+                    hash: blob_hash.clone(),
+                },
+                object_body::TreeEntry {
+                    mode: Mode::Normal,
+                    path: "copy2.txt".to_string(),
+                    hash: blob_hash.clone(),
+                },
+            ],
+        };
+        let tree_hash = put_tree(&store, &tree).await;
+
+        let ts = Utc.with_ymd_and_hms(2025, 1, 1, 0, 0, 0).unwrap();
+        let index = object_body::Index {
+            tree: tree_hash.clone(),
+            timestamp: ts,
+            metadata: HashMap::new(),
+        };
+        let index_hash = put_index(&store, &index).await;
+
+        let meta = collect_tree_metadata(&store, &index_hash).await.unwrap();
+        // 2 objects: 1 tree + 1 blob (deduplicated)
+        assert_eq!(meta.objects.len(), 2);
     }
 
     #[tokio::test]

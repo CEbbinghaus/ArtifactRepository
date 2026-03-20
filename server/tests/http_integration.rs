@@ -410,19 +410,25 @@ async fn get_metadata_returns_correct_json() {
     assert!(json["index"]["timestamp"].is_string());
     assert!(json["index"]["metadata"].is_object());
 
-    // Verify tree structure with dictionary entries
-    let tree = &json["tree"];
-    assert_eq!(tree["hash"], tree_hash.as_str());
-    let entries = tree["entries"].as_object().unwrap();
+    // Objects is a hash-keyed map
+    let objects = json["objects"].as_object().unwrap();
+
+    // Root tree keyed by its hash
+    let root = &objects[tree_hash.as_str()];
+    assert_eq!(root["type"], "tree");
+    let entries = root["entries"].as_object().unwrap();
     assert_eq!(entries.len(), 1);
-    let hello_entry = &entries["hello.txt"];
-    assert_eq!(hello_entry["hash"], blob_hash.as_str());
-    assert_eq!(hello_entry["size"], blob_data.len() as u64);
-    assert_eq!(hello_entry["mode"], "100644");
+    assert_eq!(entries["hello.txt"]["hash"], blob_hash.as_str());
+    assert_eq!(entries["hello.txt"]["mode"], "100644");
+
+    // Blob keyed by its hash
+    let blob = &objects[blob_hash.as_str()];
+    assert_eq!(blob["type"], "blob");
+    assert_eq!(blob["size"], blob_data.len() as u64);
+
     // Should not have old flat fields
-    assert!(json.get("index_hash").is_none());
+    assert!(json.get("tree").is_none());
     assert!(json.get("files").is_none());
-    assert!(json.get("objects").is_none());
 }
 
 #[tokio::test]
