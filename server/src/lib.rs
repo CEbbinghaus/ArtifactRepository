@@ -206,9 +206,67 @@ async fn read_index_from_store(store: &Store, index_hash: &Hash) -> Result<Index
 }
 
 /// Walk a tree collecting (Hash, Header) pairs and the ordered list of hashes.
-/// Only tree bodies are read to discover children; blob bodies are NOT loaded.
+/// Uses direct I/O in a single blocking task when available.
 #[allow(clippy::mutable_key_type)]
 async fn collect_entry_metadata(
+    store: &Store,
+    tree_hash: &Hash,
+) -> Result<(Vec<Hash>, HashMap<Hash, Header>), ServerError> {
+    if store.has_direct_io() {
+        let store = store.clone();
+        let tree_hash = tree_hash.clone();
+        tokio::task::spawn_blocking(move || {
+            collect_entry_metadata_blocking(&store, &tree_hash)
+        })
+        .await
+        .map_err(|e| ServerError::Internal(e.to_string()))?
+    } else {
+        collect_entry_metadata_async(store, tree_hash).await
+    }
+}
+
+/// Blocking version using direct filesystem I/O.
+#[allow(clippy::mutable_key_type)]
+fn collect_entry_metadata_blocking(
+    store: &Store,
+    tree_hash: &Hash,
+) -> Result<(Vec<Hash>, HashMap<Hash, Header>), ServerError> {
+    let mut meta: HashMap<Hash, Header> = HashMap::new();
+    let mut order: Vec<Hash> = Vec::new();
+    let mut stack = vec![tree_hash.clone()];
+
+    while let Some(current_hash) = stack.pop() {
+        if meta.contains_key(&current_hash) {
+            continue;
+        }
+
+        let raw = store.get_bytes_direct_blocking(&current_hash)
+            .map_err(|e| ServerError::Internal(e.to_string()))?;
+        let (header, body) = read_header_and_body(&raw)
+            .ok_or_else(|| ServerError::Internal("invalid object header".into()))?;
+
+        if header.object_type == ObjectType::Tree {
+            let tree = Tree::from_data(body)
+                .map_err(|e| ServerError::Internal(e.to_string()))?;
+            for entry in &tree.contents {
+                if !meta.contains_key(&entry.hash) {
+                    stack.push(entry.hash.clone());
+                }
+            }
+            meta.insert(current_hash.clone(), Header::new(ObjectType::Tree, body.len() as u64));
+            order.push(current_hash);
+        } else {
+            meta.insert(current_hash.clone(), header);
+            order.push(current_hash);
+        }
+    }
+
+    Ok((order, meta))
+}
+
+/// Async version for non-filesystem backends.
+#[allow(clippy::mutable_key_type)]
+async fn collect_entry_metadata_async(
     store: &Store,
     tree_hash: &Hash,
 ) -> Result<(Vec<Hash>, HashMap<Hash, Header>), ServerError> {
@@ -253,17 +311,11 @@ async fn collect_entry_metadata(
         .map(|hash| {
             let store = store.clone();
             async move {
-                if let Some(header) = store.get_raw_bytes(&hash).await
-                    .ok()
-                    .and_then(|raw| read_header_and_body(&raw).map(|(h, _)| h))
-                {
-                    Ok((hash, header))
-                } else {
-                    // Fallback: use get_object for header only
-                    let obj = store.get_object(&hash).await
-                        .map_err(|e| ServerError::Internal(e.to_string()))?;
-                    Ok((hash, obj.header))
-                }
+                let raw = store.get_raw_bytes(&hash).await
+                    .map_err(|e| ServerError::Internal(e.to_string()))?;
+                let (header, _) = read_header_and_body(&raw)
+                    .ok_or_else(|| ServerError::Internal("invalid blob header".into()))?;
+                Ok((hash, header))
             }
         })
         .buffer_unordered(256)
@@ -715,7 +767,7 @@ async fn get_metadata(
         .await
         .map_err(|err| {
             let msg = err.to_string();
-            if msg.contains("not found") || msg.contains("NotFound") {
+            if msg.contains("not found") || msg.contains("NotFound") || msg.contains("No such file") {
                 ServerError::NotFound("index not found".into())
             } else {
                 ServerError::Internal(msg)

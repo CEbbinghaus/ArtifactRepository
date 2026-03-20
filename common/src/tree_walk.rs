@@ -197,21 +197,115 @@ pub enum MetadataObject {
 }
 
 /// Walk an index's tree in the store and build a flat hash-keyed object map.
+/// Uses direct I/O in a single blocking task when available for maximum throughput.
 pub async fn collect_tree_metadata(
     store: &Store,
     index_hash: &Hash,
 ) -> anyhow::Result<TreeMetadata> {
     tracing::info!(index_hash = %index_hash, "collecting tree metadata");
 
+    if store.has_direct_io() {
+        // Fast path: do everything in a single blocking task with direct I/O
+        let store = store.clone();
+        let index_hash = index_hash.clone();
+        tokio::task::spawn_blocking(move || {
+            collect_tree_metadata_blocking(&store, &index_hash)
+        }).await?
+    } else {
+        collect_tree_metadata_async(store, index_hash).await
+    }
+}
+
+/// Blocking implementation using direct filesystem I/O.
+#[allow(clippy::mutable_key_type)]
+fn collect_tree_metadata_blocking(
+    store: &Store,
+    index_hash: &Hash,
+) -> anyhow::Result<TreeMetadata> {
+    let raw = store.get_bytes_direct_blocking(index_hash)?;
+    let (index_header, index_body) = crate::read_header_and_body(&raw)
+        .ok_or_else(|| anyhow::anyhow!("invalid index header"))?;
+
+    if index_header.object_type != ObjectType::Index {
+        anyhow::bail!("expected Index object, got {:?}", index_header.object_type);
+    }
+
+    let index = object_body::Index::from_data(index_body)?;
+
+    let mut objects = HashMap::new();
+    collect_objects_blocking(store, &index.tree, &mut objects)?;
+
+    Ok(TreeMetadata {
+        index: IndexInfo {
+            hash: index_hash.clone(),
+            tree: index.tree,
+            timestamp: index.timestamp,
+            metadata: index.metadata,
+        },
+        objects,
+    })
+}
+
+#[allow(clippy::mutable_key_type)]
+fn collect_objects_blocking(
+    store: &Store,
+    tree_hash: &Hash,
+    objects: &mut HashMap<Hash, MetadataObject>,
+) -> anyhow::Result<()> {
+    if objects.contains_key(tree_hash) {
+        return Ok(());
+    }
+
+    let raw = store.get_bytes_direct_blocking(tree_hash)?;
+    let (header, body) = crate::read_header_and_body(&raw)
+        .ok_or_else(|| anyhow::anyhow!("invalid tree object header"))?;
+
+    if header.object_type != ObjectType::Tree {
+        anyhow::bail!("expected Tree object, got {:?}", header.object_type);
+    }
+
+    let tree = object_body::Tree::from_data(body)?;
+
+    let mut entries = BTreeMap::new();
+    for entry in &tree.contents {
+        entries.insert(
+            entry.path.clone(),
+            TreeDirEntry {
+                mode: entry.mode.as_str().to_string(),
+                hash: entry.hash.clone(),
+            },
+        );
+
+        match entry.mode {
+            Mode::Tree => {
+                collect_objects_blocking(store, &entry.hash, objects)?;
+            }
+            _ => {
+                if !objects.contains_key(&entry.hash) {
+                    let raw = store.get_bytes_direct_blocking(&entry.hash)?;
+                    let (blob_header, _) = crate::read_header_and_body(&raw)
+                        .ok_or_else(|| anyhow::anyhow!("invalid blob header"))?;
+                    objects.insert(entry.hash.clone(), MetadataObject::Blob { size: blob_header.size });
+                }
+            }
+        }
+    }
+
+    objects.insert(tree_hash.clone(), MetadataObject::Tree { entries });
+    Ok(())
+}
+
+/// Async implementation for non-filesystem backends.
+async fn collect_tree_metadata_async(
+    store: &Store,
+    index_hash: &Hash,
+) -> anyhow::Result<TreeMetadata> {
     let raw = store.get_raw_bytes(index_hash).await?;
     let (index_header, index_body) = crate::read_header_and_body(&raw)
         .ok_or_else(|| anyhow::anyhow!("invalid index header"))?;
 
     if index_header.object_type != ObjectType::Index {
-        anyhow::bail!(
-            "expected Index object, got {:?}",
-            index_header.object_type
-        );
+        anyhow::bail!("expected Index object, got {:?}", index_header.object_type);
     }
 
     let index = object_body::Index::from_data(index_body)?;
