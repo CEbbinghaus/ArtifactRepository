@@ -74,7 +74,9 @@ impl Object for Index {
     }
 
     fn to_data(&self) -> Vec<u8> {
-        let mut data: Vec<u8> = Vec::new();
+        // Pre-allocate: "tree: " + 128-char hash + "\n" + "timestamp: " + rfc3339 + "\n" + metadata + "\n"
+        let estimated = 200 + self.metadata.iter().map(|(k, v)| k.len() + v.len() + 4).sum::<usize>();
+        let mut data: Vec<u8> = Vec::with_capacity(estimated);
 
         fn write_kv(data: &mut Vec<u8>, key: &str, value: &str) -> anyhow::Result<()> {
             data.write_all(key.as_bytes())?;
@@ -111,7 +113,9 @@ pub struct Tree {
 }
 impl Object for Tree {
     fn from_data(data: &[u8]) -> anyhow::Result<Self> {
-        let mut contents = Vec::new();
+        // Estimate entry count: ~92 bytes per entry
+        let estimated_entries = data.len() / 80;
+        let mut contents = Vec::with_capacity(estimated_entries);
 
         let mut index: usize = 0;
         loop {
@@ -152,7 +156,8 @@ impl Object for Tree {
     }
 
     fn to_data(&self) -> Vec<u8> {
-        let mut data: Vec<u8> = Vec::new();
+        // Each entry: ~6 bytes mode + 1 space + ~20 bytes name + 1 null + 64 bytes hash = ~92 bytes avg
+        let mut data: Vec<u8> = Vec::with_capacity(self.contents.len() * 92);
 
         fn write_entry(data: &mut Vec<u8>, entry: &TreeEntry) -> anyhow::Result<()> {
             data.write_all(entry.mode.as_str().as_bytes())?;
