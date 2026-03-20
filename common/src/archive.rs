@@ -225,6 +225,57 @@ where
 //     }
 // }
 
+/// Apply compression to a body-writing closure, using the same encoder
+/// settings as `Archive::to_data`. This allows callers to write the body
+/// content on-demand (e.g., streaming from a store) rather than materializing it.
+pub fn write_compressed_body<F>(
+    compression: Compression,
+    writer: &mut impl Write,
+    write_body: F,
+) -> anyhow::Result<()>
+where
+    F: FnOnce(&mut dyn Write) -> anyhow::Result<()>,
+{
+    match compression {
+        Compression::None => write_body(writer)?,
+        Compression::Gzip => {
+            let mut enc = flate2::write::GzEncoder::new(writer, flate2::Compression::default());
+            write_body(&mut enc)?;
+            enc.finish()?.flush()?;
+        }
+        Compression::Deflate => {
+            let mut enc =
+                flate2::write::DeflateEncoder::new(writer, flate2::Compression::default());
+            write_body(&mut enc)?;
+            enc.finish()?.flush()?;
+        }
+        Compression::Zstd => {
+            let mut enc = zstd::stream::write::Encoder::new(writer, 3)?;
+            enc.multithread(
+                std::thread::available_parallelism()
+                    .map(|n| n.get() as u32)
+                    .unwrap_or(1),
+            )?;
+            write_body(&mut enc)?;
+            enc.finish()?.flush()?;
+        }
+        Compression::LZMA2 => {
+            write_body(
+                &mut lzma_rust2::Lzma2WriterMt::new(
+                    writer,
+                    lzma_rust2::Lzma2Options {
+                        lzma_options: Default::default(),
+                        chunk_size: NonZero::new(1024 * 64),
+                    },
+                    std::thread::available_parallelism().unwrap().get() as u32,
+                )?
+                .auto_finish(),
+            )?;
+        }
+    }
+    Ok(())
+}
+
 pub struct ArchiveHeaderEntry {
     pub hash: Hash,
     pub index: u64,

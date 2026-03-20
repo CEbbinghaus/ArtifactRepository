@@ -13,10 +13,10 @@ use axum::{
 };
 use common::{
     Hash, Header, Mode, ObjectType,
-    archive::{Archive, ArchiveBody, ArchiveEntryData, ArchiveHeaderEntry, Compression, RawEntryData, HEADER, SUPPLEMENTAL_HEADER},
+    archive::{Archive, ArchiveHeaderEntry, Compression, RawEntryData, HEADER, SUPPLEMENTAL_HEADER, write_compressed_body},
     collect_tree_metadata,
     object_body::{Index, Object as _, Tree},
-    read_header_and_body, read_object_into_headers,
+    read_header_and_body,
     store::{Store, StoreObject},
 };
 use serde::Deserialize;
@@ -76,25 +76,6 @@ impl Drop for ChannelWriter {
     fn drop(&mut self) {
         let _ = self.send_buf();
     }
-}
-
-/// Spawn a blocking task that writes the archive into a channel,
-/// returning a streaming Body.
-fn stream_archive<T: ArchiveEntryData + Send + 'static>(
-    archive: Archive<T>,
-) -> Body {
-    let (tx, rx) = tokio::sync::mpsc::channel(STREAM_CHANNEL_CAPACITY);
-
-    tokio::task::spawn_blocking(move || {
-        let mut writer = ChannelWriter::new(tx);
-        if let Err(e) = archive.to_data(&mut writer) {
-            tracing::error!(error = %e, "archive streaming serialization failed");
-        }
-        // Drop flushes remaining bytes
-    });
-
-    let stream = tokio_stream::wrappers::ReceiverStream::new(rx);
-    Body::from_stream(stream)
 }
 
 #[derive(Clone)]
@@ -236,6 +217,118 @@ async fn read_index_from_store(store: &Store, index_hash: &Hash) -> Result<Index
     Index::from_data(&body).map_err(|err| ServerError::Internal(err.to_string()))
 }
 
+/// Walk a tree collecting (Hash, Header) pairs and the ordered list of hashes.
+/// Only tree bodies are read to discover children; blob bodies are NOT loaded.
+#[allow(clippy::mutable_key_type)]
+async fn collect_entry_metadata(
+    store: &Store,
+    tree_hash: &Hash,
+) -> Result<(Vec<Hash>, HashMap<Hash, Header>), ServerError> {
+    let mut meta: HashMap<Hash, Header> = HashMap::new();
+    let mut order: Vec<Hash> = Vec::new();
+    let mut stack = vec![tree_hash.clone()];
+
+    while let Some(current_hash) = stack.pop() {
+        if meta.contains_key(&current_hash) {
+            continue;
+        }
+
+        let mut object = store.get_object(&current_hash).await
+            .map_err(|e| ServerError::Internal(e.to_string()))?;
+        let header = object.header;
+
+        if header.object_type == ObjectType::Tree {
+            let mut data = Vec::new();
+            object.read_to_end(&mut data).await
+                .map_err(|e| ServerError::Internal(e.to_string()))?;
+            let tree = Tree::from_data(&data)
+                .map_err(|e| ServerError::Internal(e.to_string()))?;
+            for entry in &tree.contents {
+                stack.push(entry.hash.clone());
+            }
+            meta.insert(current_hash.clone(), Header::new(ObjectType::Tree, data.len() as u64));
+            order.push(current_hash);
+        } else {
+            meta.insert(current_hash.clone(), header);
+            order.push(current_hash);
+        }
+    }
+
+    Ok((order, meta))
+}
+
+/// Write an archive to `writer` by streaming each entry from the store on-demand.
+/// Only one entry's data is in memory at a time.
+fn write_streaming_archive(
+    store: Store,
+    magic: [u8; 4],
+    compression: Compression,
+    index_hash: Hash,
+    index: Index,
+    entry_order: Vec<Hash>,
+    entry_meta: HashMap<Hash, Header>,
+    writer: &mut impl Write,
+) -> anyhow::Result<()> {
+    use common::object_body::Object as _;
+
+    // 1. File header (uncompressed) — same layout as Archive::to_data
+    writer.write_all(&magic)?;
+    writer.write_all(&(compression as u16).to_be_bytes())?;
+    writer.write_all(&index_hash.hash)?;
+    writer.write_all(&index.to_data())?;
+    writer.write_all(&[0])?;
+
+    // 2. Build entry header table from metadata
+    let mut header_entries: Vec<ArchiveHeaderEntry> = Vec::with_capacity(entry_order.len());
+    let mut offset: u64 = 0;
+    for hash in &entry_order {
+        let header = &entry_meta[hash];
+        let prefix_len = header.to_string().len() as u64;
+        let length = prefix_len + header.size;
+        header_entries.push(ArchiveHeaderEntry {
+            hash: hash.clone(),
+            index: offset,
+            length,
+        });
+        offset += length;
+    }
+
+    // 3. Write body (entry table + entry data), fetching from store on-demand
+    let write_body = |w: &mut dyn Write| -> anyhow::Result<()> {
+        w.write_all(&(header_entries.len() as u64).to_be_bytes())?;
+        for entry in &header_entries {
+            w.write_all(&entry.hash.hash)?;
+            w.write_all(&entry.index.to_be_bytes())?;
+            w.write_all(&entry.length.to_be_bytes())?;
+        }
+        for hash in &entry_order {
+            let header = &entry_meta[hash];
+            let prefix = header.to_string();
+            w.write_all(prefix.as_bytes())?;
+
+            let body = tokio::task::block_in_place(|| {
+                tokio::runtime::Handle::current().block_on(async {
+                    let mut obj = store.get_object(hash).await?;
+                    let mut data = Vec::new();
+                    obj.read_to_end(&mut data).await?;
+                    Ok::<_, anyhow::Error>(data)
+                })
+            })?;
+            w.write_all(&body)?;
+        }
+        w.flush()?;
+        Ok(())
+    };
+
+    // 4. Apply compression using the Archive crate's same compression stack
+    // We use the common crate's compression by constructing a minimal Archive
+    // and delegating to its to_data. But since we need on-demand fetching,
+    // we write the compressed body ourselves using the same encoders.
+    write_compressed_body(compression, writer, write_body)?;
+
+    Ok(())
+}
+
 #[debug_handler]
 async fn get_archive(
     AxumPath(index_hash): AxumPath<Hash>,
@@ -253,49 +346,24 @@ async fn get_archive(
 
     let index = read_index_from_store(&store, &index_hash).await?;
 
-    #[allow(clippy::mutable_key_type)]
-    let mut headers: HashMap<Hash, (Header, Vec<u8>)> = HashMap::new();
-    read_object_into_headers(&store, &mut headers, &index.tree)
-        .await
-        .map_err(|err| ServerError::Internal(err.to_string()))?;
+    // Collect only metadata (hashes + headers), not body data
+    let (entry_order, entry_meta) = collect_entry_metadata(&store, &index.tree).await?;
 
-    let mut offset: u64 = 0;
-    let mut header_entries: Vec<ArchiveHeaderEntry> = Vec::new();
+    let (tx, rx) = tokio::sync::mpsc::channel(STREAM_CHANNEL_CAPACITY);
+    let ih = index_hash.clone();
 
-    for (hash, (header, data)) in &headers {
-        let prefix_length = header.to_string().len() as u64;
-        let length = prefix_length + data.len() as u64;
+    tokio::task::spawn_blocking(move || {
+        let mut writer = ChannelWriter::new(tx);
+        #[allow(clippy::mutable_key_type)]
+        if let Err(e) = write_streaming_archive(
+            store, HEADER, compression, ih, index, entry_order, entry_meta, &mut writer,
+        ) {
+            tracing::error!(error = %e, "archive streaming failed");
+        }
+    });
 
-        header_entries.push(ArchiveHeaderEntry {
-            hash: hash.clone(),
-            index: offset,
-            length,
-        });
-
-        offset += length;
-    }
-
-    let archive = Archive {
-        header: HEADER,
-        compression,
-        hash: index_hash.clone(),
-        index,
-        body: ArchiveBody {
-            header: header_entries,
-            entries: headers
-                .into_iter()
-                .map(|(_hash, (header, data))| {
-                    let prefix = header.to_string();
-                    let mut full_data = Vec::with_capacity(prefix.len() + data.len());
-                    full_data.extend_from_slice(prefix.as_bytes());
-                    full_data.extend(data);
-                    RawEntryData(full_data)
-                })
-                .collect(),
-        },
-    };
-
-    let body = stream_archive(archive);
+    let stream = tokio_stream::wrappers::ReceiverStream::new(rx);
+    let body = Body::from_stream(stream);
 
     let short_hash = &index_hash.as_str()[..12];
     let mut response = Response::new(body);
@@ -323,7 +391,7 @@ async fn get_supplemental(
     State(ServerState { store }): State<ServerState>,
     axum::Json(request): axum::Json<SupplementalRequest>,
 ) -> Result<Response<Body>, ServerError> {
-    tracing::info!(hash = %index_hash, requested_hashes = request.hashes.len(), "POST /supplemental - building");
+    tracing::info!(hash = %index_hash, requested_hashes = request.hashes.len(), "POST /supplemental - streaming");
 
     let compression = match query.compression.as_deref() {
         Some(s) => s
@@ -334,24 +402,13 @@ async fn get_supplemental(
 
     let index = read_index_from_store(&store, &index_hash).await?;
 
-    #[allow(clippy::mutable_key_type)]
-    let mut headers: HashMap<Hash, (Header, Vec<u8>)> = HashMap::new();
-    read_object_into_headers(&store, &mut headers, &index.tree)
-        .await
-        .map_err(|err| ServerError::Internal(err.to_string()))?;
+    // Collect metadata only (no body data)
+    let (all_order, all_meta) = collect_entry_metadata(&store, &index.tree).await?;
 
-    // Also include the index object itself
-    let mut index_obj = store
-        .get_object(&index_hash)
-        .await
-        .map_err(|err| ServerError::Internal(err.to_string()))?;
+    // Also get the index object's header
+    let index_obj = store.get_object(&index_hash).await
+        .map_err(|e| ServerError::Internal(e.to_string()))?;
     let index_header = index_obj.header;
-    let mut index_body = Vec::new();
-    index_obj
-        .read_to_end(&mut index_body)
-        .await
-        .map_err(|err| ServerError::Internal(err.to_string()))?;
-    headers.insert(index_hash.clone(), (index_header, index_body));
 
     // Build the set of hashes to include:
     // - All requested hashes
@@ -360,7 +417,7 @@ async fn get_supplemental(
     #[allow(clippy::mutable_key_type)]
     let mut included: std::collections::HashSet<Hash> = std::collections::HashSet::new();
     included.insert(index_hash.clone());
-    for (hash, (header, _)) in &headers {
+    for (hash, header) in &all_meta {
         if header.object_type == ObjectType::Tree {
             included.insert(hash.clone());
         }
@@ -369,46 +426,39 @@ async fn get_supplemental(
         included.insert(hash.clone());
     }
 
-    // Build header entries and raw entries in a single pass for consistent ordering
-    let mut offset: u64 = 0;
-    let mut header_entries: Vec<ArchiveHeaderEntry> = Vec::new();
-    let mut raw_entries: Vec<RawEntryData> = Vec::new();
+    // Filter to only included entries
+    #[allow(clippy::mutable_key_type)]
+    let mut entry_meta: HashMap<Hash, Header> = HashMap::new();
+    let mut entry_order: Vec<Hash> = Vec::new();
 
-    for (hash, (header, data)) in headers {
-        if !included.contains(&hash) {
-            continue;
+    // Add index object first
+    entry_meta.insert(index_hash.clone(), index_header);
+    entry_order.push(index_hash.clone());
+
+    for hash in &all_order {
+        if included.contains(hash) && !entry_meta.contains_key(hash) {
+            entry_meta.insert(hash.clone(), all_meta[hash]);
+            entry_order.push(hash.clone());
         }
-        let prefix = header.to_string();
-        let length = prefix.len() as u64 + data.len() as u64;
-
-        header_entries.push(ArchiveHeaderEntry {
-            hash,
-            index: offset,
-            length,
-        });
-
-        let mut full_data = Vec::with_capacity(prefix.len() + data.len());
-        full_data.extend_from_slice(prefix.as_bytes());
-        full_data.extend(data);
-        raw_entries.push(RawEntryData(full_data));
-
-        offset += length;
     }
 
-    tracing::debug!(entries = header_entries.len(), "supplemental archive built");
+    tracing::debug!(entries = entry_order.len(), "supplemental entries selected");
 
-    let archive = Archive {
-        header: SUPPLEMENTAL_HEADER,
-        compression,
-        hash: index_hash.clone(),
-        index,
-        body: ArchiveBody {
-            header: header_entries,
-            entries: raw_entries,
-        },
-    };
+    let (tx, rx) = tokio::sync::mpsc::channel(STREAM_CHANNEL_CAPACITY);
+    let ih = index_hash.clone();
 
-    let body = stream_archive(archive);
+    tokio::task::spawn_blocking(move || {
+        let mut writer = ChannelWriter::new(tx);
+        #[allow(clippy::mutable_key_type)]
+        if let Err(e) = write_streaming_archive(
+            store, SUPPLEMENTAL_HEADER, compression, ih, index, entry_order, entry_meta, &mut writer,
+        ) {
+            tracing::error!(error = %e, "supplemental streaming failed");
+        }
+    });
+
+    let stream = tokio_stream::wrappers::ReceiverStream::new(rx);
+    let body = Body::from_stream(stream);
 
     let short_hash = &index_hash.as_str()[..12];
     let mut response = Response::new(body);
