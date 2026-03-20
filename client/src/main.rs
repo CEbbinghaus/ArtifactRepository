@@ -5,7 +5,7 @@ use common::{
     BLOB_KEY, Hash, Header, INDEX_KEY, Mode, ObjectType, TREE_KEY,
     archive::{Archive, ArchiveBody, ArchiveEntryData, ArchiveHeaderEntry, Compression, HEADER, RawEntryData},
     compute_hash, object_body, read_header_and_body, read_header_from_slice, read_object_into_headers,
-    store::{Store, StoreObject},
+    store::Store,
 };
 
 use std::{
@@ -39,9 +39,7 @@ async fn build_index_from_path(store: &Store, path: &PathBuf) -> anyhow::Result<
 
     // Write index to store immediately
     let header = Header::new(ObjectType::Index, index_data.len() as u64);
-    let reader = futures::io::Cursor::new(index_data);
-    let store_obj = StoreObject::new_with_header(header, reader);
-    store.put_object(&index_hash, store_obj).await?;
+    store.put_object_bytes(&index_hash, header, index_data).await?;
 
     Ok((index, index_hash, total_size))
 }
@@ -108,9 +106,7 @@ fn build_tree_from_dir(
 
                 if !store_clone.exists(&hash).await.unwrap_or(false) {
                     let header = Header::new(ObjectType::Blob, size);
-                    let reader = futures::io::Cursor::new(data);
-                    let store_obj = StoreObject::new_with_header(header, reader);
-                    store_clone.put_object(&hash, store_obj).await?;
+                    store_clone.put_object_bytes(&hash, header, data).await?;
                 }
 
                 Ok::<_, anyhow::Error>((name, hash, size))
@@ -146,9 +142,7 @@ fn build_tree_from_dir(
 
         if !store.exists(&hash).await.unwrap_or(false) {
             let header = Header::new(ObjectType::Tree, tree_data.len() as u64);
-            let reader = futures::io::Cursor::new(tree_data);
-            let store_obj = StoreObject::new_with_header(header, reader);
-            store.put_object(&hash, store_obj).await?;
+            store.put_object_bytes(&hash, header, tree_data).await?;
         }
 
         Ok((hash, total_size))
@@ -1150,9 +1144,7 @@ mod tests {
                 let (header, body) = read_header_and_body(&raw_data)
                     .ok_or_else(|| anyhow::anyhow!("Failed to parse header from cache file"))?;
 
-                let reader = futures::io::Cursor::new(body.to_vec());
-                let store_obj = StoreObject::new_with_header(header, reader);
-                store.put_object(&hash, store_obj).await?;
+                store.put_object_bytes(&hash, header, body.to_vec()).await?;
             }
         }
         Ok(())

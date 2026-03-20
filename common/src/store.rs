@@ -81,6 +81,19 @@ impl Store {
         Ok(StoreObject::new_with_header(header, reader))
     }
 
+    /// Write an object from in-memory bytes (header + body concatenated).
+    /// Preferred over `put_object` when the body is already in memory.
+    pub async fn put_object_bytes(&self, hash: &Hash, header: Header, body: Vec<u8>) -> Result<()> {
+        let header_bytes = header.to_string();
+        let mut buf = Vec::with_capacity(header_bytes.len() + body.len());
+        buf.extend_from_slice(header_bytes.as_bytes());
+        buf.extend(body);
+        self.operator.write(hash.as_str(), buf).await?;
+        Ok(())
+    }
+
+    /// Write an object from a streaming reader.
+    /// Use `put_object_bytes` instead when the body is already in memory.
     pub async fn put_object<T>(&self, hash: &Hash, mut object: StoreObject<T>) -> Result<()>
     where
         T: AsyncBufRead + AsyncRead + Unpin,
@@ -120,19 +133,36 @@ mod tests {
         let store = make_store(tmp.path());
         let hash = make_hash(0x11);
         let header = Header::new(crate::ObjectType::Blob, 5);
-        let data = Cursor::new(b"hello".to_vec());
-        let obj = StoreObject::new_with_header(header, data);
-        store.put_object(&hash, obj).await.unwrap();
+        store.put_object_bytes(&hash, header, b"hello".to_vec()).await.unwrap();
         assert!(store.exists(&hash).await.unwrap());
     }
 
     #[tokio::test]
-    async fn put_then_get_returns_same_data() {
+    async fn put_bytes_then_get_returns_same_data() {
         let tmp = tempfile::tempdir().unwrap();
         let store = make_store(tmp.path());
         let hash = make_hash(0x22);
         let header = Header::new(crate::ObjectType::Blob, 5);
-        let data = Cursor::new(b"world".to_vec());
+        store.put_object_bytes(&hash, header, b"world".to_vec()).await.unwrap();
+
+        let mut retrieved = store.get_object(&hash).await.unwrap();
+        assert_eq!(retrieved.header.object_type, crate::ObjectType::Blob);
+        assert_eq!(retrieved.header.size, 5);
+
+        let mut body = Vec::new();
+        futures::AsyncReadExt::read_to_end(&mut retrieved, &mut body)
+            .await
+            .unwrap();
+        assert_eq!(body, b"world");
+    }
+
+    #[tokio::test]
+    async fn put_stream_then_get_returns_same_data() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = make_store(tmp.path());
+        let hash = make_hash(0x66);
+        let header = Header::new(crate::ObjectType::Blob, 5);
+        let data = Cursor::new(b"hello".to_vec());
         let obj = StoreObject::new_with_header(header, data);
         store.put_object(&hash, obj).await.unwrap();
 
@@ -144,7 +174,7 @@ mod tests {
         futures::AsyncReadExt::read_to_end(&mut retrieved, &mut body)
             .await
             .unwrap();
-        assert_eq!(body, b"world");
+        assert_eq!(body, b"hello");
     }
 
     #[tokio::test]
@@ -171,9 +201,7 @@ mod tests {
 
         for _ in 0..2 {
             let header = Header::new(crate::ObjectType::Tree, 4);
-            let data = Cursor::new(b"data".to_vec());
-            let obj = StoreObject::new_with_header(header, data);
-            store.put_object(&hash, obj).await.unwrap();
+            store.put_object_bytes(&hash, header, b"data".to_vec()).await.unwrap();
         }
 
         assert!(store.exists(&hash).await.unwrap());
