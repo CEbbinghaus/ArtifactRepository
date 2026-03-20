@@ -27,7 +27,7 @@ use serde::Deserialize;
 use tokio_util::compat::FuturesAsyncReadCompatExt;
 use tokio_util::io::ReaderStream;
 
-use futures::{AsyncReadExt, StreamExt, TryStreamExt};
+use futures::{StreamExt, TryStreamExt};
 
 const STREAM_CHUNK_SIZE: usize = 64 * 1024;
 const STREAM_CHANNEL_CAPACITY: usize = 32;
@@ -168,16 +168,10 @@ async fn get_object(
 ) -> Result<Response<Body>, ServerError> {
     tracing::debug!(hash = %object_hash, "GET /object - retrieving object");
 
-    match store.exists(&object_hash).await {
-        Ok(true) => Ok(()),
-        Ok(false) => Err(ServerError::NotFound("no object".into())),
-        Err(err) => Err(ServerError::Internal(err.to_string())),
-    }?;
-
     let object = store
         .get_object(&object_hash)
         .await
-        .map_err(|err| ServerError::Internal(err.to_string()))?;
+        .map_err(|_| ServerError::NotFound("no object".into()))?;
     let Header { object_type, size } = object.header;
 
     let reader_stream = ReaderStream::new(object.compat());
@@ -196,28 +190,19 @@ struct CompressionQuery {
 }
 
 async fn read_index_from_store(store: &Store, index_hash: &Hash) -> Result<Index, ServerError> {
-    match store.exists(index_hash).await {
-        Ok(true) => Ok(()),
-        Ok(false) => Err(ServerError::NotFound("index not found".into())),
-        Err(err) => Err(ServerError::Internal(err.to_string())),
-    }?;
-
-    let mut store_obj = store
-        .get_object(index_hash)
+    let raw = store
+        .get_raw_bytes(index_hash)
         .await
-        .map_err(|err| ServerError::Internal(err.to_string()))?;
+        .map_err(|_| ServerError::NotFound("index not found".into()))?;
 
-    if store_obj.header.object_type != ObjectType::Index {
+    let (header, body) = read_header_and_body(&raw)
+        .ok_or_else(|| ServerError::Internal("invalid index header".into()))?;
+
+    if header.object_type != ObjectType::Index {
         return Err(ServerError::BadRequest("object is not an index".into()));
     }
 
-    let mut body = Vec::new();
-    store_obj
-        .read_to_end(&mut body)
-        .await
-        .map_err(|err| ServerError::Internal(err.to_string()))?;
-
-    Index::from_data(&body).map_err(|err| ServerError::Internal(err.to_string()))
+    Index::from_data(body).map_err(|err| ServerError::Internal(err.to_string()))
 }
 
 /// Walk a tree collecting (Hash, Header) pairs and the ordered list of hashes.
@@ -230,30 +215,66 @@ async fn collect_entry_metadata(
     let mut meta: HashMap<Hash, Header> = HashMap::new();
     let mut order: Vec<Hash> = Vec::new();
     let mut stack = vec![tree_hash.clone()];
+    let mut blob_hashes: Vec<Hash> = Vec::new();
 
+    // Phase 1: Walk trees to discover all hashes
     while let Some(current_hash) = stack.pop() {
         if meta.contains_key(&current_hash) {
             continue;
         }
 
-        let mut object = store.get_object(&current_hash).await
+        let raw = store.get_raw_bytes(&current_hash).await
             .map_err(|e| ServerError::Internal(e.to_string()))?;
-        let header = object.header;
+        let (header, body) = read_header_and_body(&raw)
+            .ok_or_else(|| ServerError::Internal("invalid object header".into()))?;
 
         if header.object_type == ObjectType::Tree {
-            let mut data = Vec::new();
-            object.read_to_end(&mut data).await
-                .map_err(|e| ServerError::Internal(e.to_string()))?;
-            let tree = Tree::from_data(&data)
+            let tree = Tree::from_data(body)
                 .map_err(|e| ServerError::Internal(e.to_string()))?;
             for entry in &tree.contents {
-                stack.push(entry.hash.clone());
+                if !meta.contains_key(&entry.hash) {
+                    if entry.mode == Mode::Tree {
+                        stack.push(entry.hash.clone());
+                    } else {
+                        blob_hashes.push(entry.hash.clone());
+                    }
+                }
             }
-            meta.insert(current_hash.clone(), Header::new(ObjectType::Tree, data.len() as u64));
+            meta.insert(current_hash.clone(), Header::new(ObjectType::Tree, body.len() as u64));
             order.push(current_hash);
         } else {
             meta.insert(current_hash.clone(), header);
             order.push(current_hash);
+        }
+    }
+
+    // Phase 2: Read blob headers concurrently
+    let blob_results: Vec<Result<(Hash, Header), ServerError>> = futures::stream::iter(blob_hashes)
+        .map(|hash| {
+            let store = store.clone();
+            async move {
+                if let Some(header) = store.get_raw_bytes(&hash).await
+                    .ok()
+                    .and_then(|raw| read_header_and_body(&raw).map(|(h, _)| h))
+                {
+                    Ok((hash, header))
+                } else {
+                    // Fallback: use get_object for header only
+                    let obj = store.get_object(&hash).await
+                        .map_err(|e| ServerError::Internal(e.to_string()))?;
+                    Ok((hash, obj.header))
+                }
+            }
+        })
+        .buffer_unordered(256)
+        .collect()
+        .await;
+
+    for result in blob_results {
+        let (hash, header) = result?;
+        if let std::collections::hash_map::Entry::Vacant(e) = meta.entry(hash.clone()) {
+            order.push(hash);
+            e.insert(header);
         }
     }
 
@@ -310,15 +331,18 @@ fn write_streaming_archive(
             let prefix = header.to_string();
             w.write_all(prefix.as_bytes())?;
 
-            let body = tokio::task::block_in_place(|| {
+            // Use direct I/O when available for maximum throughput,
+            // otherwise fall back to async via block_on
+            let raw = if store.has_direct_io() {
+                store.get_bytes_direct_blocking(hash)?
+            } else {
                 tokio::runtime::Handle::current().block_on(async {
-                    let mut obj = store.get_object(hash).await?;
-                    let mut data = Vec::new();
-                    obj.read_to_end(&mut data).await?;
-                    Ok::<_, anyhow::Error>(data)
-                })
-            })?;
-            w.write_all(&body)?;
+                    store.get_raw_bytes(hash).await
+                })?
+            };
+            let (_, body) = read_header_and_body(&raw)
+                .ok_or_else(|| anyhow::anyhow!("invalid object header for {}", hash))?;
+            w.write_all(body)?;
         }
         w.flush()?;
         Ok(())
@@ -487,10 +511,10 @@ fn stream_zip_tree<'a, W: tokio::io::AsyncWrite + Unpin + Send + 'a>(
     zip_writer: &'a mut ZipFileWriter<W>,
 ) -> std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<()>> + Send + 'a>> {
     Box::pin(async move {
-        let mut store_obj = store.get_object(tree_hash).await?;
-        let mut body = Vec::new();
-        store_obj.read_to_end(&mut body).await?;
-        let tree = Tree::from_data(&body)?;
+        let raw = store.get_raw_bytes(tree_hash).await?;
+        let (_, body) = read_header_and_body(&raw)
+            .ok_or_else(|| anyhow::anyhow!("invalid tree header"))?;
+        let tree = Tree::from_data(body)?;
 
         for entry in &tree.contents {
             let entry_path = if prefix.is_empty() {
@@ -504,16 +528,16 @@ fn stream_zip_tree<'a, W: tokio::io::AsyncWrite + Unpin + Send + 'a>(
                     stream_zip_tree(store, &entry.hash, &entry_path, zip_writer).await?;
                 }
                 _ => {
-                    let mut blob_obj = store.get_object(&entry.hash).await?;
-                    let mut data = Vec::new();
-                    blob_obj.read_to_end(&mut data).await?;
+                    let raw = store.get_raw_bytes(&entry.hash).await?;
+                    let (_, data) = read_header_and_body(&raw)
+                        .ok_or_else(|| anyhow::anyhow!("invalid blob header"))?;
 
                     let zip_entry = ZipEntryBuilder::new(
                         entry_path.into(),
                         ZipCompression::Deflate,
                     );
                     let mut entry_writer = zip_writer.write_entry_stream(zip_entry).await?;
-                    futures::AsyncWriteExt::write_all(&mut entry_writer, &data).await?;
+                    futures::AsyncWriteExt::write_all(&mut entry_writer, data).await?;
                     entry_writer.close().await?;
                 }
             }
@@ -574,35 +598,61 @@ async fn upload_archive(
     let archive = Archive::<RawEntryData>::from_data(&mut std::io::Cursor::new(&body))
         .map_err(|err| ServerError::BadRequest(format!("invalid archive: {}", err)))?;
 
-    let mut added: usize = 0;
-    let mut skipped: usize = 0;
+    let entries: Vec<_> = archive.body.header.iter().zip(archive.body.entries.iter())
+        .map(|(header_entry, raw)| (header_entry.hash.clone(), raw.0.clone()))
+        .collect();
 
-    for (header_entry, raw) in archive.body.header.iter().zip(archive.body.entries.iter()) {
-        let hash = &header_entry.hash;
+    let total = entries.len();
 
-        match store.exists(hash).await {
-            Ok(true) => {
-                skipped += 1;
-                continue;
+    // Use direct blocking I/O when available for maximum throughput
+    if store.has_direct_io() {
+        let store_clone = store.clone();
+        let (added, skipped) = tokio::task::spawn_blocking(move || {
+            let mut added = 0usize;
+            let mut skipped = 0usize;
+            for (hash, raw_data) in &entries {
+                if store_clone.exists_direct_blocking(hash).unwrap_or(false) {
+                    skipped += 1;
+                    continue;
+                }
+                store_clone.put_bytes_direct_blocking(hash, raw_data)
+                    .map_err(|e| ServerError::Internal(e.to_string()))?;
+                added += 1;
             }
-            Ok(false) => {}
-            Err(err) => return Err(ServerError::Internal(err.to_string())),
+            Ok::<_, ServerError>((added, skipped))
+        }).await.map_err(|e| ServerError::Internal(e.to_string()))??;
+
+        tracing::info!(added, skipped, total, "POST /upload - complete (direct I/O)");
+        Ok(format!("Added {} objects, skipped {}", added, skipped))
+    } else {
+        // Async path with exists check for non-fs backends
+        let results: Vec<Result<bool, ServerError>> = futures::stream::iter(entries)
+            .map(|(hash, raw_data)| {
+                let store = store.clone();
+                async move {
+                    if store.exists(&hash).await.unwrap_or(false) {
+                        return Ok(false);
+                    }
+                    let (header, body_bytes) = read_header_and_body(&raw_data)
+                        .ok_or_else(|| ServerError::BadRequest("invalid entry data".into()))?;
+                    store.put_object_bytes(&hash, header, body_bytes.to_vec()).await
+                        .map_err(|err| ServerError::Internal(err.to_string()))?;
+                    Ok(true)
+                }
+            })
+            .buffer_unordered(64)
+            .collect()
+            .await;
+
+        let mut added = 0;
+        let mut skipped = 0;
+        for result in results {
+            if result? { added += 1; } else { skipped += 1; }
         }
 
-        let (header, body_bytes) = read_header_and_body(&raw.0)
-            .ok_or_else(|| ServerError::BadRequest("invalid entry data: could not parse header".into()))?;
-
-        store
-            .put_object_bytes(hash, header, body_bytes.to_vec())
-            .await
-            .map_err(|err| ServerError::Internal(err.to_string()))?;
-
-        added += 1;
+        tracing::info!(added, skipped, total, "POST /upload - complete");
+        Ok(format!("Added {} objects, skipped {}", added, skipped))
     }
-
-    tracing::info!(added = added, skipped = skipped, "POST /upload - complete");
-
-    Ok(format!("Added {} objects, skipped {}", added, skipped))
 }
 
 #[derive(serde::Deserialize)]
@@ -621,13 +671,33 @@ async fn check_missing(
 ) -> Result<axum::Json<MissingResponse>, ServerError> {
     tracing::debug!(requested = request.hashes.len(), "POST /missing - checking hashes");
 
-    let mut missing = Vec::new();
-    for hash in request.hashes {
-        match store.exists(&hash).await {
-            Ok(true) => {}
-            _ => missing.push(hash),
-        }
-    }
+    let missing = if store.has_direct_io() {
+        // Single blocking task for all exists checks — much faster than concurrent async
+        let store_clone = store.clone();
+        tokio::task::spawn_blocking(move || {
+            request.hashes.into_iter()
+                .filter(|hash| !store_clone.exists_direct_blocking(hash).unwrap_or(false))
+                .collect::<Vec<_>>()
+        })
+        .await
+        .map_err(|e| ServerError::Internal(e.to_string()))?
+    } else {
+        // Concurrent async for non-fs backends
+        futures::stream::iter(request.hashes)
+            .map(|hash| {
+                let store = store.clone();
+                async move {
+                    match store.exists(&hash).await {
+                        Ok(true) => None,
+                        _ => Some(hash),
+                    }
+                }
+            })
+            .buffer_unordered(256)
+            .filter_map(|x| async { x })
+            .collect()
+            .await
+    };
 
     tracing::debug!(missing = missing.len(), "POST /missing - result");
 
@@ -641,15 +711,16 @@ async fn get_metadata(
 ) -> Result<axum::Json<common::TreeMetadata>, ServerError> {
     tracing::debug!(hash = %index_hash, "GET /metadata - collecting metadata");
 
-    match store.exists(&index_hash).await {
-        Ok(true) => Ok(()),
-        Ok(false) => Err(ServerError::NotFound("index not found".into())),
-        Err(err) => Err(ServerError::Internal(err.to_string())),
-    }?;
-
     let meta = collect_tree_metadata(&store, &index_hash)
         .await
-        .map_err(|err| ServerError::Internal(err.to_string()))?;
+        .map_err(|err| {
+            let msg = err.to_string();
+            if msg.contains("not found") || msg.contains("NotFound") {
+                ServerError::NotFound("index not found".into())
+            } else {
+                ServerError::Internal(msg)
+            }
+        })?;
 
     Ok(axum::Json(meta))
 }

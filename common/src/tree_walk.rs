@@ -1,6 +1,5 @@
 use std::collections::{BTreeMap, HashMap};
 
-use futures::AsyncReadExt;
 use serde::Serialize;
 
 use crate::object_body::{self, Object as _};
@@ -42,8 +41,9 @@ pub async fn collect_index_metadata(
 ) -> anyhow::Result<IndexMetadata> {
     tracing::info!(index_hash = %index_hash, "collecting index metadata");
     // 1. Read and parse the Index object
-    let mut index_obj = store.get_object(index_hash).await?;
-    let index_header = index_obj.header;
+    let raw = store.get_raw_bytes(index_hash).await?;
+    let (index_header, index_body) = crate::read_header_and_body(&raw)
+        .ok_or_else(|| anyhow::anyhow!("invalid index header"))?;
 
     if index_header.object_type != ObjectType::Index {
         anyhow::bail!(
@@ -52,9 +52,7 @@ pub async fn collect_index_metadata(
         );
     }
 
-    let mut index_body = Vec::new();
-    index_obj.read_to_end(&mut index_body).await?;
-    let index = object_body::Index::from_data(&index_body)?;
+    let index = object_body::Index::from_data(index_body)?;
 
     let mut objects = vec![ObjectInfo {
         hash: index_hash.clone(),
@@ -85,8 +83,9 @@ async fn walk_tree(
     objects: &mut Vec<ObjectInfo>,
     files: &mut Vec<FileInfo>,
 ) -> anyhow::Result<()> {
-    let mut tree_obj = store.get_object(tree_hash).await?;
-    let tree_header = tree_obj.header;
+    let raw = store.get_raw_bytes(tree_hash).await?;
+    let (tree_header, body) = crate::read_header_and_body(&raw)
+        .ok_or_else(|| anyhow::anyhow!("invalid tree object header"))?;
 
     if tree_header.object_type != ObjectType::Tree {
         anyhow::bail!(
@@ -101,9 +100,10 @@ async fn walk_tree(
         size: tree_header.size,
     });
 
-    let mut tree_body = Vec::new();
-    tree_obj.read_to_end(&mut tree_body).await?;
-    let tree = object_body::Tree::from_data(&tree_body)?;
+    let tree = object_body::Tree::from_data(body)?;
+
+    // Collect blob entries for batch reading
+    let mut blob_entries: Vec<(Hash, String, Mode)> = Vec::new();
 
     for entry in &tree.contents {
         let current_path = if prefix.is_empty() {
@@ -117,30 +117,45 @@ async fn walk_tree(
                 Box::pin(walk_tree(store, &entry.hash, &current_path, objects, files)).await?;
             }
             _ => {
-                // Blob entry — record the object and the file
-                let blob_header = read_header(store, &entry.hash).await?;
-                objects.push(ObjectInfo {
-                    hash: entry.hash.clone(),
-                    object_type: ObjectType::Blob,
-                    size: blob_header.size,
-                });
-                files.push(FileInfo {
-                    path: current_path,
-                    hash: entry.hash.clone(),
-                    size: blob_header.size,
-                    mode: entry.mode,
-                });
+                blob_entries.push((entry.hash.clone(), current_path, entry.mode));
             }
         }
     }
 
-    Ok(())
-}
+    // Batch-read blob headers concurrently
+    if !blob_entries.is_empty() {
+        use futures::StreamExt;
+        let results: Vec<anyhow::Result<(Hash, String, Mode, Header)>> = futures::stream::iter(blob_entries)
+            .map(|(hash, path, mode)| {
+                let store = store.clone();
+                async move {
+                    let raw = store.get_raw_bytes(&hash).await?;
+                    let (header, _) = crate::read_header_and_body(&raw)
+                        .ok_or_else(|| anyhow::anyhow!("invalid blob header"))?;
+                    Ok((hash, path, mode, header))
+                }
+            })
+            .buffer_unordered(256)
+            .collect()
+            .await;
 
-/// Read just the header of an object (discarding the body).
-async fn read_header(store: &Store, hash: &Hash) -> anyhow::Result<Header> {
-    let obj = store.get_object(hash).await?;
-    Ok(obj.header)
+        for result in results {
+            let (hash, path, mode, blob_header) = result?;
+            objects.push(ObjectInfo {
+                hash: hash.clone(),
+                object_type: ObjectType::Blob,
+                size: blob_header.size,
+            });
+            files.push(FileInfo {
+                path,
+                hash,
+                size: blob_header.size,
+                mode,
+            });
+        }
+    }
+
+    Ok(())
 }
 
 /// Content-addressable metadata: index info + flat hash-keyed object map.
@@ -188,8 +203,9 @@ pub async fn collect_tree_metadata(
 ) -> anyhow::Result<TreeMetadata> {
     tracing::info!(index_hash = %index_hash, "collecting tree metadata");
 
-    let mut index_obj = store.get_object(index_hash).await?;
-    let index_header = index_obj.header;
+    let raw = store.get_raw_bytes(index_hash).await?;
+    let (index_header, index_body) = crate::read_header_and_body(&raw)
+        .ok_or_else(|| anyhow::anyhow!("invalid index header"))?;
 
     if index_header.object_type != ObjectType::Index {
         anyhow::bail!(
@@ -198,9 +214,7 @@ pub async fn collect_tree_metadata(
         );
     }
 
-    let mut index_body = Vec::new();
-    index_obj.read_to_end(&mut index_body).await?;
-    let index = object_body::Index::from_data(&index_body)?;
+    let index = object_body::Index::from_data(index_body)?;
 
     let mut objects = HashMap::new();
     collect_objects(store, &index.tree, &mut objects).await?;
@@ -226,20 +240,22 @@ async fn collect_objects(
         return Ok(());
     }
 
-    let mut tree_obj = store.get_object(tree_hash).await?;
+    let raw = store.get_raw_bytes(tree_hash).await?;
+    let (header, body) = crate::read_header_and_body(&raw)
+        .ok_or_else(|| anyhow::anyhow!("invalid tree object header"))?;
 
-    if tree_obj.header.object_type != ObjectType::Tree {
+    if header.object_type != ObjectType::Tree {
         anyhow::bail!(
             "expected Tree object, got {:?}",
-            tree_obj.header.object_type
+            header.object_type
         );
     }
 
-    let mut tree_body = Vec::new();
-    tree_obj.read_to_end(&mut tree_body).await?;
-    let tree = object_body::Tree::from_data(&tree_body)?;
+    let tree = object_body::Tree::from_data(body)?;
 
     let mut entries = BTreeMap::new();
+    let mut blob_hashes = Vec::new();
+
     for entry in &tree.contents {
         entries.insert(
             entry.path.clone(),
@@ -255,13 +271,32 @@ async fn collect_objects(
             }
             _ => {
                 if !objects.contains_key(&entry.hash) {
-                    let blob_header = read_header(store, &entry.hash).await?;
-                    objects.insert(
-                        entry.hash.clone(),
-                        MetadataObject::Blob { size: blob_header.size },
-                    );
+                    blob_hashes.push(entry.hash.clone());
                 }
             }
+        }
+    }
+
+    // Batch-read blob headers concurrently
+    if !blob_hashes.is_empty() {
+        use futures::StreamExt;
+        let results: Vec<anyhow::Result<(Hash, Header)>> = futures::stream::iter(blob_hashes)
+            .map(|hash| {
+                let store = store.clone();
+                async move {
+                    let raw = store.get_raw_bytes(&hash).await?;
+                    let (header, _) = crate::read_header_and_body(&raw)
+                        .ok_or_else(|| anyhow::anyhow!("invalid blob header"))?;
+                    Ok((hash, header))
+                }
+            })
+            .buffer_unordered(256)
+            .collect()
+            .await;
+
+        for result in results {
+            let (hash, header) = result?;
+            objects.insert(hash, MetadataObject::Blob { size: header.size });
         }
     }
 

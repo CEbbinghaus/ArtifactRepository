@@ -95,8 +95,7 @@ fn build_store(config: &StoreConfig) -> anyhow::Result<Store> {
             if !path.exists() {
                 std::fs::create_dir_all(path)?;
             }
-            let builder = opendal::services::Fs::default().root(root);
-            Store::from_builder(builder)
+            Store::from_fs_path(path)
         }
         StoreConfig::S3 {
             bucket,

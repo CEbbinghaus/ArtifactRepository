@@ -159,6 +159,11 @@ impl Store {
         }
     }
 
+    /// Whether this store supports direct filesystem I/O.
+    pub fn has_direct_io(&self) -> bool {
+        self.root_path.is_some()
+    }
+
     /// List all object hashes in the store.
     pub async fn list_hashes(&self) -> Result<Vec<Hash>> {
         use opendal::EntryMode;

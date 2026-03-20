@@ -11,8 +11,7 @@ use tempfile::TempDir;
 use tower::ServiceExt;
 
 fn make_store(dir: &TempDir) -> Store {
-    let builder = opendal::services::Fs::default().root(dir.path().to_str().unwrap());
-    Store::from_builder(builder).expect("failed to create store")
+    Store::from_fs_path(dir.path()).expect("failed to create store")
 }
 
 fn put_request(hash_str: &str, body: &[u8], object_type: &str, object_size: u64) -> Request<Body> {
