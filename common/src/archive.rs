@@ -455,7 +455,7 @@ where
             );
 
             tracing::trace!(hash = %entry.hash, length = amount, "reading archive entry");
-            entries.push(RawEntryData(data.to_vec()));
+            entries.push(RawEntryData(data));
 
             counter += amount;
         }

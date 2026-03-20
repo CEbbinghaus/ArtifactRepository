@@ -8,8 +8,6 @@ use std::{
 
 use sha2::{Digest, Sha512};
 
-use futures::AsyncReadExt;
-
 pub use crate::constants::{BLOB_KEY, INDEX_KEY, TREE_KEY};
 pub use crate::hash::Hash;
 pub use crate::header::Header;
@@ -78,28 +76,71 @@ pub async fn read_object_into_headers(
             continue;
         }
 
-        let mut object = store.get_object(&current_hash).await?;
+        let raw = store.get_raw_bytes(&current_hash).await?;
+        let (header, body) = read_header_and_body(&raw)
+            .ok_or_else(|| anyhow::anyhow!("failed to parse header for object {}", current_hash))?;
 
-        if object.header.object_type == ObjectType::Index {
-            return Err(anyhow::anyhow!("indexes cannot exist within a tree (possible hash collision)"));
-        }
-
-        let header = object.header;
-
-        let mut data = Vec::new();
-        object.read_to_end(&mut data).await?;
+        anyhow::ensure!(header.object_type != ObjectType::Index, "indexes cannot exist within a tree (possible hash collision)");
 
         if header.object_type == ObjectType::Tree {
-            let tree = crate::object_body::Tree::from_data(&data)?;
-
+            let tree = crate::object_body::Tree::from_data(body)?;
             for entry in &tree.contents {
                 stack.push(entry.hash.clone());
             }
         }
 
-        headers.insert(current_hash, (header, data));
+        headers.insert(current_hash, (header, body.to_vec()));
     }
 
+    tracing::debug!(objects_collected = headers.len(), "object tree walk complete");
+
+    Ok(())
+}
+
+/// Parallel version that reads all objects using direct blocking I/O.
+/// Walks tree structure to discover hashes, then reads all objects in a single blocking task.
+pub async fn read_object_into_headers_parallel(
+    store: &Store,
+    headers: &mut HashMap<Hash, (Header, Vec<u8>)>,
+    object_hash: &Hash,
+) -> anyhow::Result<()> {
+    tracing::debug!(root_hash = %object_hash, "reading object tree into headers (parallel)");
+
+    // Read everything in a single blocking task to avoid async overhead
+    let store_clone = store.clone();
+    let root_hash = object_hash.clone();
+    let result = tokio::task::spawn_blocking(move || {
+        let mut headers: HashMap<Hash, (Header, Vec<u8>)> = HashMap::new();
+        let mut stack = vec![root_hash];
+
+        while let Some(current_hash) = stack.pop() {
+            if headers.contains_key(&current_hash) {
+                continue;
+            }
+
+            let raw = store_clone.get_bytes_direct_blocking(&current_hash)?;
+            let (header, body) = read_header_and_body(&raw)
+                .ok_or_else(|| anyhow::anyhow!("failed to parse header for object {}", current_hash))?;
+
+            anyhow::ensure!(header.object_type != ObjectType::Index, "indexes cannot exist within a tree");
+
+            if header.object_type == ObjectType::Tree {
+                let tree = crate::object_body::Tree::from_data(body)?;
+                for entry in &tree.contents {
+                    if !headers.contains_key(&entry.hash) {
+                        stack.push(entry.hash.clone());
+                    }
+                }
+            }
+
+            headers.insert(current_hash, (header, body.to_vec()));
+        }
+
+        Ok::<_, anyhow::Error>(headers)
+    })
+    .await??;
+
+    *headers = result;
     tracing::debug!(objects_collected = headers.len(), "object tree walk complete");
 
     Ok(())

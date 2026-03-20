@@ -3,6 +3,7 @@ use anyhow::Result;
 use futures::io::copy;
 use futures::{AsyncBufRead, AsyncRead, AsyncWriteExt};
 use opendal::{Builder, FuturesAsyncReader, Operator};
+use std::path::PathBuf;
 
 pub struct StoreObject<T> {
     pub header: Header,
@@ -53,15 +54,29 @@ where
 #[derive(Clone)]
 pub struct Store {
     operator: Operator,
+    /// Root path for direct filesystem access (bypasses OpenDAL overhead for bulk writes)
+    root_path: Option<PathBuf>,
 }
 
 impl Store {
     pub fn new(operator: Operator) -> Self {
-        Self { operator }
+        Self { operator, root_path: None }
     }
 
     pub fn from_builder(builder: impl Builder) -> Result<Self> {
         Ok(Self::new(Operator::new(builder)?.finish()))
+    }
+
+    /// Create a store from a filesystem path with direct I/O support.
+    /// This enables `put_bytes_direct` for high-performance bulk writes.
+    pub fn from_fs_path(path: &std::path::Path) -> Result<Self> {
+        let builder = opendal::services::Fs::default()
+            .root(path.to_str().ok_or_else(|| anyhow::anyhow!("store path must be valid UTF-8"))?);
+        let operator = Operator::new(builder)?.finish();
+        Ok(Self {
+            operator,
+            root_path: Some(path.to_path_buf()),
+        })
     }
 
     pub async fn exists(&self, hash: &Hash) -> Result<bool> {
@@ -104,6 +119,44 @@ impl Store {
     pub async fn get_raw_bytes(&self, hash: &Hash) -> Result<Vec<u8>> {
         let bytes = self.operator.read(hash.as_str()).await?;
         Ok(bytes.to_vec())
+    }
+
+    /// Write raw bytes directly to the store (caller provides complete content).
+    pub async fn put_raw_bytes(&self, hash: &Hash, data: Vec<u8>) -> Result<()> {
+        self.operator.write(hash.as_str(), data).await?;
+        Ok(())
+    }
+
+    /// Write raw bytes using direct filesystem I/O, bypassing OpenDAL's atomic write/fsync.
+    /// Safe for content-addressable storage where partial writes are harmless.
+    pub fn put_bytes_direct_blocking(&self, hash: &Hash, data: &[u8]) -> Result<()> {
+        if let Some(root) = &self.root_path {
+            let path = root.join(hash.as_str());
+            std::fs::write(&path, data)?;
+            Ok(())
+        } else {
+            Err(anyhow::anyhow!("direct write not available: store was not created with from_fs_path"))
+        }
+    }
+
+    /// Read raw bytes using direct filesystem I/O, bypassing OpenDAL overhead.
+    pub fn get_bytes_direct_blocking(&self, hash: &Hash) -> Result<Vec<u8>> {
+        if let Some(root) = &self.root_path {
+            let path = root.join(hash.as_str());
+            let data = std::fs::read(&path)?;
+            Ok(data)
+        } else {
+            Err(anyhow::anyhow!("direct read not available: store was not created with from_fs_path"))
+        }
+    }
+
+    /// Check if an object exists using direct filesystem I/O.
+    pub fn exists_direct_blocking(&self, hash: &Hash) -> Result<bool> {
+        if let Some(root) = &self.root_path {
+            Ok(root.join(hash.as_str()).exists())
+        } else {
+            Err(anyhow::anyhow!("direct exists not available: store was not created with from_fs_path"))
+        }
     }
 
     /// List all object hashes in the store.
