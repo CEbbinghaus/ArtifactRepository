@@ -2,7 +2,7 @@ use std::fmt::Display;
 use crate::{BLOB_KEY, INDEX_KEY, TREE_KEY};
 
 
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy)]
 pub enum Mode {
     Tree = 40000,
     Normal = 100644,

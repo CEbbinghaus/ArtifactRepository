@@ -24,6 +24,9 @@ mod primitives;
 pub mod object_body;
 pub mod archive;
 pub mod store;
+pub mod tree_walk;
+
+pub use tree_walk::{collect_index_metadata, FileInfo, IndexMetadata, ObjectInfo};
 
 pub fn read_slice_until_byte(data: &[u8], byte: u8) -> Option<&[u8]> {
     let position = data.iter().position(|v| *v == byte)?;

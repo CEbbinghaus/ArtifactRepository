@@ -18,6 +18,7 @@ use crate::{
 };
 
 pub const HEADER: [u8; 4] = [b'a', b'r', b'x', b'a'];
+pub const SUPPLEMENTAL_HEADER: [u8; 4] = [b'a', b'r', b'x', b's'];
 
 #[repr(u16)]
 #[derive(Clone, Copy)]
@@ -74,8 +75,12 @@ impl<T> Archive<T>
 where
     T: ArchiveEntryData,
 {
+    pub fn is_supplemental(&self) -> bool {
+        self.header == SUPPLEMENTAL_HEADER
+    }
+
     pub fn to_data(self, writer: &mut impl Write) -> anyhow::Result<()> {
-        writer.write_all(&HEADER)?;
+        writer.write_all(&self.header)?;
         writer.write_all(&(self.compression as u16).to_be_bytes())?;
         writer.write_all(&self.hash.hash)?;
         writer.write_all(&self.index.to_data())?;
@@ -122,7 +127,11 @@ where
 
         let mut header: [u8; 4] = [0; 4];
         reader.read_exact(&mut header)?;
-        assert!(header == HEADER);
+        anyhow::ensure!(
+            header == HEADER || header == SUPPLEMENTAL_HEADER,
+            "invalid archive magic: expected 'arxa' or 'arxs', got {:?}",
+            header
+        );
 
         let mut compression: [u8; 2] = [0; 2];
         reader.read_exact(&mut compression)?;
@@ -162,7 +171,7 @@ where
         };
 
         Ok(Archive {
-            header: HEADER,
+            header,
             compression,
             hash,
             index,
@@ -538,10 +547,7 @@ mod tests {
         // Corrupt magic bytes
         buf[0] = b'X';
         let mut cursor = Cursor::new(buf);
-        // from_data uses assert!, which panics
-        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            Archive::<RawEntryData>::from_data(&mut cursor)
-        }));
+        let result = Archive::<RawEntryData>::from_data(&mut cursor);
         assert!(result.is_err());
     }
 
@@ -871,5 +877,49 @@ mod tests {
             "must contain timestamp line"
         );
         assert!(text.ends_with("\n\n"), "must end with double newline");
+    }
+
+    // --- Supplemental archive tests ---
+
+    fn make_supplemental_archive(entries_data: Vec<Vec<u8>>) -> Archive<RawEntryData> {
+        let mut archive = make_archive_with_entries(Compression::None, entries_data);
+        archive.header = SUPPLEMENTAL_HEADER;
+        archive
+    }
+
+    #[test]
+    fn supplemental_archive_round_trip() {
+        let data = b"supplemental data".to_vec();
+        let archive = make_supplemental_archive(vec![data.clone()]);
+        let recovered = round_trip(archive);
+
+        assert!(recovered.is_supplemental());
+        assert_eq!(recovered.header, SUPPLEMENTAL_HEADER);
+        assert_eq!(recovered.body.entries.len(), 1);
+        assert_eq!(recovered.body.entries[0].0, data);
+    }
+
+    #[test]
+    fn regular_archive_is_not_supplemental() {
+        let archive = make_archive_with_entries(Compression::None, vec![b"data".to_vec()]);
+        let recovered = round_trip(archive);
+
+        assert!(!recovered.is_supplemental());
+        assert_eq!(recovered.header, HEADER);
+    }
+
+    #[test]
+    fn invalid_magic_rejected() {
+        let mut buf = Vec::new();
+        let archive = make_archive_with_entries(Compression::None, vec![b"data".to_vec()]);
+        archive.to_data(&mut buf).unwrap();
+        // Overwrite magic with zeroes
+        buf[0] = 0;
+        buf[1] = 0;
+        buf[2] = 0;
+        buf[3] = 0;
+        let mut cursor = Cursor::new(buf);
+        let result = Archive::<RawEntryData>::from_data(&mut cursor);
+        assert!(result.is_err());
     }
 }

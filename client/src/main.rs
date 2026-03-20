@@ -3,7 +3,7 @@ use chrono::Utc;
 use clap::{Parser, Subcommand};
 use common::{
     BLOB_KEY, Hash, Header, INDEX_KEY, Mode, ObjectType, TREE_KEY,
-    archive::{Archive, ArchiveBody, ArchiveEntryData, ArchiveHeaderEntry, Compression, HEADER, RawEntryData},
+    archive::{Archive, ArchiveBody, ArchiveEntryData, ArchiveHeaderEntry, Compression, HEADER, RawEntryData, SUPPLEMENTAL_HEADER},
     compute_hash, object_body, read_header_and_body, read_header_from_slice, read_object_into_headers,
     store::Store,
 };
@@ -569,6 +569,115 @@ async fn pack_archive(store: &Store, path: &PathBuf, index_hash: &Hash, compress
     Ok(())
 }
 
+async fn push_archive(store: &Store, url: &str, index_hash: &Hash, compression: Compression) -> anyhow::Result<()> {
+    // 1. Read index from store
+    let index: object_body::Index = {
+        let mut store_obj = store.get_object(index_hash).await.context("index object not found in store")?;
+        anyhow::ensure!(store_obj.header.object_type == ObjectType::Index, "expected index object type");
+        let mut body = Vec::new();
+        store_obj.read_to_end(&mut body).await?;
+        object_body::Object::from_data(&body)?
+    };
+
+    // 2. Collect all objects reachable from the tree
+    #[allow(clippy::mutable_key_type)]
+    let mut headers: HashMap<Hash, (Header, Vec<u8>)> = HashMap::new();
+    read_object_into_headers(store, &mut headers, &index.tree).await?;
+
+    // 3. Collect all hashes (including the index hash)
+    let all_hashes: Vec<Hash> = std::iter::once(index_hash.clone())
+        .chain(headers.keys().cloned())
+        .collect();
+
+    // 4. POST to /missing to find which objects the server needs
+    #[derive(serde::Serialize)]
+    struct MissingRequest {
+        hashes: Vec<Hash>,
+    }
+    #[derive(serde::Deserialize)]
+    struct MissingResponse {
+        missing: Vec<Hash>,
+    }
+
+    let missing_url = format!("{url}/missing");
+    let missing_resp: MissingResponse = ureq::post(&missing_url)
+        .send_json(&MissingRequest { hashes: all_hashes })
+        .context("failed to query missing objects")?
+        .body_mut()
+        .read_json()
+        .context("failed to parse missing response")?;
+
+    // 5. If no missing objects, nothing to do
+    if missing_resp.missing.is_empty() {
+        println!("All objects already present on server");
+        return Ok(());
+    }
+
+    // 6. Build supplemental archive with all trees + missing objects
+    #[allow(clippy::mutable_key_type)]
+    let missing_set: std::collections::HashSet<Hash> = missing_resp.missing.into_iter().collect();
+
+    let mut offset = 0u64;
+    let mut header_entries: Vec<ArchiveHeaderEntry> = Vec::new();
+    let mut entry_data_vec: Vec<RawEntryData> = Vec::new();
+
+    for (hash, (header, data)) in &headers {
+        // Always include tree objects; for others, only include if missing
+        if header.object_type != ObjectType::Tree && !missing_set.contains(hash) {
+            continue;
+        }
+
+        let prefix = header.to_string();
+        let length = prefix.len() as u64 + data.len() as u64;
+
+        header_entries.push(ArchiveHeaderEntry {
+            hash: hash.clone(),
+            index: offset,
+            length,
+        });
+
+        let mut full_data = Vec::with_capacity(prefix.len() + data.len());
+        full_data.extend_from_slice(prefix.as_bytes());
+        full_data.extend_from_slice(data);
+        entry_data_vec.push(RawEntryData(full_data));
+
+        offset += length;
+    }
+
+    let num_objects = entry_data_vec.len();
+
+    let archive = Archive {
+        header: SUPPLEMENTAL_HEADER,
+        compression,
+        hash: index_hash.clone(),
+        index,
+        body: ArchiveBody {
+            header: header_entries,
+            entries: entry_data_vec,
+        },
+    };
+
+    // 7. Serialize to bytes
+    let mut buf: Vec<u8> = Vec::new();
+    archive.to_data(&mut buf)?;
+    let total_bytes = buf.len();
+
+    // 8. POST the archive to /upload
+    let upload_url = format!("{url}/upload");
+    let response_text = ureq::post(&upload_url)
+        .header("Content-Type", "application/octet-stream")
+        .send(&buf[..])
+        .context("failed to upload archive")?
+        .body_mut()
+        .read_to_string()
+        .context("failed to read upload response")?;
+
+    println!("{}", response_text);
+    println!("Pushed {} objects ({} bytes) to {}", num_objects, total_bytes, url);
+
+    Ok(())
+}
+
 async fn unpack_archive(cache: &PathBuf, path: &PathBuf) -> anyhow::Result<()> {
     let path_meta = tokio::fs::metadata(path).await?;
     anyhow::ensure!(path_meta.is_file(), "path must be a file");
@@ -1033,6 +1142,19 @@ enum Commands {
         file: PathBuf,
         /// Compression algorithm (none, gzip, deflate, lzma2, zstd)
         #[arg(short, long)]
+        compression: Compression,
+    },
+
+    /// Push objects to a remote server, uploading only what's missing (deduplication)
+    PushArchive {
+        /// Base URL of the remote artifact server
+        #[arg(long)]
+        url: String,
+        /// Hash of the index to push
+        #[arg(long)]
+        index: Hash,
+        /// Compression algorithm for the supplemental archive (default: zstd)
+        #[arg(long, default_value = "zstd")]
         compression: Compression,
     },
 }
@@ -1547,6 +1669,9 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
         }
         Commands::Archive { directory, file, compression } => {
             archive_directory(&directory, &file, compression).await?
+        }
+        Commands::PushArchive { url, index, compression } => {
+            push_archive(&store, &url, &index, compression).await?
         }
     }
     Ok(())

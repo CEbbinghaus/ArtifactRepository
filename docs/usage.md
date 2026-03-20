@@ -100,6 +100,27 @@ client -s ./store push --url http://server:1287 --index <HASH>
 | `--url <URL>` | Server base URL |
 | `--index <HASH>` | (Optional) Specific object to push. If omitted, pushes all objects. |
 
+#### push-archive
+
+Push objects to a remote server with deduplication. Only uploads objects the server doesn't already have, packaged as a supplemental archive (`.sar`).
+
+```bash
+client -s ./store push-archive --url http://server:1287 --index <HASH> --compression zstd
+```
+
+| Option | Description |
+|--------|-------------|
+| `--url <URL>` | Server base URL |
+| `--index <HASH>` | Index hash to push |
+| `--compression <ALG>` | (Optional) `none`, `gzip`, `deflate`, `lzma2`, or `zstd` |
+
+**Dedup upload workflow:**
+
+1. Commit a directory to the local store → get an index hash
+2. Run `push-archive --url http://server:1287 --index <HASH>`
+3. Client collects all object hashes for the index, asks the server which are missing
+4. Client builds a `.sar` containing only the missing objects, uploads it
+
 #### pull
 
 Download an Index and all referenced objects from a remote server.
@@ -165,3 +186,59 @@ Retrieve an object.
 - `404 Not Found` — object does not exist
 
 Transport compression (gzip, zstd, brotli, deflate) is negotiated via standard `Accept-Encoding` headers.
+
+#### GET /metadata/{index_hash}
+
+Returns JSON metadata about an index.
+
+**Response (`200 OK`):**
+```json
+{
+  "files": [
+    {"path": "src/main.rs", "hash": "...", "size": 1234, "mode": 33188}
+  ],
+  "objects": [
+    {"hash": "...", "type": "blob", "size": 1234}
+  ]
+}
+```
+
+- `404 Not Found` — index does not exist
+
+#### POST /missing
+
+Determine which objects the server does not have.
+
+**Request:**
+```json
+{"hashes": ["aabb...", "ccdd..."]}
+```
+
+**Response (`200 OK`):**
+```json
+{"missing": ["ccdd..."]}
+```
+
+#### POST /upload
+
+Accept an `.arx` or `.sar` archive body. Unpacks all objects into the server's store, skipping duplicates.
+
+**Request:**
+- Body: raw archive bytes
+
+**Responses:**
+- `200 OK` — objects unpacked successfully
+- `400 Bad Request` — invalid archive
+
+#### POST /supplemental/{index_hash}
+
+Build and return a `.sar` file containing only the requested objects (plus all tree objects and the index).
+
+**Request:**
+```json
+{"hashes": ["aabb...", "ccdd..."]}
+```
+
+**Response:**
+- `200 OK` — body is the `.sar` archive (streamed)
+- `404 Not Found` — index does not exist

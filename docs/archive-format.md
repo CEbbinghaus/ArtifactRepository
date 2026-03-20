@@ -1,6 +1,6 @@
 # Archive Format
 
-Byte-level specification for `.arx` archive files.
+Byte-level specification for `.arx` archive files and `.sar` supplemental archives.
 
 ## Overview
 
@@ -31,7 +31,8 @@ All multi-byte integers are **big-endian**.
 ### Magic (4 bytes)
 
 ```
-Offset 0:  61 72 78 61  ("arxa")
+Offset 0:  61 72 78 61  ("arxa")   — full archive
+           61 72 78 73  ("arxs")   — supplemental archive
 ```
 
 ### Compression Method (2 bytes, u16 BE)
@@ -107,9 +108,31 @@ Entries that fail verification cause the unpack to fail.
 
 ---
 
+## Supplemental Archives (.sar)
+
+A supplemental archive (`.sar`) uses the same binary layout as a full archive but may contain only a **subset** of the objects referenced by the index.
+
+| Property | Full Archive (.arx) | Supplemental Archive (.sar) |
+|----------|--------------------|-----------------------------|
+| Magic | `arxa` (`61 72 78 61`) | `arxs` (`61 72 78 73`) |
+| Extension | `.arx` | `.sar` |
+| Objects | All objects for the index | Subset of objects |
+
+### Invariants
+
+- Always includes all **tree** objects and the **index** itself, so the full directory structure is navigable.
+- May omit blob objects that the receiving store already has.
+- After applying a `.sar` to a store that already contains the remaining objects, the index is fully restorable.
+
+### Use Case
+
+Supplemental archives enable **deduplication** during upload and download. Instead of transferring every object, the sender queries the receiver for which objects are missing and packages only those into a `.sar`. This reduces transfer size when the receiver already has most of the data.
+
+---
+
 ## Serialization Steps
 
-1. Write magic: `61 72 78 61`
+1. Write magic: `61 72 78 61` (or `61 72 78 73` for supplemental)
 2. Write compression as u16 BE
 3. Write hash: 64 raw bytes
 4. Write serialized Index body (UTF-8 text)
@@ -122,7 +145,7 @@ Entries that fail verification cause the unpack to fail.
 
 ## Deserialization Steps
 
-1. Read 4 bytes → verify magic `arxa`
+1. Read 4 bytes → verify magic (`arxa` or `arxs`)
 2. Read 2 bytes → u16 BE → compression variant
 3. Read 64 bytes → hash
 4. Read until `0x00` → parse as Index
