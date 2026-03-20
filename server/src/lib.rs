@@ -1,6 +1,8 @@
 use std::collections::HashMap;
 use std::io::Write;
 
+use async_zip::tokio::write::ZipFileWriter;
+use async_zip::{Compression as ZipCompression, ZipEntryBuilder};
 use axum::{
     body::{Body, Bytes},
     debug_handler,
@@ -422,20 +424,19 @@ async fn get_supplemental(
     Ok(response)
 }
 
-#[allow(clippy::type_complexity)]
-fn collect_files<'a>(
+/// Recursively walk a tree and write each blob entry directly to the zip writer,
+/// streaming from the store without collecting all file data first.
+fn stream_zip_tree<'a, W: tokio::io::AsyncWrite + Unpin + Send + 'a>(
     store: &'a Store,
     tree_hash: &'a Hash,
     prefix: &'a str,
-) -> std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<Vec<(String, Vec<u8>)>>> + Send + 'a>>
-{
+    zip_writer: &'a mut ZipFileWriter<W>,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<()>> + Send + 'a>> {
     Box::pin(async move {
         let mut store_obj = store.get_object(tree_hash).await?;
         let mut body = Vec::new();
         store_obj.read_to_end(&mut body).await?;
         let tree = Tree::from_data(&body)?;
-
-        let mut files: Vec<(String, Vec<u8>)> = Vec::new();
 
         for entry in &tree.contents {
             let entry_path = if prefix.is_empty() {
@@ -446,19 +447,25 @@ fn collect_files<'a>(
 
             match entry.mode {
                 Mode::Tree => {
-                    let sub_files = collect_files(store, &entry.hash, &entry_path).await?;
-                    files.extend(sub_files);
+                    stream_zip_tree(store, &entry.hash, &entry_path, zip_writer).await?;
                 }
                 _ => {
                     let mut blob_obj = store.get_object(&entry.hash).await?;
                     let mut data = Vec::new();
                     blob_obj.read_to_end(&mut data).await?;
-                    files.push((entry_path, data));
+
+                    let zip_entry = ZipEntryBuilder::new(
+                        entry_path.into(),
+                        ZipCompression::Deflate,
+                    );
+                    let mut entry_writer = zip_writer.write_entry_stream(zip_entry).await?;
+                    futures::AsyncWriteExt::write_all(&mut entry_writer, &data).await?;
+                    entry_writer.close().await?;
                 }
             }
         }
 
-        Ok(files)
+        Ok(())
     })
 }
 
@@ -467,52 +474,27 @@ async fn get_zip(
     AxumPath(index_hash): AxumPath<Hash>,
     State(ServerState { store }): State<ServerState>,
 ) -> Result<Response<Body>, ServerError> {
-    tracing::info!(hash = %index_hash, "GET /zip - building zip");
+    tracing::info!(hash = %index_hash, "GET /zip - streaming zip");
 
     let index = read_index_from_store(&store, &index_hash).await?;
-
-    let files = collect_files(&store, &index.tree, "")
-        .await
-        .map_err(|err| ServerError::Internal(err.to_string()))?;
-
-    // Zip requires Write+Seek, so we build in memory then stream the result
-    let (tx, rx) = tokio::sync::mpsc::channel::<Result<Vec<u8>, std::io::Error>>(STREAM_CHANNEL_CAPACITY);
+    let tree_hash = index.tree.clone();
     let short_hash = index_hash.as_str()[..12].to_string();
 
-    tokio::task::spawn_blocking(move || {
-        let mut buf = Vec::new();
-        {
-            let cursor = std::io::Cursor::new(&mut buf);
-            let mut zip_writer = zip::ZipWriter::new(cursor);
-            let options = zip::write::SimpleFileOptions::default()
-                .compression_method(zip::CompressionMethod::Deflated);
+    // DuplexStream: write zip to one end, stream from the other
+    let (read_half, write_half) = tokio::io::duplex(STREAM_CHUNK_SIZE);
 
-            for (path, data) in &files {
-                if let Err(e) = zip_writer.start_file(path, options) {
-                    tracing::error!(error = %e, "zip start_file failed");
-                    return;
-                }
-                if let Err(e) = zip_writer.write_all(data) {
-                    tracing::error!(error = %e, "zip write failed");
-                    return;
-                }
-            }
-
-            if let Err(e) = zip_writer.finish() {
-                tracing::error!(error = %e, "zip finish failed");
-                return;
-            }
+    tokio::spawn(async move {
+        let mut zip_writer = ZipFileWriter::with_tokio(write_half);
+        if let Err(e) = stream_zip_tree(&store, &tree_hash, "", &mut zip_writer).await {
+            tracing::error!(error = %e, "zip streaming failed");
+            return;
         }
-
-        // Stream the completed zip in chunks
-        for chunk in buf.chunks(STREAM_CHUNK_SIZE) {
-            if tx.blocking_send(Ok(chunk.to_vec())).is_err() {
-                return;
-            }
+        if let Err(e) = zip_writer.close().await {
+            tracing::error!(error = %e, "zip close failed");
         }
     });
 
-    let stream = tokio_stream::wrappers::ReceiverStream::new(rx);
+    let stream = ReaderStream::new(read_half);
     let body = Body::from_stream(stream);
 
     let mut response = Response::new(body);
