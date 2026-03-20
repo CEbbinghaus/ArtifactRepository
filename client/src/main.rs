@@ -136,6 +136,9 @@ fn build_tree_from_dir(
             });
         }
 
+        // Sort entries by name for deterministic tree hashes
+        entries.sort_by(|a, b| a.path.cmp(&b.path));
+
         // Build and store tree
         let tree = object_body::Tree { contents: entries };
         let tree_data = object_body::Object::to_data(&tree);
@@ -1558,6 +1561,65 @@ mod tests {
             1,
             "Identical files should produce only one blob entry in the archive"
         );
+    }
+
+    #[tokio::test]
+    async fn tree_hash_is_deterministic() {
+        let source = TempDir::new().unwrap();
+
+        // Create a non-trivial directory structure
+        tokio::fs::write(source.path().join("zebra.txt"), b"z content").await.unwrap();
+        tokio::fs::write(source.path().join("alpha.txt"), b"a content").await.unwrap();
+        tokio::fs::write(source.path().join("middle.txt"), b"m content").await.unwrap();
+        let sub = source.path().join("subdir");
+        tokio::fs::create_dir(&sub).await.unwrap();
+        tokio::fs::write(sub.join("beta.txt"), b"b content").await.unwrap();
+        tokio::fs::write(sub.join("gamma.txt"), b"g content").await.unwrap();
+        let deep = sub.join("deep");
+        tokio::fs::create_dir(&deep).await.unwrap();
+        tokio::fs::write(deep.join("file.txt"), b"deep content").await.unwrap();
+
+        let source_path = source.path().to_path_buf();
+
+        // Commit the same directory multiple times to separate stores
+        let mut tree_hashes = Vec::new();
+        for _ in 0..5 {
+            let store_dir = TempDir::new().unwrap();
+            let store = create_store(store_dir.path());
+            let (index, _, _) = build_index_from_path(&store, &source_path).await.unwrap();
+            tree_hashes.push(index.tree.as_str().to_string());
+        }
+
+        // All tree hashes must be identical
+        for (i, h) in tree_hashes.iter().enumerate() {
+            assert_eq!(
+                &tree_hashes[0], h,
+                "Tree hash differs on iteration {i}: expected {}, got {h}",
+                tree_hashes[0]
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn tree_entries_are_sorted_by_name() {
+        let source = TempDir::new().unwrap();
+        let store_dir = TempDir::new().unwrap();
+
+        // Create files with names that would sort differently by creation order vs alphabetical
+        tokio::fs::write(source.path().join("c.txt"), b"c").await.unwrap();
+        tokio::fs::write(source.path().join("a.txt"), b"a").await.unwrap();
+        tokio::fs::write(source.path().join("b.txt"), b"b").await.unwrap();
+
+        let store = create_store(store_dir.path());
+        let source_path = source.path().to_path_buf();
+        let (index, _, _) = build_index_from_path(&store, &source_path).await.unwrap();
+
+        // Read back the tree and verify entries are sorted
+        let tree = read_tree_from_store(&store, &index.tree).await.unwrap();
+        let names: Vec<&str> = tree.contents.iter().map(|e| e.path.as_str()).collect();
+        let mut sorted = names.clone();
+        sorted.sort();
+        assert_eq!(names, sorted, "Tree entries should be sorted alphabetically");
     }
 }
 
