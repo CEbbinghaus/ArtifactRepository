@@ -39,6 +39,7 @@ pub async fn collect_index_metadata(
     store: &Store,
     index_hash: &Hash,
 ) -> anyhow::Result<IndexMetadata> {
+    tracing::info!(index_hash = %index_hash, "collecting index metadata");
     // 1. Read and parse the Index object
     let mut index_obj = store.get_object(index_hash).await?;
     let index_header = index_obj.header;
@@ -63,6 +64,8 @@ pub async fn collect_index_metadata(
 
     // 2. Recursively walk the tree
     walk_tree(store, &index.tree, "", &mut objects, &mut files).await?;
+
+    tracing::info!(files = files.len(), objects = objects.len(), "index metadata collected");
 
     Ok(IndexMetadata {
         index_hash: index_hash.clone(),
@@ -102,14 +105,15 @@ async fn walk_tree(
     let tree = object_body::Tree::from_data(&tree_body)?;
 
     for entry in &tree.contents {
+        let current_path = if prefix.is_empty() {
+            entry.path.clone()
+        } else {
+            format!("{}/{}", prefix, entry.path)
+        };
+        tracing::trace!(hash = %entry.hash, path = %current_path, "walking tree entry");
         match entry.mode {
             Mode::Tree => {
-                let child_prefix = if prefix.is_empty() {
-                    entry.path.clone()
-                } else {
-                    format!("{}/{}", prefix, entry.path)
-                };
-                Box::pin(walk_tree(store, &entry.hash, &child_prefix, objects, files)).await?;
+                Box::pin(walk_tree(store, &entry.hash, &current_path, objects, files)).await?;
             }
             _ => {
                 // Blob entry — record the object and the file
@@ -119,13 +123,8 @@ async fn walk_tree(
                     object_type: ObjectType::Blob,
                     size: blob_header.size,
                 });
-                let full_path = if prefix.is_empty() {
-                    entry.path.clone()
-                } else {
-                    format!("{}/{}", prefix, entry.path)
-                };
                 files.push(FileInfo {
-                    path: full_path,
+                    path: current_path,
                     hash: entry.hash.clone(),
                     size: blob_header.size,
                     mode: entry.mode,

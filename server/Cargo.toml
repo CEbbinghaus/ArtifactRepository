@@ -11,12 +11,15 @@ common = { path = "../common" }
 futures = "0.3.31"
 futures-core = "0.3.31"
 http-body = "1.0.1"
-opendal = { version = "0.54.1", features = ["services-fs", "services-s3"] }
+opendal = { version = "0.54.1", features = ["services-fs", "services-s3", "services-memory"] }
+toml = "0.8"
 sha2 = "0.10.9"
 tokio = { version = "1.45.1", features = ["full"] }
 tokio-stream = "0.1.17"
 tokio-util = { version = "0.7.15", features = ["codec", "compat", "io"] }
-tower-http = { version = "0.6.6", features = ["compression-br", "compression-deflate", "compression-gzip", "compression-zstd"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tower-http = { version = "0.6.6", features = ["compression-br", "compression-deflate", "compression-gzip", "compression-zstd", "trace"] }
 zip = { version = "2", default-features = false, features = ["deflate"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

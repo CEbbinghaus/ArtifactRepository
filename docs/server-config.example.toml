@@ -1,0 +1,29 @@
+# Server configuration
+[server]
+bind = "0.0.0.0"
+port = 1287
+
+# Logging configuration
+[logging]
+level = "info"  # trace, debug, info, warn, error
+
+# Store backend configuration
+# Choose one of: fs, s3, memory
+
+[store]
+backend = "fs"
+root = "/var/lib/artifact-repository"
+
+# S3 backend example (uncomment to use):
+# [store]
+# backend = "s3"
+# bucket = "my-artifacts"
+# region = "us-east-1"
+# endpoint = "https://s3.amazonaws.com"
+# access_key_id = "AKIA..."
+# secret_access_key = "..."
+# root = "artifacts/"
+
+# Memory backend example (for testing only):
+# [store]
+# backend = "memory"

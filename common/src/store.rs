@@ -65,10 +65,13 @@ impl Store {
     }
 
     pub async fn exists(&self, hash: &Hash) -> Result<bool> {
-        Ok(self.operator.exists(hash.as_str()).await?)
+        let result = self.operator.exists(hash.as_str()).await?;
+        tracing::trace!(hash = %hash, exists = result, "store exists check");
+        Ok(result)
     }
 
     pub async fn get_object(&self, hash: &Hash) -> Result<StoreObject<FuturesAsyncReader>> {
+        tracing::debug!(hash = %hash, "reading object from store");
         let mut reader = self
             .operator
             .reader(hash.as_str())
@@ -78,16 +81,19 @@ impl Store {
 
         let header = Header::read_from_async(&mut reader).await?;
 
+        tracing::trace!(hash = %hash, object_type = %header.object_type.to_str(), size = header.size, "object header read");
         Ok(StoreObject::new_with_header(header, reader))
     }
 
     /// Write an object from in-memory bytes (header + body concatenated).
     /// Preferred over `put_object` when the body is already in memory.
     pub async fn put_object_bytes(&self, hash: &Hash, header: Header, body: Vec<u8>) -> Result<()> {
+        tracing::debug!(hash = %hash, object_type = %header.object_type.to_str(), size = body.len(), "storing object");
         let header_bytes = header.to_string();
         let mut buf = Vec::with_capacity(header_bytes.len() + body.len());
         buf.extend_from_slice(header_bytes.as_bytes());
         buf.extend(body);
+        tracing::trace!(hash = %hash, total_bytes = buf.len(), "object written");
         self.operator.write(hash.as_str(), buf).await?;
         Ok(())
     }
@@ -98,6 +104,7 @@ impl Store {
     where
         T: AsyncBufRead + AsyncRead + Unpin,
     {
+        tracing::debug!(hash = %hash, object_type = %object.header.object_type.to_str(), "storing object (streaming)");
         let mut writer = self
             .operator
             .writer(hash.as_str())

@@ -21,7 +21,7 @@ pub const HEADER: [u8; 4] = [b'a', b'r', b'x', b'a'];
 pub const SUPPLEMENTAL_HEADER: [u8; 4] = [b'a', b'r', b'x', b's'];
 
 #[repr(u16)]
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 pub enum Compression {
     None = 0,
     Gzip = 4,
@@ -80,6 +80,12 @@ where
     }
 
     pub fn to_data(self, writer: &mut impl Write) -> anyhow::Result<()> {
+        tracing::debug!(
+            magic = ?std::str::from_utf8(&self.header).unwrap_or("????"),
+            compression = ?self.compression,
+            entries = self.body.entries.len(),
+            "serializing archive"
+        );
         writer.write_all(&self.header)?;
         writer.write_all(&(self.compression as u16).to_be_bytes())?;
         writer.write_all(&self.hash.hash)?;
@@ -133,6 +139,11 @@ where
             header
         );
 
+        tracing::debug!(
+            magic = ?std::str::from_utf8(&header).unwrap_or("????"),
+            "deserializing archive"
+        );
+
         let mut compression: [u8; 2] = [0; 2];
         reader.read_exact(&mut compression)?;
 
@@ -169,6 +180,12 @@ where
                 )
             })?,
         };
+
+        tracing::info!(
+            entries = body.header.len(),
+            compression = ?compression,
+            "archive deserialized"
+        );
 
         Ok(Archive {
             header,
@@ -297,6 +314,7 @@ where
 {
     #[allow(clippy::wrong_self_convention)]
     fn to_data(self, writer: &mut impl Write) -> anyhow::Result<()> {
+        tracing::debug!(entries = self.header.len(), "writing archive body");
         writer.write_all(&(self.header.len() as u64).to_be_bytes())?;
         for entry in &self.header {
             writer.write_all(&entry.hash.hash)?;
@@ -317,6 +335,8 @@ where
         let mut long: [u8; 8] = [0; 8];
         reader.read_exact(&mut long)?;
         let count = u64::from_be_bytes(long);
+
+        tracing::debug!(entries = count, "reading archive body entries");
 
         if count == 0 {
             return Ok(ArchiveBody {
@@ -368,6 +388,7 @@ where
             hasher.write_all(&data)?;
             assert!(Hash::from(hasher) == entry.hash);
 
+            tracing::trace!(hash = %entry.hash, length = amount, "reading archive entry");
             entries.push(RawEntryData(data.to_vec()));
 
             counter += amount;

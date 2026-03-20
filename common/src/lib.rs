@@ -66,6 +66,7 @@ pub async fn read_object_into_headers(
     headers: &mut HashMap<Hash, (Header, Vec<u8>)>,
     object_hash: &Hash,
 ) -> anyhow::Result<()> {
+    tracing::debug!(root_hash = %object_hash, "reading object tree into headers");
     let mut stack = vec![object_hash.clone()];
 
     while let Some(current_hash) = stack.pop() {
@@ -95,6 +96,8 @@ pub async fn read_object_into_headers(
         headers.insert(current_hash, (header, data));
     }
 
+    tracing::debug!(objects_collected = headers.len(), "object tree walk complete");
+
     Ok(())
 }
 
@@ -114,6 +117,7 @@ pub fn pipe(reader: &mut dyn Read, writer: &mut dyn Write) -> anyhow::Result<()>
 }
 
 pub fn compute_hash(key: &str, data: &[u8]) -> Hash {
+    tracing::trace!(key, data_len = data.len(), "computing hash");
     let mut hasher = Sha512::new();
     hasher.update(key.as_bytes());
     hasher.update(b" ");

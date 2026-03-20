@@ -38,11 +38,14 @@ enum ServerError {
 
 impl axum::response::IntoResponse for ServerError {
     fn into_response(self) -> axum::response::Response {
-        let (status, msg) = match self {
-            ServerError::NotFound(m) => (StatusCode::NOT_FOUND, m),
-            ServerError::AlreadyExists(m) => (StatusCode::OK, m),
-            ServerError::BadRequest(m) => (StatusCode::BAD_REQUEST, m),
-            ServerError::Internal(m) => (StatusCode::INTERNAL_SERVER_ERROR, m),
+        let (status, msg) = match &self {
+            ServerError::NotFound(m) => (StatusCode::NOT_FOUND, m.clone()),
+            ServerError::AlreadyExists(m) => (StatusCode::OK, m.clone()),
+            ServerError::BadRequest(m) => (StatusCode::BAD_REQUEST, m.clone()),
+            ServerError::Internal(m) => {
+                tracing::error!(error = %m, "internal server error");
+                (StatusCode::INTERNAL_SERVER_ERROR, m.clone())
+            }
         };
         (status, msg).into_response()
     }
@@ -55,6 +58,7 @@ async fn put_object(
     headers: HeaderMap,
     request: Request<Body>,
 ) -> Result<StatusCode, ServerError> {
+    tracing::debug!(hash = %object_hash, "PUT /object - storing object");
     match store.exists(&object_hash).await {
         Ok(false) => Ok(()),
         Ok(true) => Err(ServerError::AlreadyExists("object already exists".into())),
@@ -77,6 +81,8 @@ async fn put_object(
         return Err(ServerError::BadRequest("invalid Object-Size header".into()));
     };
     let header = Header::new(object_type, object_size);
+    let object_size_val = object_size;
+    let object_type_str = object_type.to_str().to_string();
     let data_stream = request.into_body().into_data_stream();
 
     let buffered_reader = data_stream.map(|result| {
@@ -93,6 +99,8 @@ async fn put_object(
         .await
         .map_err(|err| ServerError::Internal(err.to_string()))?;
 
+    tracing::info!(hash = %object_hash, object_type = %object_type_str, size = object_size_val, "object stored");
+
     Ok(StatusCode::CREATED)
 }
 
@@ -101,6 +109,8 @@ async fn get_object(
     AxumPath(object_hash): AxumPath<Hash>,
     State(ServerState { store }): State<ServerState>,
 ) -> Result<Response<Body>, ServerError> {
+    tracing::debug!(hash = %object_hash, "GET /object - retrieving object");
+
     match store.exists(&object_hash).await {
         Ok(true) => Ok(()),
         Ok(false) => Err(ServerError::NotFound("no object".into())),
@@ -166,6 +176,8 @@ async fn get_archive(
         None => Compression::Zstd,
     };
 
+    tracing::info!(hash = %index_hash, compression = ?compression, "GET /archive - building archive");
+
     let index = read_index_from_store(&store, &index_hash).await?;
 
     #[allow(clippy::mutable_key_type)]
@@ -189,6 +201,8 @@ async fn get_archive(
 
         offset += length;
     }
+
+    let num_entries = header_entries.len();
 
     let archive = Archive {
         header: HEADER,
@@ -214,6 +228,8 @@ async fn get_archive(
     archive
         .to_data(&mut Cursor::new(&mut buf))
         .map_err(|err| ServerError::Internal(err.to_string()))?;
+
+    tracing::debug!(entries = num_entries, "archive built");
 
     let short_hash = &index_hash.as_str()[..12];
     let mut response = Response::new(Body::from(buf));
@@ -241,6 +257,8 @@ async fn get_supplemental(
     State(ServerState { store }): State<ServerState>,
     axum::Json(request): axum::Json<SupplementalRequest>,
 ) -> Result<Response<Body>, ServerError> {
+    tracing::info!(hash = %index_hash, requested_hashes = request.hashes.len(), "POST /supplemental - building");
+
     let compression = match query.compression.as_deref() {
         Some(s) => s
             .parse::<Compression>()
@@ -310,6 +328,8 @@ async fn get_supplemental(
 
         offset += length;
     }
+
+    tracing::debug!(entries = header_entries.len(), "supplemental archive built");
 
     let archive = Archive {
         header: SUPPLEMENTAL_HEADER,
@@ -386,6 +406,8 @@ async fn get_zip(
     AxumPath(index_hash): AxumPath<Hash>,
     State(ServerState { store }): State<ServerState>,
 ) -> Result<Response<Body>, ServerError> {
+    tracing::info!(hash = %index_hash, "GET /zip - building zip");
+
     let index = read_index_from_store(&store, &index_hash).await?;
 
     let files = collect_files(&store, &index.tree, "")
@@ -432,6 +454,8 @@ async fn upload_archive(
     State(ServerState { store }): State<ServerState>,
     body: Bytes,
 ) -> Result<String, ServerError> {
+    tracing::info!(bytes = body.len(), "POST /upload - receiving archive");
+
     let archive = Archive::<RawEntryData>::from_data(&mut std::io::Cursor::new(&body))
         .map_err(|err| ServerError::BadRequest(format!("invalid archive: {}", err)))?;
 
@@ -461,6 +485,8 @@ async fn upload_archive(
         added += 1;
     }
 
+    tracing::info!(added = added, skipped = skipped, "POST /upload - complete");
+
     Ok(format!("Added {} objects, skipped {}", added, skipped))
 }
 
@@ -478,6 +504,8 @@ async fn check_missing(
     State(ServerState { store }): State<ServerState>,
     axum::Json(request): axum::Json<MissingRequest>,
 ) -> Result<axum::Json<MissingResponse>, ServerError> {
+    tracing::debug!(requested = request.hashes.len(), "POST /missing - checking hashes");
+
     let mut missing = Vec::new();
     for hash in request.hashes {
         match store.exists(&hash).await {
@@ -485,6 +513,9 @@ async fn check_missing(
             _ => missing.push(hash),
         }
     }
+
+    tracing::debug!(missing = missing.len(), "POST /missing - result");
+
     Ok(axum::Json(MissingResponse { missing }))
 }
 
@@ -493,6 +524,8 @@ async fn get_metadata(
     AxumPath(index_hash): AxumPath<Hash>,
     State(ServerState { store }): State<ServerState>,
 ) -> Result<axum::Json<serde_json::Value>, ServerError> {
+    tracing::debug!(hash = %index_hash, "GET /metadata - collecting metadata");
+
     match store.exists(&index_hash).await {
         Ok(true) => Ok(()),
         Ok(false) => Err(ServerError::NotFound("index not found".into())),
