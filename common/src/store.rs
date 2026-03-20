@@ -100,6 +100,29 @@ impl Store {
 
     /// Write an object from a streaming reader.
     /// Use `put_object_bytes` instead when the body is already in memory.
+    /// Read the complete raw bytes of an object (header prefix + body).
+    pub async fn get_raw_bytes(&self, hash: &Hash) -> Result<Vec<u8>> {
+        let bytes = self.operator.read(hash.as_str()).await?;
+        Ok(bytes.to_vec())
+    }
+
+    /// List all object hashes in the store.
+    pub async fn list_hashes(&self) -> Result<Vec<Hash>> {
+        use opendal::EntryMode;
+        let entries = self.operator.list("/").await?;
+        let mut hashes = Vec::new();
+        for entry in entries {
+            let path = entry.path();
+            if entry.metadata().mode() == EntryMode::DIR {
+                continue;
+            }
+            if let Ok(hash) = Hash::try_from(path.trim_end_matches('/').to_string()) {
+                hashes.push(hash);
+            }
+        }
+        Ok(hashes)
+    }
+
     pub async fn put_object<T>(&self, hash: &Hash, mut object: StoreObject<T>) -> Result<()>
     where
         T: AsyncBufRead + AsyncRead + Unpin,
@@ -198,6 +221,53 @@ mod tests {
         let store = make_store(tmp.path());
         let hash = make_hash(0x44);
         assert!(store.get_object(&hash).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn get_raw_bytes_returns_header_and_body() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = make_store(tmp.path());
+        let hash = make_hash(0x77);
+        let header = Header::new(crate::ObjectType::Blob, 5);
+        store.put_object_bytes(&hash, header, b"hello".to_vec()).await.unwrap();
+
+        let raw = store.get_raw_bytes(&hash).await.unwrap();
+        assert_eq!(&raw[..7], b"blob 5\0");
+        assert_eq!(&raw[7..], b"hello");
+    }
+
+    #[tokio::test]
+    async fn get_raw_bytes_missing_returns_error() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = make_store(tmp.path());
+        let hash = make_hash(0x88);
+        assert!(store.get_raw_bytes(&hash).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn list_hashes_returns_stored_objects() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = make_store(tmp.path());
+        let h1 = make_hash(0xaa);
+        let h2 = make_hash(0xbb);
+        let header = Header::new(crate::ObjectType::Blob, 4);
+        store.put_object_bytes(&h1, header, b"data".to_vec()).await.unwrap();
+        let header2 = Header::new(crate::ObjectType::Tree, 4);
+        store.put_object_bytes(&h2, header2, b"tree".to_vec()).await.unwrap();
+
+        let mut hashes = store.list_hashes().await.unwrap();
+        hashes.sort_by(|a, b| a.as_str().cmp(b.as_str()));
+        assert_eq!(hashes.len(), 2);
+        assert!(hashes.contains(&h1));
+        assert!(hashes.contains(&h2));
+    }
+
+    #[tokio::test]
+    async fn list_hashes_empty_store() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = make_store(tmp.path());
+        let hashes = store.list_hashes().await.unwrap();
+        assert!(hashes.is_empty());
     }
 
     #[tokio::test]

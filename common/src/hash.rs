@@ -4,7 +4,6 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use sha2::digest::FixedOutput;
 use sha2::Sha512;
 use std::fmt::{self, Debug, Display};
-use std::path::PathBuf;
 use std::str::FromStr;
 use std::sync::OnceLock;
 
@@ -27,11 +26,6 @@ impl Hash {
         Ok(Self { hash, hex_cache: OnceLock::new() })
     }
 
-    pub fn get_parts(&self) -> (String, String) {
-        let s = self.as_str();
-        (s[..2].to_owned(), s[2..].to_owned())
-    }
-
     pub fn as_str(&self) -> &str {
         self.hex_cache.get_or_init(|| hex::encode(self.hash))
     }
@@ -41,27 +35,6 @@ impl Hash {
         Self::from_hex(value.as_str()).ok()
     }
 
-    #[allow(clippy::ptr_arg)]
-    pub fn get_path(&self, cache_dir: &PathBuf) -> PathBuf {
-        let (dir, file) = self.get_parts();
-        cache_dir.join(dir).join(file)
-    }
-
-    #[allow(clippy::ptr_arg)]
-    pub fn from_path(file: &PathBuf) -> Option<Self> {
-        let filename = file.file_name()?;
-        let directory = file.parent()?.file_name()?;
-
-        if directory.len() != 2 {
-            return None;
-        }
-
-        if filename.len() != 126 {
-            return None;
-        }
-
-        Self::try_from(directory.to_str()?.to_owned() + filename.to_str()?).ok()
-    }
 }
 
 impl std::hash::Hash for Hash {
@@ -214,39 +187,6 @@ mod tests {
         let hex_str = original.as_str().to_string();
         let recovered = Hash::try_from(hex_str).unwrap();
         assert_eq!(original, recovered);
-    }
-
-    #[test]
-    fn get_parts_splits_correctly() {
-        let h = make_hash(0xab);
-        let (prefix, rest) = h.get_parts();
-        assert_eq!(prefix.len(), 2);
-        assert_eq!(rest.len(), 126);
-        assert_eq!(format!("{}{}", prefix, rest), h.as_str());
-    }
-
-    #[test]
-    fn get_path_builds_correct_path() {
-        let h = make_hash(0xab);
-        let cache = PathBuf::from("cache");
-        let path = h.get_path(&cache);
-        let (prefix, rest) = h.get_parts();
-        assert_eq!(path, PathBuf::from("cache").join(&prefix).join(&rest));
-    }
-
-    #[test]
-    fn from_path_inverts_get_path() {
-        let original = make_hash(0xcd);
-        let cache = PathBuf::from("/tmp/cache");
-        let path = original.get_path(&cache);
-        let recovered = Hash::from_path(&path).unwrap();
-        assert_eq!(original, recovered);
-    }
-
-    #[test]
-    fn from_path_rejects_wrong_structure() {
-        let bad = PathBuf::from("/tmp/abc/def");
-        assert!(Hash::from_path(&bad).is_none());
     }
 
     #[test]
