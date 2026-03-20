@@ -51,6 +51,7 @@ fn build_tree_from_dir(
 ) -> std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<(Hash, u128)>> + Send>> {
     Box::pin(async move {
         anyhow::ensure!(path.is_dir(), "path must be a directory");
+        tracing::debug!(path = %path.display(), "processing directory");
         let mut dir_entries = read_dir(&path).await?;
 
         // Collect all entries first so we can process them concurrently
@@ -168,7 +169,7 @@ async fn commit_directory(store: &Store, path: &PathBuf) -> anyhow::Result<()> {
 
     let (_index, index_hash, total_size) = build_index_from_path(store, &path).await?;
 
-    println!("Finished generating Index for {} bytes of data", total_size);
+    tracing::info!("Finished generating Index for {} bytes of data", total_size);
     println!("{}", index_hash);
     Ok(())
 }
@@ -424,7 +425,7 @@ async fn upload_object(hash: &Hash, file: &PathBuf, url: &String) -> anyhow::Res
 
     let url = format!("{url}/object/{hash}");
 
-    println!("Sending put request to {url}");
+    tracing::debug!("Sending PUT request to {url}");
 
     // Get the body after the header (skip past the null terminator)
     let header_end = file_data.iter().position(|&b| b == 0).unwrap_or(0) + 1;
@@ -460,7 +461,7 @@ async fn download_object(hash: &Hash, file: &PathBuf, url: &String) -> anyhow::R
             .context("invalid header in file");
     }
 
-    println!("Sending get request to {url}");
+    tracing::debug!("Sending GET request to {url}");
 
     let mut response = ureq::get(&url).call()
         .context("failed to send GET request")?;
@@ -570,6 +571,7 @@ async fn pack_archive(store: &Store, path: &PathBuf, index_hash: &Hash, compress
 }
 
 async fn push_archive(store: &Store, url: &str, index_hash: &Hash, compression: Compression) -> anyhow::Result<()> {
+    tracing::info!(index = %index_hash, url, "starting push-archive");
     // 1. Read index from store
     let index: object_body::Index = {
         let mut store_obj = store.get_object(index_hash).await.context("index object not found in store")?;
@@ -591,6 +593,7 @@ async fn push_archive(store: &Store, url: &str, index_hash: &Hash, compression: 
 
     // 3. Collect all hashes
     let all_hashes: Vec<Hash> = headers.keys().cloned().collect();
+    let total_objects = all_hashes.len();
 
     // 4. POST to /missing to find which objects the server needs
     #[derive(serde::Serialize)]
@@ -612,13 +615,14 @@ async fn push_archive(store: &Store, url: &str, index_hash: &Hash, compression: 
 
     // 5. If no missing objects, nothing to do
     if missing_resp.missing.is_empty() {
-        println!("All objects already present on server");
+        tracing::info!("All objects already present on server");
         return Ok(());
     }
 
     // 6. Build supplemental archive with all trees + missing objects
     #[allow(clippy::mutable_key_type)]
     let missing_set: std::collections::HashSet<Hash> = missing_resp.missing.into_iter().collect();
+    tracing::info!(total = total_objects, missing = missing_set.len(), "found missing objects");
 
     let mut offset = 0u64;
     let mut header_entries: Vec<ArchiveHeaderEntry> = Vec::new();
@@ -678,8 +682,8 @@ async fn push_archive(store: &Store, url: &str, index_hash: &Hash, compression: 
         .read_to_string()
         .context("failed to read upload response")?;
 
-    println!("{}", response_text);
-    println!("Pushed {} objects ({} bytes) to {}", num_objects, total_bytes, url);
+    tracing::debug!("{}", response_text);
+    tracing::info!("Pushed {} objects ({} bytes) to {}", num_objects, total_bytes, url);
 
     Ok(())
 }
@@ -695,7 +699,7 @@ async fn unpack_archive(cache: &PathBuf, path: &PathBuf) -> anyhow::Result<()> {
 
     anyhow::ensure!(archive.body.entries.len() == archive.body.header.len(), "archive entries and headers length mismatch");
 
-    println!("Successfully read archive, Index {}", archive.hash);
+    tracing::debug!("Successfully read archive, Index {}", archive.hash);
 
     let index_data = object_body::Object::to_data(&archive.index);
     let computed_hash = compute_hash(INDEX_KEY, &index_data);
@@ -779,7 +783,7 @@ async fn extract_archive(file: &PathBuf, directory: &PathBuf) -> anyhow::Result<
         "archive entries and headers length mismatch"
     );
 
-    println!("Index: {}", archive.hash);
+    tracing::info!("Index: {}", archive.hash);
 
     #[allow(clippy::mutable_key_type)]
     let mut data_map: HashMap<Hash, Vec<u8>> = HashMap::with_capacity(archive.body.header.len());
@@ -791,7 +795,7 @@ async fn extract_archive(file: &PathBuf, directory: &PathBuf) -> anyhow::Result<
     let data_map = Arc::new(data_map);
     let file_count = extract_tree(&data_map, &root_tree_hash, directory).await?;
 
-    println!("Extracted {} files to {:?}", file_count, directory);
+    tracing::info!("Extracted {} files to {:?}", file_count, directory);
 
     Ok(())
 }
@@ -1047,7 +1051,7 @@ struct Cli {
     #[arg(short, long, value_name = "Store")]
     store: PathBuf,
 
-    /// Increase debug verbosity (can be repeated)
+    /// Increase logging verbosity (-d = info, -dd = debug, -ddd = trace)
     #[arg(short, long, action = clap::ArgAction::Count)]
     debug: u8,
 
@@ -1168,8 +1172,24 @@ enum Commands {
 #[tokio::main]
 async fn main() {
     let cli = Cli::parse();
+
+    let level = match cli.debug {
+        0 => "warn",
+        1 => "info",
+        2 => "debug",
+        _ => "trace",
+    };
+
+    let filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(level));
+
+    tracing_subscriber::fmt()
+        .with_env_filter(filter)
+        .with_target(false)
+        .init();
+
     if let Err(e) = run(cli).await {
-        eprintln!("Error: {e:?}");
+        tracing::error!("{e:?}");
         std::process::exit(1);
     }
 }
