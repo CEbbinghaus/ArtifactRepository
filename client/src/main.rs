@@ -584,10 +584,13 @@ async fn push_archive(store: &Store, url: &str, index_hash: &Hash, compression: 
     let mut headers: HashMap<Hash, (Header, Vec<u8>)> = HashMap::new();
     read_object_into_headers(store, &mut headers, &index.tree).await?;
 
-    // 3. Collect all hashes (including the index hash)
-    let all_hashes: Vec<Hash> = std::iter::once(index_hash.clone())
-        .chain(headers.keys().cloned())
-        .collect();
+    // Also include the index object itself
+    let index_data = object_body::Object::to_data(&index);
+    let index_header = Header::new(ObjectType::Index, index_data.len() as u64);
+    headers.insert(index_hash.clone(), (index_header, index_data));
+
+    // 3. Collect all hashes
+    let all_hashes: Vec<Hash> = headers.keys().cloned().collect();
 
     // 4. POST to /missing to find which objects the server needs
     #[derive(serde::Serialize)]
@@ -622,8 +625,11 @@ async fn push_archive(store: &Store, url: &str, index_hash: &Hash, compression: 
     let mut entry_data_vec: Vec<RawEntryData> = Vec::new();
 
     for (hash, (header, data)) in &headers {
-        // Always include tree objects; for others, only include if missing
-        if header.object_type != ObjectType::Tree && !missing_set.contains(hash) {
+        // Always include tree and index objects; for blobs, only include if missing
+        let dominated_by_missing = header.object_type != ObjectType::Tree
+            && header.object_type != ObjectType::Index
+            && !missing_set.contains(hash);
+        if dominated_by_missing {
             continue;
         }
 
