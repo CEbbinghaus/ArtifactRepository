@@ -30,9 +30,8 @@ impl Hash {
         self.hex_cache.get_or_init(|| hex::encode(self.hash))
     }
 
-    #[allow(clippy::ptr_arg)]
-    pub fn from_string(value: &String) -> Option<Self> {
-        Self::from_hex(value.as_str()).ok()
+    pub fn from_string(value: &str) -> Option<Self> {
+        Self::from_hex(value).ok()
     }
 
 }

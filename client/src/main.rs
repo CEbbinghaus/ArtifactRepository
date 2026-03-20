@@ -10,7 +10,7 @@ use common::{
 
 use std::{
     collections::HashMap,
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::Arc,
 };
 
@@ -22,11 +22,10 @@ use tokio::{
 };
 
 // Helper to build Index from filesystem
-#[allow(clippy::ptr_arg)]
-async fn build_index_from_path(store: &Store, path: &PathBuf) -> anyhow::Result<(object_body::Index, Hash, u128)> {
+async fn build_index_from_path(store: &Store, path: &Path) -> anyhow::Result<(object_body::Index, Hash, u128)> {
     anyhow::ensure!(path.is_dir(), "path must be a directory");
 
-    let (tree_hash, total_size) = build_tree_from_dir(store.clone(), path.clone()).await?;
+    let (tree_hash, total_size) = build_tree_from_dir(store.clone(), path.to_path_buf()).await?;
 
     let index = object_body::Index {
         tree: tree_hash,
@@ -75,8 +74,9 @@ fn build_tree_from_dir(
             let store_clone = store.clone();
             dir_set.spawn(async move {
                 let name = dir_path.file_name()
-                    .map(|n| n.to_string_lossy().to_string())
-                    .unwrap_or_default();
+                    .and_then(|n| n.to_str())
+                    .ok_or_else(|| anyhow::anyhow!("invalid file name: {}", dir_path.display()))?
+                    .to_string();
                 let (hash, size) = build_tree_from_dir(store_clone, dir_path).await?;
                 Ok::<_, anyhow::Error>((name, hash, size))
             });
@@ -92,8 +92,9 @@ fn build_tree_from_dir(
                 let _permit = sem.acquire().await
                     .map_err(|e| anyhow::anyhow!("semaphore: {e}"))?;
                 let name = file_path.file_name()
-                    .map(|n| n.to_string_lossy().to_string())
-                    .unwrap_or_default();
+                    .and_then(|n| n.to_str())
+                    .ok_or_else(|| anyhow::anyhow!("invalid file name: {}", file_path.display()))?
+                    .to_string();
 
                 let (data, hash) = tokio::task::spawn_blocking({
                     let path = file_path.clone();
@@ -105,7 +106,7 @@ fn build_tree_from_dir(
                 }).await??;
                 let size = data.len() as u64;
 
-                if !store_clone.exists(&hash).await.unwrap_or(false) {
+                if !store_clone.exists(&hash).await? {
                     let header = Header::new(ObjectType::Blob, size);
                     store_clone.put_object_bytes(&hash, header, data).await?;
                 }
@@ -144,7 +145,7 @@ fn build_tree_from_dir(
         let tree_data = object_body::Object::to_data(&tree);
         let hash = compute_hash(TREE_KEY, &tree_data);
 
-        if !store.exists(&hash).await.unwrap_or(false) {
+        if !store.exists(&hash).await? {
             let header = Header::new(ObjectType::Tree, tree_data.len() as u64);
             store.put_object_bytes(&hash, header, tree_data).await?;
         }
@@ -164,7 +165,7 @@ async fn read_tree_from_store(store: &Store, hash: &Hash) -> anyhow::Result<obje
     object_body::Object::from_data(&data)
 }
 
-async fn commit_directory(store: &Store, path: &PathBuf) -> anyhow::Result<()> {
+async fn commit_directory(store: &Store, path: &Path) -> anyhow::Result<()> {
     let path_meta = tokio::fs::metadata(path).await?;
     anyhow::ensure!(path_meta.is_dir(), "path must be a directory");
 
@@ -177,7 +178,7 @@ async fn commit_directory(store: &Store, path: &PathBuf) -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn restore_directory(store: &Store, path: &PathBuf, index_hash: Hash, validate: bool) -> anyhow::Result<()> {
+async fn restore_directory(store: &Store, path: &Path, index_hash: Hash, validate: bool) -> anyhow::Result<()> {
     if tokio::fs::metadata(path).await.is_err() {
         create_dir_all(path).await.context("failed to create directory")?;
     }
@@ -203,11 +204,10 @@ async fn restore_directory(store: &Store, path: &PathBuf, index_hash: Hash, vali
     Ok(())
 }
 
-#[allow(clippy::ptr_arg)]
 fn validate_tree_at_path<'a>(
     store: &'a Store,
     tree: &'a object_body::Tree,
-    path: &'a PathBuf,
+    path: &'a Path,
 ) -> std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<()>> + Send + 'a>> {
     Box::pin(async move {
         for entry in &tree.contents {
@@ -238,11 +238,10 @@ fn validate_tree_at_path<'a>(
     })
 }
 
-#[allow(clippy::ptr_arg)]
 fn write_tree_to_path<'a>(
     store: &'a Store,
     tree: &'a object_body::Tree,
-    path: &'a PathBuf,
+    path: &'a Path,
 ) -> std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<()>> + Send + 'a>> {
     Box::pin(async move {
         let semaphore = Arc::new(tokio::sync::Semaphore::new(64));
@@ -328,7 +327,7 @@ async fn push_cache(store: &Store, url: &str, hash: Option<Hash>) -> anyhow::Res
 fn pull_tree<'a>(store: &'a Store, url: &'a str, tree_hash: &'a Hash) -> std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<()>> + Send + 'a>> {
     Box::pin(async move {
         // tree already exists locally so we can skip downloading it
-        if !store.exists(tree_hash).await.unwrap_or(false) {
+        if !store.exists(tree_hash).await? {
             let header = download_object(store, tree_hash, url).await
                 .context(format!("unable to download object with hash {tree_hash}"))?;
             anyhow::ensure!(header.object_type == ObjectType::Tree, "expected tree object");
@@ -375,17 +374,15 @@ async fn pull_cache(store: &Store, url: &str, hash: Hash) -> anyhow::Result<()> 
 }
 
 async fn upload_object(hash: &Hash, raw_bytes: &[u8], url: &str) -> anyhow::Result<()> {
-    let header = read_header_from_slice(
-        &raw_bytes[..raw_bytes.iter().position(|&b| b == 0).unwrap_or(raw_bytes.len())]
-    ).context("data should be a valid object")?;
+    let null_pos = raw_bytes.iter().position(|&b| b == 0)
+        .context("object data missing null terminator")?;
+    let header = read_header_from_slice(&raw_bytes[..null_pos])
+        .context("invalid object header")?;
+    let body = &raw_bytes[(null_pos + 1)..];
 
     let url = format!("{url}/object/{hash}");
 
     tracing::debug!("Sending PUT request to {url}");
-
-    // Get the body after the header (skip past the null terminator)
-    let header_end = raw_bytes.iter().position(|&b| b == 0).unwrap_or(0) + 1;
-    let body = &raw_bytes[header_end..];
 
     ureq::put(&url)
         .header("Object-Type", header.object_type.to_str())
@@ -398,7 +395,7 @@ async fn upload_object(hash: &Hash, raw_bytes: &[u8], url: &str) -> anyhow::Resu
 
 async fn download_object(store: &Store, hash: &Hash, url: &str) -> anyhow::Result<Header> {
     // If already in store, return its header
-    if store.exists(hash).await.unwrap_or(false) {
+    if store.exists(hash).await? {
         let mut store_obj = store.get_object(hash).await
             .context("object should exist in store")?;
         // Consume body to drop the reader
@@ -450,7 +447,7 @@ async fn download_object(store: &Store, hash: &Hash, url: &str) -> anyhow::Resul
     Ok(header)
 }
 
-async fn pack_archive(store: &Store, path: &PathBuf, index_hash: &Hash, compression: Compression) -> anyhow::Result<()> {
+async fn pack_archive(store: &Store, path: &Path, index_hash: &Hash, compression: Compression) -> anyhow::Result<()> {
     anyhow::ensure!(tokio::fs::metadata(path).await.is_err(), "output file already exists");
     anyhow::ensure!(
         path.parent().map(|p| p.exists() && p.is_dir()) == Some(true),
@@ -632,7 +629,7 @@ async fn push_archive(store: &Store, url: &str, index_hash: &Hash, compression: 
     Ok(())
 }
 
-async fn unpack_archive(store: &Store, path: &PathBuf) -> anyhow::Result<()> {
+async fn unpack_archive(store: &Store, path: &Path) -> anyhow::Result<()> {
     let path_meta = tokio::fs::metadata(path).await?;
     anyhow::ensure!(path_meta.is_file(), "path must be a file");
 
@@ -667,11 +664,11 @@ async fn unpack_archive(store: &Store, path: &PathBuf) -> anyhow::Result<()> {
                 .map_err(|e| anyhow::anyhow!("semaphore: {e}"))?;
 
             // Skip if already exists
-            if store_clone.exists(&hash).await.unwrap_or(false) {
+            if store_clone.exists(&hash).await? {
                 return Ok::<_, anyhow::Error>(());
             }
 
-            let raw = entry.turn_into_vec();
+            let raw = entry.turn_into_vec()?;
             let (obj_header, body) = read_header_and_body(&raw)
                 .ok_or_else(|| anyhow::anyhow!("failed to parse header for object {}", hash))?;
 
@@ -688,8 +685,7 @@ async fn unpack_archive(store: &Store, path: &PathBuf) -> anyhow::Result<()> {
     Ok(())
 }
 
-#[allow(clippy::ptr_arg)]
-async fn extract_archive(file: &PathBuf, directory: &PathBuf) -> anyhow::Result<()> {
+async fn extract_archive(file: &Path, directory: &Path) -> anyhow::Result<()> {
     if tokio::fs::metadata(directory).await.is_err() {
         create_dir_all(directory).await.context("failed to create output directory")?;
     }
@@ -700,7 +696,7 @@ async fn extract_archive(file: &PathBuf, directory: &PathBuf) -> anyhow::Result<
     let mut entries = read_dir(directory).await?;
     anyhow::ensure!(entries.next_entry().await?.is_none(), "output directory must be empty");
 
-    let file = file.clone();
+    let file = file.to_path_buf();
     let archive = tokio::task::spawn_blocking(move || {
         let f = std::fs::File::open(&file)?;
         let mut reader = std::io::BufReader::new(f);
@@ -729,11 +725,11 @@ async fn extract_archive(file: &PathBuf, directory: &PathBuf) -> anyhow::Result<
     Ok(())
 }
 
-#[allow(clippy::ptr_arg, clippy::mutable_key_type)]
+#[allow(clippy::mutable_key_type)]
 fn extract_tree<'a>(
     data_map: &'a Arc<HashMap<Hash, Vec<u8>>>,
     tree_hash: &'a Hash,
-    path: &'a PathBuf,
+    path: &'a Path,
 ) -> std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<usize>> + Send + 'a>> {
     Box::pin(async move {
         let raw_data = data_map.get(tree_hash)
@@ -818,8 +814,9 @@ fn archive_build_tree(
             let objects_clone = objects.clone();
             dir_set.spawn(async move {
                 let name = dir_path.file_name()
-                    .map(|n| n.to_string_lossy().to_string())
-                    .unwrap_or_default();
+                    .and_then(|n| n.to_str())
+                    .ok_or_else(|| anyhow::anyhow!("invalid file name: {}", dir_path.display()))?
+                    .to_string();
                 let hash = archive_build_tree(objects_clone, dir_path).await?;
                 Ok::<_, anyhow::Error>((name, hash))
             });
@@ -835,8 +832,9 @@ fn archive_build_tree(
                 let _permit = sem.acquire().await
                     .map_err(|e| anyhow::anyhow!("semaphore: {e}"))?;
                 let name = file_path.file_name()
-                    .map(|n| n.to_string_lossy().to_string())
-                    .unwrap_or_default();
+                    .and_then(|n| n.to_str())
+                    .ok_or_else(|| anyhow::anyhow!("invalid file name: {}", file_path.display()))?
+                    .to_string();
 
                 let (data, hash) = tokio::task::spawn_blocking({
                     let path = file_path.clone();
@@ -904,7 +902,7 @@ fn archive_build_tree(
     })
 }
 
-async fn archive_directory(directory: &PathBuf, file: &PathBuf, compression: Compression) -> anyhow::Result<()> {
+async fn archive_directory(directory: &Path, file: &Path, compression: Compression) -> anyhow::Result<()> {
     anyhow::ensure!(tokio::fs::metadata(file).await.is_err(), "output file already exists");
     anyhow::ensure!(
         file.parent().map(|p| p.exists() && p.is_dir()) == Some(true),

@@ -1,3 +1,6 @@
+// Hash uses OnceLock for hex cache but Hash/Eq only use the [u8; 64] bytes
+#![allow(clippy::mutable_key_type)]
+
 use std::collections::HashMap;
 use std::io::Write;
 
@@ -259,6 +262,7 @@ async fn collect_entry_metadata(
 
 /// Write an archive to `writer` by streaming each entry from the store on-demand.
 /// Only one entry's data is in memory at a time.
+#[allow(clippy::too_many_arguments)]
 fn write_streaming_archive(
     store: Store,
     magic: [u8; 4],

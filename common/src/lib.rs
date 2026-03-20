@@ -1,4 +1,6 @@
 #![warn(unused_imports)]
+// Hash uses OnceLock for hex cache but Hash/Eq only use the [u8; 64] bytes
+#![allow(clippy::mutable_key_type)]
 
 use std::{
     collections::HashMap, fs::File, io::{BufRead, BufReader, Read, Write}, str::from_utf8
@@ -45,7 +47,9 @@ pub fn read_header_and_body(data: &[u8]) -> Option<(Header, &[u8])> {
 }
 
 pub fn read_header_from_slice(slice: &[u8]) -> Option<Header> {
-    assert!(slice[slice.len() - 1] != 0);
+    if slice.is_empty() || slice[slice.len() - 1] == 0 {
+        return None;
+    }
     let string = from_utf8(slice).ok()?;
 
     let (object_type, size) = string.split_once(' ')?;

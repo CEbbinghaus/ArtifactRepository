@@ -283,14 +283,14 @@ pub struct ArchiveHeaderEntry {
 }
 
 pub trait ArchiveEntryData {
-    fn turn_into_vec(self) -> Vec<u8>;
+    fn turn_into_vec(self) -> anyhow::Result<Vec<u8>>;
 }
 
 pub struct RawEntryData(pub Vec<u8>);
 
 impl ArchiveEntryData for RawEntryData {
-    fn turn_into_vec(self) -> Vec<u8> {
-        self.0
+    fn turn_into_vec(self) -> anyhow::Result<Vec<u8>> {
+        Ok(self.0)
     }
 }
 pub struct ReaderEntryData<T>(T)
@@ -310,23 +310,23 @@ impl<T> ArchiveEntryData for ReaderEntryData<T>
 where
     T: Read,
 {
-    fn turn_into_vec(mut self) -> Vec<u8> {
+    fn turn_into_vec(mut self) -> anyhow::Result<Vec<u8>> {
         let mut data: Vec<u8> = Vec::new();
-        self.0.read_to_end(&mut data).expect("Reading to work");
-
-        data
+        self.0.read_to_end(&mut data)?;
+        Ok(data)
     }
 }
 
 pub struct FileEntryData(pub PathBuf);
 
 impl ArchiveEntryData for FileEntryData {
-    fn turn_into_vec(self) -> Vec<u8> {
-        let file = File::open(self.0).expect("File to be avaliable for read");
+    fn turn_into_vec(self) -> anyhow::Result<Vec<u8>> {
+        let file = File::open(&self.0)
+            .map_err(|e| anyhow!("file not available for read {:?}: {}", self.0, e))?;
         let mut reader = BufReader::new(file);
         let mut data = Vec::new();
-        pipe(&mut reader, &mut data).expect("reading to work");
-        data
+        pipe(&mut reader, &mut data)?;
+        Ok(data)
     }
 }
 
@@ -336,16 +336,16 @@ pub struct StoreEntryData {
 }
 
 impl ArchiveEntryData for StoreEntryData {
-    fn turn_into_vec(self) -> Vec<u8> {
+    fn turn_into_vec(self) -> anyhow::Result<Vec<u8>> {
         // Use block_in_place to avoid deadlocking the tokio runtime
         tokio::task::block_in_place(|| {
             tokio::runtime::Handle::current().block_on(async {
                 let mut object = self.store.get_object(&self.hash).await
-                    .expect("Object to be available in store");
+                    .map_err(|e| anyhow!("object {} not available in store: {}", self.hash, e))?;
 
                 let mut data: Vec<u8> = Vec::new();
-                object.read_to_end(&mut data).await.expect("Reading to work");
-                data
+                object.read_to_end(&mut data).await?;
+                Ok(data)
             })
         })
     }
@@ -374,7 +374,7 @@ where
         }
 
         for entry in self.entries {
-            writer.write_all(&entry.turn_into_vec())?;
+            writer.write_all(&entry.turn_into_vec()?)?;
         }
 
         writer.flush()?;
@@ -425,11 +425,20 @@ where
         let mut counter: u64 = 0;
 
         header_entries.sort_by(|a, b| a.index.cmp(&b.index));
-        assert!(header_entries[0].index == 0);
+        anyhow::ensure!(
+            header_entries[0].index == 0,
+            "first archive entry must start at index 0, got {}",
+            header_entries[0].index
+        );
 
         let mut entries: Vec<RawEntryData> = Vec::with_capacity(header_entries.len());
         for entry in &header_entries {
-            assert!(entry.index == counter);
+            anyhow::ensure!(
+                entry.index == counter,
+                "archive entry index mismatch: expected {}, got {}",
+                counter,
+                entry.index
+            );
 
             let amount = entry.length;
             let mut data: Vec<u8> = vec![0; amount as usize];
@@ -437,7 +446,13 @@ where
 
             let mut hasher = Sha512::new();
             hasher.write_all(&data)?;
-            assert!(Hash::from(hasher) == entry.hash);
+            let computed_hash = Hash::from(hasher);
+            anyhow::ensure!(
+                computed_hash == entry.hash,
+                "archive entry hash mismatch: expected {}, got {}",
+                entry.hash,
+                computed_hash
+            );
 
             tracing::trace!(hash = %entry.hash, length = amount, "reading archive entry");
             entries.push(RawEntryData(data.to_vec()));
