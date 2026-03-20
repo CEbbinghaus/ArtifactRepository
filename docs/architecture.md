@@ -42,6 +42,8 @@ Two objects with identical content always produce the same hash. This gives auto
 - Archives containing duplicate files store each unique file once
 - Servers backing onto shared storage never conflict on writes
 
+Because SHA-512 hash collisions are computationally infeasible, a PUT for an object whose hash already exists in the store can be safely treated as a no-op. The server returns `200 OK` (not `409 Conflict`) for duplicate PUTs — this is intentional idempotent-by-design behavior. The hash *is* the identity; if the hash matches, the content is guaranteed identical, so there is nothing to conflict with. This simplifies client retry logic and enables fire-and-forget uploads without coordination.
+
 ### Hashing
 
 ```
