@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::io::{Cursor, Write};
+use std::io::Write;
 
 use axum::{
     body::{Body, Bytes},
@@ -11,8 +11,8 @@ use axum::{
 };
 use common::{
     Hash, Header, Mode, ObjectType,
-    archive::{Archive, ArchiveBody, ArchiveHeaderEntry, Compression, RawEntryData, HEADER, SUPPLEMENTAL_HEADER},
-    collect_index_metadata, collect_tree_metadata,
+    archive::{Archive, ArchiveBody, ArchiveEntryData, ArchiveHeaderEntry, Compression, RawEntryData, HEADER, SUPPLEMENTAL_HEADER},
+    collect_tree_metadata,
     object_body::{Index, Object as _, Tree},
     read_header_and_body, read_object_into_headers,
     store::{Store, StoreObject},
@@ -23,6 +23,77 @@ use tokio_util::compat::FuturesAsyncReadCompatExt;
 use tokio_util::io::ReaderStream;
 
 use futures::{AsyncReadExt, StreamExt, TryStreamExt};
+
+const STREAM_CHUNK_SIZE: usize = 64 * 1024;
+const STREAM_CHANNEL_CAPACITY: usize = 32;
+
+/// A `Write` adapter that sends chunks through a bounded mpsc channel.
+/// Provides backpressure: when the channel is full, writes block until
+/// the receiver consumes data.
+struct ChannelWriter {
+    tx: tokio::sync::mpsc::Sender<Result<Vec<u8>, std::io::Error>>,
+    buf: Vec<u8>,
+    chunk_size: usize,
+}
+
+impl ChannelWriter {
+    fn new(tx: tokio::sync::mpsc::Sender<Result<Vec<u8>, std::io::Error>>) -> Self {
+        Self {
+            tx,
+            buf: Vec::with_capacity(STREAM_CHUNK_SIZE),
+            chunk_size: STREAM_CHUNK_SIZE,
+        }
+    }
+
+    fn send_buf(&mut self) -> std::io::Result<()> {
+        if !self.buf.is_empty() {
+            let chunk = std::mem::replace(&mut self.buf, Vec::with_capacity(self.chunk_size));
+            self.tx
+                .blocking_send(Ok(chunk))
+                .map_err(|_| std::io::Error::new(std::io::ErrorKind::BrokenPipe, "receiver dropped"))?;
+        }
+        Ok(())
+    }
+}
+
+impl Write for ChannelWriter {
+    fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
+        self.buf.extend_from_slice(data);
+        if self.buf.len() >= self.chunk_size {
+            self.send_buf()?;
+        }
+        Ok(data.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.send_buf()
+    }
+}
+
+impl Drop for ChannelWriter {
+    fn drop(&mut self) {
+        let _ = self.send_buf();
+    }
+}
+
+/// Spawn a blocking task that writes the archive into a channel,
+/// returning a streaming Body.
+fn stream_archive<T: ArchiveEntryData + Send + 'static>(
+    archive: Archive<T>,
+) -> Body {
+    let (tx, rx) = tokio::sync::mpsc::channel(STREAM_CHANNEL_CAPACITY);
+
+    tokio::task::spawn_blocking(move || {
+        let mut writer = ChannelWriter::new(tx);
+        if let Err(e) = archive.to_data(&mut writer) {
+            tracing::error!(error = %e, "archive streaming serialization failed");
+        }
+        // Drop flushes remaining bytes
+    });
+
+    let stream = tokio_stream::wrappers::ReceiverStream::new(rx);
+    Body::from_stream(stream)
+}
 
 #[derive(Clone)]
 struct ServerState {
@@ -176,7 +247,7 @@ async fn get_archive(
         None => Compression::Zstd,
     };
 
-    tracing::info!(hash = %index_hash, compression = ?compression, "GET /archive - building archive");
+    tracing::info!(hash = %index_hash, compression = ?compression, "GET /archive - streaming archive");
 
     let index = read_index_from_store(&store, &index_hash).await?;
 
@@ -202,8 +273,6 @@ async fn get_archive(
         offset += length;
     }
 
-    let num_entries = header_entries.len();
-
     let archive = Archive {
         header: HEADER,
         compression,
@@ -224,15 +293,10 @@ async fn get_archive(
         },
     };
 
-    let mut buf = Vec::new();
-    archive
-        .to_data(&mut Cursor::new(&mut buf))
-        .map_err(|err| ServerError::Internal(err.to_string()))?;
-
-    tracing::debug!(entries = num_entries, "archive built");
+    let body = stream_archive(archive);
 
     let short_hash = &index_hash.as_str()[..12];
-    let mut response = Response::new(Body::from(buf));
+    let mut response = Response::new(body);
     let headers = response.headers_mut();
     headers.insert("Content-Type", "application/octet-stream".parse().unwrap());
     headers.insert(
@@ -342,13 +406,10 @@ async fn get_supplemental(
         },
     };
 
-    let mut buf = Vec::new();
-    archive
-        .to_data(&mut Cursor::new(&mut buf))
-        .map_err(|err| ServerError::Internal(err.to_string()))?;
+    let body = stream_archive(archive);
 
     let short_hash = &index_hash.as_str()[..12];
-    let mut response = Response::new(Body::from(buf));
+    let mut response = Response::new(body);
     let headers = response.headers_mut();
     headers.insert("Content-Type", "application/octet-stream".parse().unwrap());
     headers.insert(
@@ -414,29 +475,47 @@ async fn get_zip(
         .await
         .map_err(|err| ServerError::Internal(err.to_string()))?;
 
-    let mut buf = Vec::new();
-    {
-        let cursor = Cursor::new(&mut buf);
-        let mut zip_writer = zip::ZipWriter::new(cursor);
-        let options = zip::write::SimpleFileOptions::default()
-            .compression_method(zip::CompressionMethod::Deflated);
+    // Zip requires Write+Seek, so we build in memory then stream the result
+    let (tx, rx) = tokio::sync::mpsc::channel::<Result<Vec<u8>, std::io::Error>>(STREAM_CHANNEL_CAPACITY);
+    let short_hash = index_hash.as_str()[..12].to_string();
 
-        for (path, data) in &files {
-            zip_writer
-                .start_file(path, options)
-                .map_err(|err| ServerError::Internal(err.to_string()))?;
-            zip_writer
-                .write_all(data)
-                .map_err(|err| ServerError::Internal(err.to_string()))?;
+    tokio::task::spawn_blocking(move || {
+        let mut buf = Vec::new();
+        {
+            let cursor = std::io::Cursor::new(&mut buf);
+            let mut zip_writer = zip::ZipWriter::new(cursor);
+            let options = zip::write::SimpleFileOptions::default()
+                .compression_method(zip::CompressionMethod::Deflated);
+
+            for (path, data) in &files {
+                if let Err(e) = zip_writer.start_file(path, options) {
+                    tracing::error!(error = %e, "zip start_file failed");
+                    return;
+                }
+                if let Err(e) = zip_writer.write_all(data) {
+                    tracing::error!(error = %e, "zip write failed");
+                    return;
+                }
+            }
+
+            if let Err(e) = zip_writer.finish() {
+                tracing::error!(error = %e, "zip finish failed");
+                return;
+            }
         }
 
-        zip_writer
-            .finish()
-            .map_err(|err| ServerError::Internal(err.to_string()))?;
-    }
+        // Stream the completed zip in chunks
+        for chunk in buf.chunks(STREAM_CHUNK_SIZE) {
+            if tx.blocking_send(Ok(chunk.to_vec())).is_err() {
+                return;
+            }
+        }
+    });
 
-    let short_hash = &index_hash.as_str()[..12];
-    let mut response = Response::new(Body::from(buf));
+    let stream = tokio_stream::wrappers::ReceiverStream::new(rx);
+    let body = Body::from_stream(stream);
+
+    let mut response = Response::new(body);
     let headers = response.headers_mut();
     headers.insert("Content-Type", "application/zip".parse().unwrap());
     headers.insert(
