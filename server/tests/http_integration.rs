@@ -405,25 +405,24 @@ async fn get_metadata_returns_correct_json() {
     let body = resp.into_body().collect().await.unwrap().to_bytes();
     let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
 
-    assert_eq!(json["index_hash"], index_hash.as_str());
-    assert_eq!(json["tree_hash"], tree_hash.as_str());
-    assert!(json["timestamp"].is_string());
-    assert!(json["metadata"].is_object());
+    assert_eq!(json["index"]["hash"], index_hash.as_str());
+    assert_eq!(json["index"]["tree"], tree_hash.as_str());
+    assert!(json["index"]["timestamp"].is_string());
+    assert!(json["index"]["metadata"].is_object());
 
-    // Verify files array
-    let files = json["files"].as_array().unwrap();
-    assert_eq!(files.len(), 1);
-    assert_eq!(files[0]["path"], "hello.txt");
-    assert_eq!(files[0]["hash"], blob_hash.as_str());
-    assert_eq!(files[0]["size"], blob_data.len() as u64);
-    assert_eq!(files[0]["mode"], "100644");
-
-    // Verify objects array contains index, tree, and blob
-    let objects = json["objects"].as_array().unwrap();
-    assert_eq!(objects.len(), 3);
-    assert!(objects.iter().any(|o| o["hash"] == index_hash.as_str() && o["type"] == "indx"));
-    assert!(objects.iter().any(|o| o["hash"] == tree_hash.as_str() && o["type"] == "tree"));
-    assert!(objects.iter().any(|o| o["hash"] == blob_hash.as_str() && o["type"] == "blob"));
+    // Verify tree structure with dictionary entries
+    let tree = &json["tree"];
+    assert_eq!(tree["hash"], tree_hash.as_str());
+    let entries = tree["entries"].as_object().unwrap();
+    assert_eq!(entries.len(), 1);
+    let hello_entry = &entries["hello.txt"];
+    assert_eq!(hello_entry["hash"], blob_hash.as_str());
+    assert_eq!(hello_entry["size"], blob_data.len() as u64);
+    assert_eq!(hello_entry["mode"], "100644");
+    // Should not have old flat fields
+    assert!(json.get("index_hash").is_none());
+    assert!(json.get("files").is_none());
+    assert!(json.get("objects").is_none());
 }
 
 #[tokio::test]

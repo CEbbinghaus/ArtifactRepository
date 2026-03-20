@@ -304,6 +304,7 @@ dependencies = [
  "iana-time-zone",
  "js-sys",
  "num-traits",
+ "serde",
  "wasm-bindgen",
  "windows-link",
 ]
@@ -389,6 +390,7 @@ dependencies = [
  "lzma-rust2",
  "opendal",
  "serde",
+ "serde_json",
  "sha2",
  "tempfile",
  "tokio",

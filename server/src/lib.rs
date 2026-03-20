@@ -12,7 +12,7 @@ use axum::{
 use common::{
     Hash, Header, Mode, ObjectType,
     archive::{Archive, ArchiveBody, ArchiveHeaderEntry, Compression, RawEntryData, HEADER, SUPPLEMENTAL_HEADER},
-    collect_index_metadata,
+    collect_index_metadata, collect_tree_metadata,
     object_body::{Index, Object as _, Tree},
     read_header_and_body, read_object_into_headers,
     store::{Store, StoreObject},
@@ -523,7 +523,7 @@ async fn check_missing(
 async fn get_metadata(
     AxumPath(index_hash): AxumPath<Hash>,
     State(ServerState { store }): State<ServerState>,
-) -> Result<axum::Json<serde_json::Value>, ServerError> {
+) -> Result<axum::Json<common::TreeMetadata>, ServerError> {
     tracing::debug!(hash = %index_hash, "GET /metadata - collecting metadata");
 
     match store.exists(&index_hash).await {
@@ -532,33 +532,11 @@ async fn get_metadata(
         Err(err) => Err(ServerError::Internal(err.to_string())),
     }?;
 
-    let meta = collect_index_metadata(&store, &index_hash)
+    let meta = collect_tree_metadata(&store, &index_hash)
         .await
         .map_err(|err| ServerError::Internal(err.to_string()))?;
 
-    let json = serde_json::json!({
-        "index_hash": meta.index_hash,
-        "tree_hash": meta.tree_hash,
-        "timestamp": meta.timestamp.to_rfc3339(),
-        "metadata": meta.metadata,
-        "files": meta.files.iter().map(|f| {
-            serde_json::json!({
-                "path": f.path,
-                "hash": f.hash,
-                "size": f.size,
-                "mode": f.mode.as_str(),
-            })
-        }).collect::<Vec<_>>(),
-        "objects": meta.objects.iter().map(|o| {
-            serde_json::json!({
-                "hash": o.hash,
-                "type": o.object_type.to_str(),
-                "size": o.size,
-            })
-        }).collect::<Vec<_>>(),
-    });
-
-    Ok(axum::Json(json))
+    Ok(axum::Json(meta))
 }
 
 /// Build the application router with the given store.
