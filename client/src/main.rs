@@ -106,9 +106,16 @@ fn build_tree_from_dir(
                 }).await??;
                 let size = data.len() as u64;
 
+                // Content-addressable: concurrent writes of the same hash are safe to ignore.
+                // The exists() check is a fast path to skip unnecessary writes.
                 if !store_clone.exists(&hash).await? {
                     let header = Header::new(ObjectType::Blob, size);
-                    store_clone.put_object_bytes(&hash, header, data).await?;
+                    if let Err(e) = store_clone.put_object_bytes(&hash, header, data).await {
+                        // If another task wrote the same object concurrently, that's fine
+                        if !store_clone.exists(&hash).await.unwrap_or(false) {
+                            return Err(e);
+                        }
+                    }
                 }
 
                 Ok::<_, anyhow::Error>((name, hash, size))
@@ -672,7 +679,11 @@ async fn unpack_archive(store: &Store, path: &Path) -> anyhow::Result<()> {
             let (obj_header, body) = read_header_and_body(&raw)
                 .ok_or_else(|| anyhow::anyhow!("failed to parse header for object {}", hash))?;
 
-            store_clone.put_object_bytes(&hash, obj_header, body.to_vec()).await?;
+            if let Err(e) = store_clone.put_object_bytes(&hash, obj_header, body.to_vec()).await {
+                if !store_clone.exists(&hash).await.unwrap_or(false) {
+                    return Err(e);
+                }
+            }
 
             Ok(())
         });
