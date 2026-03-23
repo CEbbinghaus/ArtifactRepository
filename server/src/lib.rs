@@ -9,7 +9,7 @@ use async_zip::{Compression as ZipCompression, ZipEntryBuilder};
 use axum::{
     body::{Body, Bytes},
     debug_handler,
-    extract::{Path as AxumPath, Query, Request, State},
+    extract::{DefaultBodyLimit, Path as AxumPath, Query, Request, State},
     http::{HeaderMap, Response, StatusCode},
     routing::{get, post, put},
     Router,
@@ -665,5 +665,6 @@ pub fn create_router(store: Store) -> Router {
         .route("/metadata/{index_hash}", get(get_metadata))
         .route("/upload", post(upload_archive))
         .route("/missing", post(check_missing))
+        .layer(DefaultBodyLimit::disable())
         .with_state(ServerState { store })
 }
