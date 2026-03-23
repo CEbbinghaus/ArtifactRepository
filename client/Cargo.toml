@@ -3,7 +3,11 @@ name = "client"
 version = "0.1.0"
 edition = "2021"
 
+[features]
+cow = ["dep:reflink-copy"]
+
 [dependencies]
+reflink-copy = { version = "0.1", optional = true }
 common = { path = "../common" }
 anyhow = { workspace = true }
 chrono = { workspace = true }

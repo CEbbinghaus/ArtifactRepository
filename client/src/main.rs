@@ -234,7 +234,9 @@ async fn restore_directory(store: &Store, path: &Path, index_hash: Hash, validat
 
     let tree = read_tree_from_store(store, &index.tree).await?;
 
-    write_tree_to_path(store, &tree, path).await?;
+    #[allow(clippy::mutable_key_type)]
+    let written_files = Arc::new(tokio::sync::Mutex::new(HashMap::<Hash, PathBuf>::new()));
+    write_tree_to_path(store, &tree, path, written_files).await?;
 
     if validate {
         validate_tree_at_path(store, &tree, path).await?;
@@ -280,10 +282,14 @@ fn write_tree_to_path<'a>(
     store: &'a Store,
     tree: &'a object_body::Tree,
     path: &'a Path,
+    written_files: Arc<tokio::sync::Mutex<HashMap<Hash, PathBuf>>>,
 ) -> std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<()>> + Send + 'a>> {
     Box::pin(async move {
         let semaphore = Arc::new(tokio::sync::Semaphore::new(64));
         let mut blob_set = JoinSet::new();
+
+        #[cfg(feature = "cow")]
+        let mut deferred_reflinks: Vec<(PathBuf, PathBuf, bool)> = Vec::new();
 
         for entry in &tree.contents {
             let entry_path = path.join(&entry.path);
@@ -292,12 +298,24 @@ fn write_tree_to_path<'a>(
                 Mode::Tree => {
                     create_dir(&entry_path).await.context("failed to create directory")?;
                     let subtree = read_tree_from_store(store, &entry.hash).await?;
-                    write_tree_to_path(store, &subtree, &entry_path).await?;
+                    write_tree_to_path(store, &subtree, &entry_path, written_files.clone()).await?;
                 }
                 Mode::Normal | Mode::Executable => {
+                    let is_executable = entry.mode == Mode::Executable;
+
+                    // When CoW is enabled, reuse already-written files via reflink
+                    #[cfg(feature = "cow")]
+                    {
+                        let mut map = written_files.lock().await;
+                        if let Some(source_path) = map.get(&entry.hash) {
+                            deferred_reflinks.push((source_path.clone(), entry_path, is_executable));
+                            continue;
+                        }
+                        map.insert(entry.hash.clone(), entry_path.clone());
+                    }
+
                     let store_clone = store.clone();
                     let hash = entry.hash.clone();
-                    let is_executable = entry.mode == Mode::Executable;
                     let sem = semaphore.clone();
                     blob_set.spawn(async move {
                         let _permit = sem.acquire().await
@@ -325,6 +343,26 @@ fn write_tree_to_path<'a>(
 
         while let Some(result) = blob_set.join_next().await {
             result??;
+        }
+
+        // Phase 2: reflink (or copy) deferred duplicate files
+        #[cfg(feature = "cow")]
+        for (source, dest, is_exec) in deferred_reflinks {
+            tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+                reflink_copy::reflink_or_copy(&source, &dest)
+                    .context(format!("failed to reflink {:?} -> {:?}", source, dest))?;
+                if is_exec {
+                    set_executable(&dest)?;
+                } else {
+                    // Source may have been executable; ensure correct permissions
+                    #[cfg(unix)]
+                    {
+                        use std::os::unix::fs::PermissionsExt;
+                        std::fs::set_permissions(&dest, std::fs::Permissions::from_mode(0o644))?;
+                    }
+                }
+                Ok(())
+            }).await??;
         }
 
         Ok(())
@@ -764,7 +802,9 @@ async fn extract_archive(file: &Path, directory: &Path) -> anyhow::Result<()> {
 
     let root_tree_hash = archive.index.tree;
     let data_map = Arc::new(data_map);
-    let file_count = extract_tree(&data_map, &root_tree_hash, directory).await?;
+    #[allow(clippy::mutable_key_type)]
+    let written_files = Arc::new(tokio::sync::Mutex::new(HashMap::<Hash, PathBuf>::new()));
+    let file_count = extract_tree(&data_map, &root_tree_hash, directory, written_files).await?;
 
     tracing::info!("Extracted {} files to {:?}", file_count, directory);
 
@@ -776,6 +816,7 @@ fn extract_tree<'a>(
     data_map: &'a Arc<HashMap<Hash, Vec<u8>>>,
     tree_hash: &'a Hash,
     path: &'a Path,
+    written_files: Arc<tokio::sync::Mutex<HashMap<Hash, PathBuf>>>,
 ) -> std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<usize>> + Send + 'a>> {
     Box::pin(async move {
         let raw_data = data_map.get(tree_hash)
@@ -790,6 +831,9 @@ fn extract_tree<'a>(
         let mut set = JoinSet::new();
         let mut file_count: usize = 0;
 
+        #[cfg(feature = "cow")]
+        let mut deferred_reflinks: Vec<(PathBuf, PathBuf, bool)> = Vec::new();
+
         for entry in tree.contents {
             let entry_path = path.join(&entry.path);
 
@@ -797,13 +841,24 @@ fn extract_tree<'a>(
                 Mode::Tree => {
                     create_dir(&entry_path).await
                         .context(format!("failed to create directory {:?}", entry_path))?;
-                    file_count += extract_tree(data_map, &entry.hash, &entry_path).await?;
+                    file_count += extract_tree(data_map, &entry.hash, &entry_path, written_files.clone()).await?;
                 }
                 Mode::Normal | Mode::Executable => {
                     file_count += 1;
+                    let is_executable = entry.mode == Mode::Executable;
+
+                    #[cfg(feature = "cow")]
+                    {
+                        let mut map = written_files.lock().await;
+                        if let Some(source_path) = map.get(&entry.hash) {
+                            deferred_reflinks.push((source_path.clone(), entry_path, is_executable));
+                            continue;
+                        }
+                        map.insert(entry.hash.clone(), entry_path.clone());
+                    }
+
                     let dm = data_map.clone();
                     let sem = semaphore.clone();
-                    let is_executable = entry.mode == Mode::Executable;
                     set.spawn(async move {
                         let _permit = sem.acquire().await
                             .map_err(|e| anyhow::anyhow!("semaphore: {e}"))?;
@@ -836,6 +891,24 @@ fn extract_tree<'a>(
 
         while let Some(result) = set.join_next().await {
             result??;
+        }
+
+        #[cfg(feature = "cow")]
+        for (source, dest, is_exec) in deferred_reflinks {
+            tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+                reflink_copy::reflink_or_copy(&source, &dest)
+                    .context(format!("failed to reflink {:?} -> {:?}", source, dest))?;
+                if is_exec {
+                    set_executable(&dest)?;
+                } else {
+                    #[cfg(unix)]
+                    {
+                        use std::os::unix::fs::PermissionsExt;
+                        std::fs::set_permissions(&dest, std::fs::Permissions::from_mode(0o644))?;
+                    }
+                }
+                Ok(())
+            }).await??;
         }
 
         Ok(file_count)
