@@ -21,6 +21,36 @@ use tokio::{
     task::JoinSet,
 };
 
+/// Detect whether a file has any executable bit set (Unix only).
+/// Returns Mode::Executable if so, Mode::Normal otherwise.
+fn detect_file_mode(path: &Path) -> Mode {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if let Ok(meta) = std::fs::metadata(path) {
+            if meta.permissions().mode() & 0o111 != 0 {
+                return Mode::Executable;
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    { let _ = path; }
+    Mode::Normal
+}
+
+/// Set executable permissions on a file (Unix only, no-op elsewhere).
+#[cfg(unix)]
+fn set_executable(path: &Path) -> std::io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    let perms = std::fs::Permissions::from_mode(0o755);
+    std::fs::set_permissions(path, perms)
+}
+
+#[cfg(not(unix))]
+fn set_executable(_path: &Path) -> std::io::Result<()> {
+    Ok(())
+}
+
 // Helper to build Index from filesystem
 async fn build_index_from_path(store: &Store, path: &Path) -> anyhow::Result<(object_body::Index, Hash, u128)> {
     anyhow::ensure!(path.is_dir(), "path must be a directory");
@@ -96,12 +126,13 @@ fn build_tree_from_dir(
                     .ok_or_else(|| anyhow::anyhow!("invalid file name: {}", file_path.display()))?
                     .to_string();
 
-                let (data, hash) = tokio::task::spawn_blocking({
+                let (data, hash, file_mode) = tokio::task::spawn_blocking({
                     let path = file_path.clone();
-                    move || -> anyhow::Result<(Vec<u8>, Hash)> {
+                    move || -> anyhow::Result<(Vec<u8>, Hash, Mode)> {
+                        let file_mode = detect_file_mode(&path);
                         let data = std::fs::read(&path)?;
                         let hash = compute_hash(BLOB_KEY, &data);
-                        Ok((data, hash))
+                        Ok((data, hash, file_mode))
                     }
                 }).await??;
                 let size = data.len() as u64;
@@ -118,7 +149,7 @@ fn build_tree_from_dir(
                     }
                 }
 
-                Ok::<_, anyhow::Error>((name, hash, size))
+                Ok::<_, anyhow::Error>((name, hash, size, file_mode))
             });
         }
 
@@ -135,10 +166,10 @@ fn build_tree_from_dir(
 
         // Collect file results
         while let Some(result) = file_set.join_next().await {
-            let (name, hash, size) = result??;
+            let (name, hash, size, file_mode) = result??;
             total_size += size as u128;
             entries.push(object_body::TreeEntry {
-                mode: Mode::Normal,
+                mode: file_mode,
                 path: name,
                 hash,
             });
@@ -256,17 +287,17 @@ fn write_tree_to_path<'a>(
 
         for entry in &tree.contents {
             let entry_path = path.join(&entry.path);
-            let header = store.get_object(&entry.hash).await?.header;
 
-            match header.object_type {
-                ObjectType::Tree => {
+            match entry.mode {
+                Mode::Tree => {
                     create_dir(&entry_path).await.context("failed to create directory")?;
                     let subtree = read_tree_from_store(store, &entry.hash).await?;
                     write_tree_to_path(store, &subtree, &entry_path).await?;
                 }
-                ObjectType::Blob => {
+                Mode::Normal | Mode::Executable => {
                     let store_clone = store.clone();
                     let hash = entry.hash.clone();
+                    let is_executable = entry.mode == Mode::Executable;
                     let sem = semaphore.clone();
                     blob_set.spawn(async move {
                         let _permit = sem.acquire().await
@@ -280,11 +311,15 @@ fn write_tree_to_path<'a>(
                         tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
                             std::fs::write(&path, &data)
                                 .context(format!("failed to write file {:?}", path))?;
+                            if is_executable {
+                                set_executable(&path)
+                                    .context(format!("failed to set executable permissions on {:?}", path))?;
+                            }
                             Ok(())
                         }).await?
                     });
                 }
-                ObjectType::Index => anyhow::bail!("invalid object type in tree"),
+                _ => anyhow::bail!("unsupported mode {} for entry {}", entry.mode.as_str(), entry.path),
             }
         }
 
@@ -768,6 +803,7 @@ fn extract_tree<'a>(
                     file_count += 1;
                     let dm = data_map.clone();
                     let sem = semaphore.clone();
+                    let is_executable = entry.mode == Mode::Executable;
                     set.spawn(async move {
                         let _permit = sem.acquire().await
                             .map_err(|e| anyhow::anyhow!("semaphore: {e}"))?;
@@ -780,6 +816,14 @@ fn extract_tree<'a>(
 
                         tokio::fs::write(&entry_path, blob_body).await
                             .context(format!("failed to write file {:?}", entry_path))?;
+
+                        if is_executable {
+                            tokio::task::spawn_blocking({
+                                let path = entry_path.clone();
+                                move || set_executable(&path)
+                            }).await?
+                                .context(format!("failed to set executable permissions on {:?}", entry_path))?;
+                        }
 
                         Ok::<_, anyhow::Error>(())
                     });
@@ -847,12 +891,13 @@ fn archive_build_tree(
                     .ok_or_else(|| anyhow::anyhow!("invalid file name: {}", file_path.display()))?
                     .to_string();
 
-                let (data, hash) = tokio::task::spawn_blocking({
+                let (data, hash, file_mode) = tokio::task::spawn_blocking({
                     let path = file_path.clone();
-                    move || -> anyhow::Result<(Vec<u8>, Hash)> {
+                    move || -> anyhow::Result<(Vec<u8>, Hash, Mode)> {
+                        let file_mode = detect_file_mode(&path);
                         let data = std::fs::read(&path)?;
                         let hash = compute_hash(BLOB_KEY, &data);
-                        Ok((data, hash))
+                        Ok((data, hash, file_mode))
                     }
                 }).await??;
 
@@ -868,7 +913,7 @@ fn archive_build_tree(
                     }
                 }
 
-                Ok::<_, anyhow::Error>((name, hash))
+                Ok::<_, anyhow::Error>((name, hash, file_mode))
             });
         }
 
@@ -884,9 +929,9 @@ fn archive_build_tree(
 
         // Collect file results
         while let Some(result) = file_set.join_next().await {
-            let (name, hash) = result??;
+            let (name, hash, file_mode) = result??;
             entries.push(object_body::TreeEntry {
-                mode: Mode::Normal,
+                mode: file_mode,
                 path: name,
                 hash,
             });
