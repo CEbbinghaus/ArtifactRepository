@@ -115,7 +115,7 @@ async fn put_object(
     headers: HeaderMap,
     request: Request<Body>,
 ) -> Result<StatusCode, ServerError> {
-    tracing::debug!(hash = %object_hash, "PUT /object - storing object");
+    tracing::debug!(hash = %object_hash, "PUT /v1/object - storing object");
     match store.exists(&object_hash).await {
         Ok(false) => Ok(()),
         Ok(true) => Err(ServerError::AlreadyExists("object already exists".into())),
@@ -166,7 +166,7 @@ async fn get_object(
     AxumPath(object_hash): AxumPath<Hash>,
     State(ServerState { store }): State<ServerState>,
 ) -> Result<Response<Body>, ServerError> {
-    tracing::debug!(hash = %object_hash, "GET /object - retrieving object");
+    tracing::debug!(hash = %object_hash, "GET /v1/object - retrieving object");
 
     match store.exists(&object_hash).await {
         Ok(true) => Ok(()),
@@ -346,7 +346,7 @@ async fn get_archive(
         None => Compression::Zstd,
     };
 
-    tracing::info!(hash = %index_hash, compression = ?compression, "GET /archive - streaming archive");
+    tracing::info!(hash = %index_hash, compression = ?compression, "GET /v1/archive - streaming archive");
 
     let index = read_index_from_store(&store, &index_hash).await?;
 
@@ -395,7 +395,7 @@ async fn get_supplemental(
     State(ServerState { store }): State<ServerState>,
     axum::Json(request): axum::Json<SupplementalRequest>,
 ) -> Result<Response<Body>, ServerError> {
-    tracing::info!(hash = %index_hash, requested_hashes = request.hashes.len(), "POST /supplemental - streaming");
+    tracing::info!(hash = %index_hash, requested_hashes = request.hashes.len(), "POST /v1/archive/supplemental - streaming");
 
     let compression = match query.compression.as_deref() {
         Some(s) => s
@@ -528,7 +528,7 @@ async fn get_zip(
     AxumPath(index_hash): AxumPath<Hash>,
     State(ServerState { store }): State<ServerState>,
 ) -> Result<Response<Body>, ServerError> {
-    tracing::info!(hash = %index_hash, "GET /zip - streaming zip");
+    tracing::info!(hash = %index_hash, "GET /v1/zip - streaming zip");
 
     let index = read_index_from_store(&store, &index_hash).await?;
     let tree_hash = index.tree.clone();
@@ -569,7 +569,7 @@ async fn upload_archive(
     State(ServerState { store }): State<ServerState>,
     body: Bytes,
 ) -> Result<String, ServerError> {
-    tracing::info!(bytes = body.len(), "POST /upload - receiving archive");
+    tracing::info!(bytes = body.len(), "POST /v1/archive/upload - receiving archive");
 
     let archive = Archive::<RawEntryData>::from_data(&mut std::io::Cursor::new(&body))
         .map_err(|err| ServerError::BadRequest(format!("invalid archive: {}", err)))?;
@@ -600,7 +600,7 @@ async fn upload_archive(
         added += 1;
     }
 
-    tracing::info!(added = added, skipped = skipped, "POST /upload - complete");
+    tracing::info!(added = added, skipped = skipped, "POST /v1/archive/upload - complete");
 
     Ok(format!("Added {} objects, skipped {}", added, skipped))
 }
@@ -619,7 +619,7 @@ async fn check_missing(
     State(ServerState { store }): State<ServerState>,
     axum::Json(request): axum::Json<MissingRequest>,
 ) -> Result<axum::Json<MissingResponse>, ServerError> {
-    tracing::debug!(requested = request.hashes.len(), "POST /missing - checking hashes");
+    tracing::debug!(requested = request.hashes.len(), "POST /v1/object/missing - checking hashes");
 
     let mut missing = Vec::new();
     for hash in request.hashes {
@@ -629,7 +629,7 @@ async fn check_missing(
         }
     }
 
-    tracing::debug!(missing = missing.len(), "POST /missing - result");
+    tracing::debug!(missing = missing.len(), "POST /v1/object/missing - result");
 
     Ok(axum::Json(MissingResponse { missing }))
 }
@@ -639,7 +639,7 @@ async fn get_metadata(
     AxumPath(index_hash): AxumPath<Hash>,
     State(ServerState { store }): State<ServerState>,
 ) -> Result<axum::Json<common::TreeMetadata>, ServerError> {
-    tracing::debug!(hash = %index_hash, "GET /metadata - collecting metadata");
+    tracing::debug!(hash = %index_hash, "GET /v1/index/metadata - collecting metadata");
 
     match store.exists(&index_hash).await {
         Ok(true) => Ok(()),
@@ -657,14 +657,16 @@ async fn get_metadata(
 /// Build the application router with the given store.
 pub fn create_router(store: Store) -> Router {
     Router::new()
-        .route("/object/{object_id}", put(put_object))
-        .route("/object/{object_id}", get(get_object))
-        .route("/archive/{index_hash}", get(get_archive))
-        .route("/supplemental/{index_hash}", post(get_supplemental))
-        .route("/zip/{index_hash}", get(get_zip))
-        .route("/metadata/{index_hash}", get(get_metadata))
-        .route("/upload", post(upload_archive))
-        .route("/missing", post(check_missing))
+        // V1 API (spec-defined endpoints)
+        .route("/v1/object/{object_id}", put(put_object))
+        .route("/v1/object/{object_id}", get(get_object))
+        .route("/v1/object/missing", post(check_missing))
+        .route("/v1/archive/{index_hash}", get(get_archive))
+        .route("/v1/archive/{index_hash}/supplemental", post(get_supplemental))
+        .route("/v1/archive/upload", post(upload_archive))
+        .route("/v1/index/{index_hash}/metadata", get(get_metadata))
+        // Non-spec convenience endpoints
+        .route("/v1/zip/{index_hash}", get(get_zip))
         .layer(DefaultBodyLimit::disable())
         .with_state(ServerState { store })
 }

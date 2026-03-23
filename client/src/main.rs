@@ -387,7 +387,7 @@ async fn upload_object(hash: &Hash, raw_bytes: &[u8], url: &str) -> anyhow::Resu
         .context("invalid object header")?;
     let body = &raw_bytes[(null_pos + 1)..];
 
-    let url = format!("{url}/object/{hash}");
+    let url = format!("{url}/v1/object/{hash}");
 
     tracing::debug!("Sending PUT request to {url}");
 
@@ -411,7 +411,7 @@ async fn download_object(store: &Store, hash: &Hash, url: &str) -> anyhow::Resul
         return Ok(store_obj.header);
     }
 
-    let url = format!("{url}/object/{hash}");
+    let url = format!("{url}/v1/object/{hash}");
 
     tracing::debug!("Sending GET request to {url}");
 
@@ -553,7 +553,7 @@ async fn push_archive(store: &Store, url: &str, index_hash: &Hash, compression: 
         missing: Vec<Hash>,
     }
 
-    let missing_url = format!("{url}/missing");
+    let missing_url = format!("{url}/v1/object/missing");
     let missing_resp: MissingResponse = ureq::post(&missing_url)
         .send_json(&MissingRequest { hashes: all_hashes })
         .context("failed to query missing objects")?
@@ -620,8 +620,8 @@ async fn push_archive(store: &Store, url: &str, index_hash: &Hash, compression: 
     archive.to_data(&mut buf)?;
     let total_bytes = buf.len();
 
-    // 8. POST the archive to /upload
-    let upload_url = format!("{url}/upload");
+    // 8. POST the archive to /v1/archive/upload
+    let upload_url = format!("{url}/v1/archive/upload");
     let response_text = ureq::post(&upload_url)
         .header("Content-Type", "application/octet-stream")
         .send(&buf[..])

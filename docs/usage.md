@@ -162,7 +162,9 @@ The server binds to `0.0.0.0:<port>` and prints the listen address.
 
 ### API
 
-#### PUT /object/{hash}
+All V1 endpoints are prefixed with `/v1/`. See [docs/rfc-v1-api.md](rfc-v1-api.md) for the full protocol specification and [docs/openapi-v1.yaml](openapi-v1.yaml) for the OpenAPI schema.
+
+#### PUT /v1/object/{hash}
 
 Store an object.
 
@@ -173,10 +175,10 @@ Store an object.
 
 **Responses:**
 - `201 Created` — stored successfully
-- `200 OK` — object already exists (idempotent)
+- `200 OK` — object already exists (idempotent, see [Idempotent PUT Semantics](store-format.md))
 - `400 Bad Request` — missing or invalid headers
 
-#### GET /object/{hash}
+#### GET /v1/object/{hash}
 
 Retrieve an object.
 
@@ -187,25 +189,7 @@ Retrieve an object.
 
 Transport compression (gzip, zstd, brotli, deflate) is negotiated via standard `Accept-Encoding` headers.
 
-#### GET /metadata/{index_hash}
-
-Returns JSON metadata about an index.
-
-**Response (`200 OK`):**
-```json
-{
-  "files": [
-    {"path": "src/main.rs", "hash": "...", "size": 1234, "mode": 33188}
-  ],
-  "objects": [
-    {"hash": "...", "type": "blob", "size": 1234}
-  ]
-}
-```
-
-- `404 Not Found` — index does not exist
-
-#### POST /missing
+#### POST /v1/object/missing
 
 Determine which objects the server does not have.
 
@@ -219,18 +203,18 @@ Determine which objects the server does not have.
 {"missing": ["ccdd..."]}
 ```
 
-#### POST /upload
+#### GET /v1/archive/{index_hash}
 
-Accept an `.arx` or `.sar` archive body. Unpacks all objects into the server's store, skipping duplicates.
+Download a complete `.arx` archive containing all objects reachable from the index.
 
-**Request:**
-- Body: raw archive bytes
+**Query parameters:**
+- `compression`: `none`, `gzip`, `deflate`, `lzma2`, `zstd` (default: `zstd`)
 
-**Responses:**
-- `200 OK` — objects unpacked successfully
-- `400 Bad Request` — invalid archive
+**Response:**
+- `200 OK` — body is the `.arx` archive (streamed)
+- `404 Not Found` — index does not exist
 
-#### POST /supplemental/{index_hash}
+#### POST /v1/archive/{index_hash}/supplemental
 
 Build and return a `.sar` file containing only the requested objects (plus all tree objects and the index).
 
@@ -239,6 +223,45 @@ Build and return a `.sar` file containing only the requested objects (plus all t
 {"hashes": ["aabb...", "ccdd..."]}
 ```
 
+**Query parameters:**
+- `compression`: `none`, `gzip`, `deflate`, `lzma2`, `zstd` (default: `zstd`)
+
 **Response:**
 - `200 OK` — body is the `.sar` archive (streamed)
 - `404 Not Found` — index does not exist
+
+#### POST /v1/archive/upload
+
+Accept an `.arx` or `.sar` archive body. Unpacks all objects into the server's store, skipping duplicates.
+
+**Request:**
+- Body: raw archive bytes
+
+**Responses:**
+- `200 OK` — `"Added N objects, skipped M"`
+- `400 Bad Request` — invalid archive
+
+#### GET /v1/index/{index_hash}/metadata
+
+Returns JSON metadata about an index and its full tree structure.
+
+**Response (`200 OK`):**
+```json
+{
+  "index": {
+    "hash": "...", "tree": "...",
+    "timestamp": "2025-01-15T12:00:00Z",
+    "metadata": {}
+  },
+  "objects": {
+    "hash...": {"type": "blob", "size": 1234},
+    "hash...": {"type": "tree", "entries": {"file.txt": {"mode": "100644", "hash": "..."}}}
+  }
+}
+```
+
+- `404 Not Found` — index does not exist
+
+#### GET /v1/zip/{index_hash} *(non-spec)*
+
+Download the tree contents as a standard `.zip` file. This endpoint is provided for convenience but is not part of the V1 specification.

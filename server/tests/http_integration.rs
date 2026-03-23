@@ -18,7 +18,7 @@ fn make_store(dir: &TempDir) -> Store {
 fn put_request(hash_str: &str, body: &[u8], object_type: &str, object_size: u64) -> Request<Body> {
     Request::builder()
         .method("PUT")
-        .uri(format!("/object/{}", hash_str))
+        .uri(format!("/v1/object/{}", hash_str))
         .header("Object-Type", object_type)
         .header("Object-Size", object_size.to_string())
         .body(Body::from(body.to_vec()))
@@ -28,7 +28,7 @@ fn put_request(hash_str: &str, body: &[u8], object_type: &str, object_size: u64)
 fn get_request(hash_str: &str) -> Request<Body> {
     Request::builder()
         .method("GET")
-        .uri(format!("/object/{}", hash_str))
+        .uri(format!("/v1/object/{}", hash_str))
         .body(Body::empty())
         .unwrap()
 }
@@ -114,7 +114,7 @@ async fn put_missing_object_type_header() {
 
     let req = Request::builder()
         .method("PUT")
-        .uri(format!("/object/{}", hash_str))
+        .uri(format!("/v1/object/{}", hash_str))
         .header("Object-Size", data.len().to_string())
         .body(Body::from(data.to_vec()))
         .unwrap();
@@ -134,7 +134,7 @@ async fn put_missing_object_size_header() {
 
     let req = Request::builder()
         .method("PUT")
-        .uri(format!("/object/{}", hash_str))
+        .uri(format!("/v1/object/{}", hash_str))
         .header("Object-Type", "blob")
         .body(Body::from(data.to_vec()))
         .unwrap();
@@ -154,7 +154,7 @@ async fn put_invalid_object_type() {
 
     let req = Request::builder()
         .method("PUT")
-        .uri(format!("/object/{}", hash_str))
+        .uri(format!("/v1/object/{}", hash_str))
         .header("Object-Type", "invalid")
         .header("Object-Size", data.len().to_string())
         .body(Body::from(data.to_vec()))
@@ -270,7 +270,7 @@ async fn get_archive_round_trip() {
 
     let req = Request::builder()
         .method("GET")
-        .uri(format!("/archive/{}", index_hash_str))
+        .uri(format!("/v1/archive/{}", index_hash_str))
         .body(Body::empty())
         .unwrap();
 
@@ -295,7 +295,7 @@ async fn get_archive_missing_index() {
     let fake_hash = compute_hash(INDEX_KEY, b"nonexistent");
     let req = Request::builder()
         .method("GET")
-        .uri(format!("/archive/{}", fake_hash.as_str()))
+        .uri(format!("/v1/archive/{}", fake_hash.as_str()))
         .body(Body::empty())
         .unwrap();
 
@@ -312,7 +312,7 @@ async fn get_zip_round_trip() {
 
     let req = Request::builder()
         .method("GET")
-        .uri(format!("/zip/{}", index_hash_str))
+        .uri(format!("/v1/zip/{}", index_hash_str))
         .body(Body::empty())
         .unwrap();
 
@@ -337,7 +337,7 @@ async fn get_zip_missing_index() {
     let fake_hash = compute_hash(INDEX_KEY, b"nonexistent");
     let req = Request::builder()
         .method("GET")
-        .uri(format!("/zip/{}", fake_hash.as_str()))
+        .uri(format!("/v1/zip/{}", fake_hash.as_str()))
         .body(Body::empty())
         .unwrap();
 
@@ -395,7 +395,7 @@ async fn get_metadata_returns_correct_json() {
     // GET /metadata/{index_hash}
     let req = Request::builder()
         .method("GET")
-        .uri(format!("/metadata/{}", index_hash.as_str()))
+        .uri(format!("/v1/index/{}/metadata", index_hash.as_str()))
         .body(Body::empty())
         .unwrap();
 
@@ -439,7 +439,7 @@ async fn get_metadata_missing_index_returns_404() {
     let fake_hash = compute_hash(INDEX_KEY, b"nonexistent");
     let req = Request::builder()
         .method("GET")
-        .uri(format!("/metadata/{}", fake_hash.as_str()))
+        .uri(format!("/v1/index/{}/metadata", fake_hash.as_str()))
         .body(Body::empty())
         .unwrap();
 
@@ -533,7 +533,7 @@ async fn upload_arx_and_verify_objects() {
     // POST the archive
     let req = Request::builder()
         .method("POST")
-        .uri("/upload")
+        .uri("/v1/archive/upload")
         .body(Body::from(archive_bytes))
         .unwrap();
 
@@ -568,7 +568,7 @@ async fn upload_sar_and_verify_objects() {
     // POST the archive with supplemental header
     let req = Request::builder()
         .method("POST")
-        .uri("/upload")
+        .uri("/v1/archive/upload")
         .body(Body::from(archive_bytes))
         .unwrap();
 
@@ -610,7 +610,7 @@ async fn upload_skips_existing_objects() {
 
     let req = Request::builder()
         .method("POST")
-        .uri("/upload")
+        .uri("/v1/archive/upload")
         .body(Body::from(archive_bytes))
         .unwrap();
 
@@ -649,7 +649,7 @@ async fn check_missing_returns_missing_hashes() {
     let body = serde_json::json!({"hashes": [hash_a.as_str(), hash_b.as_str(), hash_c.as_str()]});
     let req = Request::builder()
         .method("POST")
-        .uri("/missing")
+        .uri("/v1/object/missing")
         .header("content-type", "application/json")
         .body(Body::from(serde_json::to_vec(&body).unwrap()))
         .unwrap();
@@ -676,7 +676,7 @@ async fn check_missing_empty_request() {
     let body = serde_json::json!({"hashes": []});
     let req = Request::builder()
         .method("POST")
-        .uri("/missing")
+        .uri("/v1/object/missing")
         .header("content-type", "application/json")
         .body(Body::from(serde_json::to_vec(&body).unwrap()))
         .unwrap();
@@ -710,7 +710,7 @@ async fn check_missing_all_present() {
     let body = serde_json::json!({"hashes": [hash_a.as_str(), hash_b.as_str()]});
     let req = Request::builder()
         .method("POST")
-        .uri("/missing")
+        .uri("/v1/object/missing")
         .header("content-type", "application/json")
         .body(Body::from(serde_json::to_vec(&body).unwrap()))
         .unwrap();
@@ -790,7 +790,7 @@ async fn get_supplemental_returns_subset() {
     let body = serde_json::json!({ "hashes": [blob1_hash.as_str()] });
     let req = Request::builder()
         .method("POST")
-        .uri(format!("/supplemental/{}", index_hash.as_str()))
+        .uri(format!("/v1/archive/{}/supplemental", index_hash.as_str()))
         .header("content-type", "application/json")
         .body(Body::from(serde_json::to_vec(&body).unwrap()))
         .unwrap();
@@ -889,7 +889,7 @@ async fn get_supplemental_always_includes_trees() {
     let body = serde_json::json!({ "hashes": [] });
     let req = Request::builder()
         .method("POST")
-        .uri(format!("/supplemental/{}", index_hash.as_str()))
+        .uri(format!("/v1/archive/{}/supplemental", index_hash.as_str()))
         .header("content-type", "application/json")
         .body(Body::from(serde_json::to_vec(&body).unwrap()))
         .unwrap();
@@ -919,7 +919,7 @@ async fn get_supplemental_missing_index_returns_error() {
     let body = serde_json::json!({ "hashes": [] });
     let req = Request::builder()
         .method("POST")
-        .uri(format!("/supplemental/{}", fake_hash.as_str()))
+        .uri(format!("/v1/archive/{}/supplemental", fake_hash.as_str()))
         .header("content-type", "application/json")
         .body(Body::from(serde_json::to_vec(&body).unwrap()))
         .unwrap();

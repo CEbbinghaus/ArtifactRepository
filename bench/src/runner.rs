@@ -584,14 +584,14 @@ pub fn run_all_benchmarks(config: &BenchConfig, manifest: &DataManifest) -> Benc
             print_run(0, elapsed);
         }
 
-        // 11. GET /archive
+        // 11. GET /v1/archive
         {
-            println!("  [bench] GET /archive...");
+            println!("  [bench] GET /v1/archive...");
             let dl_path = config.work_dir.join("server-dl.arx");
-            let url = format!("{}/archive/{}", server.url(), index_hash);
+            let url = format!("{}/v1/archive/{}", server.url(), index_hash);
             let elapsed = run_curl(&url, Some(&dl_path));
             steps.push(StepResult {
-                name: "GET /archive".into(),
+                name: "GET /v1/archive".into(),
                 timings: vec![elapsed],
                 input_bytes: ref_store_size,
                 output_bytes: Some(file_size(&dl_path)),
@@ -600,14 +600,14 @@ pub fn run_all_benchmarks(config: &BenchConfig, manifest: &DataManifest) -> Benc
             print_run(0, elapsed);
         }
 
-        // 12. GET /zip
+        // 12. GET /v1/zip
         {
-            println!("  [bench] GET /zip...");
+            println!("  [bench] GET /v1/zip...");
             let dl_path = config.work_dir.join("server-dl.zip");
-            let url = format!("{}/zip/{}", server.url(), index_hash);
+            let url = format!("{}/v1/zip/{}", server.url(), index_hash);
             let elapsed = run_curl(&url, Some(&dl_path));
             steps.push(StepResult {
-                name: "GET /zip".into(),
+                name: "GET /v1/zip".into(),
                 timings: vec![elapsed],
                 input_bytes: ref_store_size,
                 output_bytes: Some(file_size(&dl_path)),
@@ -616,13 +616,13 @@ pub fn run_all_benchmarks(config: &BenchConfig, manifest: &DataManifest) -> Benc
             print_run(0, elapsed);
         }
 
-        // 13. GET /metadata
+        // 13. GET /v1/index/metadata
         {
-            println!("  [bench] GET /metadata...");
-            let url = format!("{}/metadata/{}", server.url(), index_hash);
+            println!("  [bench] GET /v1/index/metadata...");
+            let url = format!("{}/v1/index/{}/metadata", server.url(), index_hash);
             let elapsed = run_curl(&url, None);
             steps.push(StepResult {
-                name: "GET /metadata".into(),
+                name: "GET /v1/index/metadata".into(),
                 timings: vec![elapsed],
                 input_bytes: 0,
                 output_bytes: None,
@@ -631,17 +631,17 @@ pub fn run_all_benchmarks(config: &BenchConfig, manifest: &DataManifest) -> Benc
             print_run(0, elapsed);
         }
 
-        // 14. POST /missing
+        // 14. POST /v1/object/missing
         {
-            println!("  [bench] POST /missing...");
+            println!("  [bench] POST /v1/object/missing...");
             let hashes = collect_store_hashes(&ref_store);
             let json = serde_json::json!({ "hashes": hashes });
             let json_path = config.work_dir.join("missing-req.json");
             std::fs::write(&json_path, json.to_string()).expect("cannot write json");
-            let url = format!("{}/missing", server.url());
+            let url = format!("{}/v1/object/missing", server.url());
             let elapsed = run_curl_post_json(&url, &json_path);
             steps.push(StepResult {
-                name: "POST /missing".into(),
+                name: "POST /v1/object/missing".into(),
                 timings: vec![elapsed],
                 input_bytes: file_size(&json_path),
                 output_bytes: None,
@@ -650,13 +650,13 @@ pub fn run_all_benchmarks(config: &BenchConfig, manifest: &DataManifest) -> Benc
             print_run(0, elapsed);
         }
 
-        // 15. POST /upload
+        // 15. POST /v1/archive/upload
         {
-            println!("  [bench] POST /upload...");
-            let url = format!("{}/upload", server.url());
+            println!("  [bench] POST /v1/archive/upload...");
+            let url = format!("{}/v1/archive/upload", server.url());
             let elapsed = run_curl_post_file(&url, &archive_path);
             steps.push(StepResult {
-                name: "POST /upload".into(),
+                name: "POST /v1/archive/upload".into(),
                 timings: vec![elapsed],
                 input_bytes: file_size(&archive_path),
                 output_bytes: None,
