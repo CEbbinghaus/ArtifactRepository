@@ -48,6 +48,7 @@ Servers implementing this extension MUST advertise it in the `GET /v1/info` resp
     "oauth2": {
       "issuer": "https://auth.example.com/",
       "audience": "https://artifacts.example.com/",
+      "client_id": "artifact-repo-public-client",
       "scopes": {
         "read": "artifact:read",
         "write": "artifact:write"
@@ -67,10 +68,46 @@ Servers implementing this extension MUST advertise it in the `GET /v1/info` resp
 |-------|------|----------|-------------|
 | `issuer` | string (URL) | REQUIRED | The OIDC issuer URL. Clients fetch `{issuer}/.well-known/openid-configuration` for discovery. |
 | `audience` | string | REQUIRED | The expected `aud` claim in access tokens. Typically the server's base URL or a logical identifier. |
+| `client_id` | string | OPTIONAL | A pre-registered public OAuth 2.0 client ID for interactive flows (Authorization Code + PKCE, Device Authorization). See Section 2.3. |
 | `scopes.read` | string | REQUIRED | The OAuth 2.0 scope required for read operations. |
 | `scopes.write` | string | REQUIRED | The OAuth 2.0 scope required for write operations. |
 
 The `issuer` URL MUST NOT have a trailing path segment beyond what is necessary for the OIDC discovery document. Clients MUST be able to construct the discovery URL as `{issuer}/.well-known/openid-configuration`.
+
+### 2.3 Client Identity and Credential Provisioning
+
+OAuth 2.0 requires clients to identify themselves to the identity provider. How a client obtains its credentials depends on the grant type:
+
+**Interactive flows (Authorization Code + PKCE, Device Authorization):**
+
+The server SHOULD advertise a `client_id` in the oauth2 object. This is a **public client** ([RFC 6749 §2.1](https://datatracker.ietf.org/doc/html/rfc6749#section-2.1)) pre-registered with the identity provider by the server administrator. Public clients do not have a client secret — they rely on PKCE or device codes for security. This allows any user to authenticate interactively without needing credentials provisioned in advance.
+
+If no `client_id` is advertised, the client MUST obtain its own client registration from the identity provider through out-of-band means.
+
+**Machine-to-machine flows (Client Credentials Grant):**
+
+Client credentials (`client_id` + `client_secret` or private key) MUST be provisioned out-of-band. The server CANNOT advertise these because:
+
+1. Each M2M integration (CI pipeline, build agent, service account) SHOULD have its own unique client registration for auditing and revocation.
+2. Client secrets are confidential and cannot be exposed via a public endpoint.
+
+The typical provisioning workflow is:
+
+1. An administrator registers a client application in the identity provider (Entra ID, Keycloak, Okta, etc.).
+2. The administrator grants the client the appropriate scopes (`artifact:read`, `artifact:write`).
+3. The administrator provides the `client_id` and `client_secret` to the service that needs access (e.g., as CI/CD pipeline secrets).
+4. The service discovers all other parameters (issuer, audience, token endpoint, scopes) from `GET /v1/info`.
+
+**Summary of what is discovered vs. configured:**
+
+| Parameter | Interactive (Auth Code) | M2M (Client Credentials) |
+|-----------|------------------------|--------------------------|
+| Issuer | Discovered from `/v1/info` | Discovered from `/v1/info` |
+| Audience | Discovered from `/v1/info` | Discovered from `/v1/info` |
+| Scopes | Discovered from `/v1/info` | Discovered from `/v1/info` |
+| Token endpoint | Discovered from OIDC discovery | Discovered from OIDC discovery |
+| Client ID | Discovered from `/v1/info` | **Configured out-of-band** |
+| Client Secret | Not needed (public client + PKCE) | **Configured out-of-band** |
 
 ## 3. Token Format
 
@@ -264,11 +301,13 @@ When a server supports multiple identity providers, the `oauth2` field MAY be an
       {
         "issuer": "https://auth.example.com/",
         "audience": "https://artifacts.example.com/",
+        "client_id": "artifact-repo-public-client",
         "scopes": { "read": "artifact:read", "write": "artifact:write" }
       },
       {
         "issuer": "https://login.microsoftonline.com/{tenant}/v2.0",
         "audience": "api://artifact-repository",
+        "client_id": "a1b2c3d4-e5f6-7890-abcd-ef1234567890",
         "scopes": { "read": "Artifacts.Read", "write": "Artifacts.ReadWrite" }
       }
     ]
@@ -330,15 +369,23 @@ Error responses SHOULD include a JSON body for programmatic consumption:
 
 ### 8.1 Required Configuration
 
-Clients implementing this extension need the following configuration:
+**Interactive users (Authorization Code + PKCE, Device Authorization):**
 
-| Parameter | Description | Example |
-|-----------|-------------|---------|
-| Server URL | The ArtifactRepository server base URL | `https://artifacts.example.com` |
-| Client ID | OAuth 2.0 client identifier, registered with the identity provider | `artifact-ci-client` |
-| Client Secret or Key | Client authentication credential (secret, key file, or certificate) | `s3cr3t...` |
+| Parameter | Source | Description |
+|-----------|--------|-------------|
+| Server URL | User-provided | The ArtifactRepository server base URL |
 
-All other parameters (issuer, audience, scopes, token endpoint) are discovered automatically from `GET /v1/info` and the OIDC discovery document.
+All other parameters (issuer, audience, scopes, client_id, token endpoint) are discovered automatically from `GET /v1/info` and the OIDC discovery document. No credentials need to be configured — the user authenticates interactively via their browser or device code.
+
+**Machine-to-machine (Client Credentials Grant):**
+
+| Parameter | Source | Description |
+|-----------|--------|-------------|
+| Server URL | Configured | The ArtifactRepository server base URL |
+| Client ID | Configured (out-of-band) | OAuth 2.0 client identifier, registered with the identity provider |
+| Client Secret or Key | Configured (out-of-band) | Client authentication credential (secret, key file, or certificate) |
+
+All other parameters (issuer, audience, scopes, token endpoint) are discovered automatically.
 
 ### 8.2 Configuration Sources
 
