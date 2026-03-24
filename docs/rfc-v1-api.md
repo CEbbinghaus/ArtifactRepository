@@ -406,7 +406,9 @@ Returns metadata about the server, its capabilities, and supported extensions. C
 - `server.version` (string, required): Server implementation version (semver).
 - `extensions` (array of strings, required): List of supported extension identifiers. An empty array means no extensions. Defined extensions:
   - `"zip-content-addressing"` — Transparent zip file decomposition (see `rfc-v1-ext-zip.md`)
-- `authentication.methods` (array of strings, required): Supported authentication methods. An empty array means no authentication is required. Values are defined by future authentication RFCs.
+  - `"oauth2-bearer"` — OAuth 2.0 Bearer Token authentication (see `rfc-v1-ext-auth.md`)
+- `authentication.methods` (array of strings, required): Supported authentication methods. An empty array means no authentication is required. Defined methods:
+  - `"oauth2-bearer"` — OAuth 2.0 Bearer Token (see `rfc-v1-ext-auth.md`)
 - `capabilities.compression` (array of strings, required): Compression algorithms supported for archive endpoints.
 - `capabilities.max_object_size` (integer or null, required): Maximum object size in bytes the server will accept, or `null` for no limit.
 
