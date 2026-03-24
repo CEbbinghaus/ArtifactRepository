@@ -86,10 +86,14 @@ fn build_tree_from_dir(
         // Collect all entries first so we can process them concurrently
         let mut dir_paths = Vec::new();
         let mut file_paths = Vec::new();
+        let mut symlink_paths = Vec::new();
         while let Some(entry) = dir_entries.next_entry().await? {
             let entry_path = entry.path();
-            if entry.file_type().await?.is_dir() {
+            let file_type = entry.file_type().await?;
+            if file_type.is_dir() {
                 dir_paths.push(entry_path);
+            } else if file_type.is_symlink() {
+                symlink_paths.push(entry_path);
             } else {
                 file_paths.push(entry_path);
             }
@@ -153,6 +157,43 @@ fn build_tree_from_dir(
             });
         }
 
+        // Process symlinks concurrently
+        let mut symlink_set = JoinSet::new();
+        for symlink_path in symlink_paths {
+            let store_clone = store.clone();
+            let sem = semaphore.clone();
+            symlink_set.spawn(async move {
+                let _permit = sem.acquire().await
+                    .map_err(|e| anyhow::anyhow!("semaphore: {e}"))?;
+                let name = symlink_path.file_name()
+                    .and_then(|n| n.to_str())
+                    .ok_or_else(|| anyhow::anyhow!("invalid file name: {}", symlink_path.display()))?
+                    .to_string();
+
+                let (data, hash) = tokio::task::spawn_blocking({
+                    let path = symlink_path.clone();
+                    move || -> anyhow::Result<(Vec<u8>, Hash)> {
+                        let target = std::fs::read_link(&path)?;
+                        let target_bytes = target.as_os_str().as_encoded_bytes().to_vec();
+                        let hash = compute_hash(BLOB_KEY, &target_bytes);
+                        Ok((target_bytes, hash))
+                    }
+                }).await??;
+                let size = data.len() as u64;
+
+                if !store_clone.exists(&hash).await? {
+                    let header = Header::new(ObjectType::Blob, size);
+                    if let Err(e) = store_clone.put_object_bytes(&hash, header, data).await {
+                        if !store_clone.exists(&hash).await.unwrap_or(false) {
+                            return Err(e);
+                        }
+                    }
+                }
+
+                Ok::<_, anyhow::Error>((name, hash, size))
+            });
+        }
+
         // Collect directory results
         while let Some(result) = dir_set.join_next().await {
             let (name, hash, size) = result??;
@@ -170,6 +211,17 @@ fn build_tree_from_dir(
             total_size += size as u128;
             entries.push(object_body::TreeEntry {
                 mode: file_mode,
+                path: name,
+                hash,
+            });
+        }
+
+        // Collect symlink results
+        while let Some(result) = symlink_set.join_next().await {
+            let (name, hash, size) = result??;
+            total_size += size as u128;
+            entries.push(object_body::TreeEntry {
+                mode: Mode::SymbolicLink,
                 path: name,
                 hash,
             });
@@ -332,6 +384,36 @@ fn write_tree_to_path<'a>(
                             if is_executable {
                                 set_executable(&path)
                                     .context(format!("failed to set executable permissions on {:?}", path))?;
+                            }
+                            Ok(())
+                        }).await?
+                    });
+                }
+                Mode::SymbolicLink => {
+                    let store_clone = store.clone();
+                    let hash = entry.hash.clone();
+                    let sem = semaphore.clone();
+                    blob_set.spawn(async move {
+                        let _permit = sem.acquire().await
+                            .map_err(|e| anyhow::anyhow!("semaphore: {e}"))?;
+
+                        let mut store_obj = store_clone.get_object(&hash).await?;
+                        let mut data = Vec::with_capacity(store_obj.header.size as usize);
+                        store_obj.read_to_end(&mut data).await?;
+
+                        tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+                            #[cfg(unix)]
+                            {
+                                use std::os::unix::ffi::OsStrExt;
+                                let target = std::ffi::OsStr::from_bytes(&data);
+                                std::os::unix::fs::symlink(target, &entry_path)
+                                    .context(format!("failed to create symlink {:?}", entry_path))?;
+                            }
+                            #[cfg(not(unix))]
+                            {
+                                // Best-effort: write target path as a file on non-Unix
+                                std::fs::write(&entry_path, &data)
+                                    .context(format!("failed to write symlink placeholder {:?}", entry_path))?;
                             }
                             Ok(())
                         }).await?
@@ -883,6 +965,42 @@ fn extract_tree<'a>(
                         Ok::<_, anyhow::Error>(())
                     });
                 }
+                Mode::SymbolicLink => {
+                    file_count += 1;
+                    let dm = data_map.clone();
+                    let sem = semaphore.clone();
+                    set.spawn(async move {
+                        let _permit = sem.acquire().await
+                            .map_err(|e| anyhow::anyhow!("semaphore: {e}"))?;
+
+                        let raw = dm.get(&entry.hash)
+                            .ok_or_else(|| anyhow::anyhow!("blob hash {} not found in archive", entry.hash))?;
+
+                        let (_hdr, blob_body) = read_header_and_body(raw)
+                            .ok_or_else(|| anyhow::anyhow!("failed to parse header for blob {}", entry.hash))?;
+
+                        tokio::task::spawn_blocking({
+                            let data = blob_body.to_vec();
+                            move || -> anyhow::Result<()> {
+                                #[cfg(unix)]
+                                {
+                                    use std::os::unix::ffi::OsStrExt;
+                                    let target = std::ffi::OsStr::from_bytes(&data);
+                                    std::os::unix::fs::symlink(target, &entry_path)
+                                        .context(format!("failed to create symlink {:?}", entry_path))?;
+                                }
+                                #[cfg(not(unix))]
+                                {
+                                    std::fs::write(&entry_path, &data)
+                                        .context(format!("failed to write symlink placeholder {:?}", entry_path))?;
+                                }
+                                Ok(())
+                            }
+                        }).await??;
+
+                        Ok::<_, anyhow::Error>(())
+                    });
+                }
                 _ => {
                     anyhow::bail!("unsupported mode {} for entry {}", entry.mode.as_str(), entry.path);
                 }
@@ -925,10 +1043,14 @@ fn archive_build_tree(
 
         let mut dir_paths = Vec::new();
         let mut file_paths = Vec::new();
+        let mut symlink_paths = Vec::new();
         while let Some(entry) = dir_entries.next_entry().await? {
             let entry_path = entry.path();
-            if entry.file_type().await?.is_dir() {
+            let file_type = entry.file_type().await?;
+            if file_type.is_dir() {
                 dir_paths.push(entry_path);
+            } else if file_type.is_symlink() {
+                symlink_paths.push(entry_path);
             } else {
                 file_paths.push(entry_path);
             }
@@ -990,6 +1112,45 @@ fn archive_build_tree(
             });
         }
 
+        // Process symlinks concurrently
+        let mut symlink_set = JoinSet::new();
+        for symlink_path in symlink_paths {
+            let objects_clone = objects.clone();
+            let sem = semaphore.clone();
+            symlink_set.spawn(async move {
+                let _permit = sem.acquire().await
+                    .map_err(|e| anyhow::anyhow!("semaphore: {e}"))?;
+                let name = symlink_path.file_name()
+                    .and_then(|n| n.to_str())
+                    .ok_or_else(|| anyhow::anyhow!("invalid file name: {}", symlink_path.display()))?
+                    .to_string();
+
+                let (data, hash) = tokio::task::spawn_blocking({
+                    let path = symlink_path.clone();
+                    move || -> anyhow::Result<(Vec<u8>, Hash)> {
+                        let target = std::fs::read_link(&path)?;
+                        let target_bytes = target.as_os_str().as_encoded_bytes().to_vec();
+                        let hash = compute_hash(BLOB_KEY, &target_bytes);
+                        Ok((target_bytes, hash))
+                    }
+                }).await??;
+
+                {
+                    let mut map = objects_clone.lock().await;
+                    if !map.contains_key(&hash) {
+                        let header = Header::new(ObjectType::Blob, data.len() as u64);
+                        let prefix = header.to_string();
+                        let mut full_data = Vec::with_capacity(prefix.len() + data.len());
+                        full_data.extend_from_slice(prefix.as_bytes());
+                        full_data.extend(data);
+                        map.insert(hash.clone(), full_data);
+                    }
+                }
+
+                Ok::<_, anyhow::Error>((name, hash))
+            });
+        }
+
         // Collect directory results
         while let Some(result) = dir_set.join_next().await {
             let (name, hash) = result??;
@@ -1009,6 +1170,19 @@ fn archive_build_tree(
                 hash,
             });
         }
+
+        // Collect symlink results
+        while let Some(result) = symlink_set.join_next().await {
+            let (name, hash) = result??;
+            entries.push(object_body::TreeEntry {
+                mode: Mode::SymbolicLink,
+                path: name,
+                hash,
+            });
+        }
+
+        // Sort entries by name for deterministic tree hashes
+        entries.sort_by(|a, b| a.path.cmp(&b.path));
 
         // Build tree
         let tree = object_body::Tree { contents: entries };
