@@ -285,11 +285,9 @@ Servers MUST cache the OIDC discovery document and JWKS to avoid per-request HTT
 
 A server MAY support multiple OIDC issuers simultaneously. When multiple issuers are configured:
 
-- The `GET /v1/info` response SHOULD include all issuers (see Section 2.3).
+- The `GET /v1/info` response SHOULD include all issuers.
 - The server determines which issuer to validate against by inspecting the `iss` claim in the JWT.
 - Each issuer has its own audience, JWKS, and configuration.
-
-### 2.3 Multiple Issuers in Server Info
 
 When a server supports multiple identity providers, the `oauth2` field MAY be an array:
 
