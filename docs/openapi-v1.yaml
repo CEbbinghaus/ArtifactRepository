@@ -12,6 +12,22 @@ servers:
     description: Local development server
 
 paths:
+  /v1/info:
+    get:
+      operationId: getServerInfo
+      summary: Get server information and capabilities
+      description: |
+        Returns metadata about the server, supported extensions, authentication
+        methods, and capabilities. Clients SHOULD call this before other operations
+        to discover available features. This endpoint never requires authentication.
+      responses:
+        "200":
+          description: Server information
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ServerInfo"
+
   /v1/object/{hash}:
     put:
       operationId: putObject
@@ -431,12 +447,67 @@ components:
       properties:
         mode:
           type: string
-          enum: ["040000", "100644", "100755", "120000"]
+          enum: ["040000", "100644", "100755", "100646", "120000"]
           description: |
             File mode:
             - 040000: Directory
             - 100644: Regular file
             - 100755: Executable
+            - 100646: Zip archive (content-addressed, requires zip-content-addressing extension)
             - 120000: Symbolic link
         hash:
           $ref: "#/components/schemas/Hash"
+
+    ServerInfo:
+      type: object
+      required: [spec_version, server, extensions, authentication, capabilities]
+      properties:
+        spec_version:
+          type: string
+          description: V1 specification version (semver)
+          example: "1.0.0"
+        server:
+          type: object
+          required: [name, version]
+          properties:
+            name:
+              type: string
+              description: Server implementation name
+              example: "ArtifactRepository"
+            version:
+              type: string
+              description: Server implementation version (semver)
+              example: "0.1.0"
+        extensions:
+          type: array
+          items:
+            type: string
+          description: |
+            Supported extension identifiers. Known extensions:
+            - "zip-content-addressing": Transparent zip decomposition
+          example: ["zip-content-addressing"]
+        authentication:
+          type: object
+          required: [methods]
+          properties:
+            methods:
+              type: array
+              items:
+                type: string
+              description: Supported authentication methods (defined by future RFCs)
+              example: []
+        capabilities:
+          type: object
+          required: [compression, max_object_size]
+          properties:
+            compression:
+              type: array
+              items:
+                type: string
+                enum: [none, gzip, deflate, lzma2, zstd]
+              description: Supported compression algorithms
+            max_object_size:
+              type: integer
+              format: uint64
+              nullable: true
+              description: Maximum object size in bytes, or null for no limit

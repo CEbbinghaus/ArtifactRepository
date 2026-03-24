@@ -370,6 +370,56 @@ Returns JSON metadata describing the full tree structure referenced by an index,
 | 404 Not Found | Index object does not exist |
 | 500 Internal Server Error | Storage failure |
 
+### 3.8 Server Information
+
+```
+GET /v1/info
+```
+
+Returns metadata about the server, its capabilities, and supported extensions. Clients SHOULD call this endpoint before other operations to discover what features are available.
+
+**Response Body (JSON):**
+```json
+{
+  "spec_version": "1.0.0",
+  "server": {
+    "name": "ArtifactRepository",
+    "version": "0.1.0"
+  },
+  "extensions": [
+    "zip-content-addressing"
+  ],
+  "authentication": {
+    "methods": []
+  },
+  "capabilities": {
+    "compression": ["none", "gzip", "deflate", "lzma2", "zstd"],
+    "max_object_size": null
+  }
+}
+```
+
+**Fields:**
+
+- `spec_version` (string, required): The V1 specification version the server implements (semver).
+- `server.name` (string, required): Human-readable server implementation name.
+- `server.version` (string, required): Server implementation version (semver).
+- `extensions` (array of strings, required): List of supported extension identifiers. An empty array means no extensions. Defined extensions:
+  - `"zip-content-addressing"` — Transparent zip file decomposition (see `rfc-v1-ext-zip.md`)
+- `authentication.methods` (array of strings, required): Supported authentication methods. An empty array means no authentication is required. Values are defined by future authentication RFCs.
+- `capabilities.compression` (array of strings, required): Compression algorithms supported for archive endpoints.
+- `capabilities.max_object_size` (integer or null, required): Maximum object size in bytes the server will accept, or `null` for no limit.
+
+Servers MAY include additional fields in the response. Clients MUST ignore fields they do not recognize.
+
+**Responses:**
+
+| Status | Description |
+|--------|-------------|
+| 200 OK | Server information returned |
+
+This endpoint MUST NOT require authentication and MUST always return 200.
+
 ## 4. Archive Format
 
 Archives are binary containers for transporting sets of objects. Two variants exist:
