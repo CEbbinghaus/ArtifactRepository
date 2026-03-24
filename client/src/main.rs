@@ -174,7 +174,9 @@ fn build_tree_from_dir(
                     let path = symlink_path.clone();
                     move || -> anyhow::Result<(Vec<u8>, Hash)> {
                         let target = std::fs::read_link(&path)?;
-                        let target_bytes = target.as_os_str().as_encoded_bytes().to_vec();
+                        let target_str = target.to_str()
+                            .ok_or_else(|| anyhow::anyhow!("symlink target is not valid UTF-8: {:?}", target))?;
+                        let target_bytes = target_str.as_bytes().to_vec();
                         let hash = compute_hash(BLOB_KEY, &target_bytes);
                         Ok((target_bytes, hash))
                     }
@@ -402,17 +404,31 @@ fn write_tree_to_path<'a>(
                         store_obj.read_to_end(&mut data).await?;
 
                         tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+                            let target_str = String::from_utf8(data)
+                                .context("symlink target is not valid UTF-8")?;
+                            let target = std::path::Path::new(&target_str);
                             #[cfg(unix)]
                             {
-                                use std::os::unix::ffi::OsStrExt;
-                                let target = std::ffi::OsStr::from_bytes(&data);
                                 std::os::unix::fs::symlink(target, &entry_path)
                                     .context(format!("failed to create symlink {:?}", entry_path))?;
                             }
-                            #[cfg(not(unix))]
+                            #[cfg(windows)]
                             {
-                                // Best-effort: write target path as a file on non-Unix
-                                std::fs::write(&entry_path, &data)
+                                // Resolve relative to symlink parent to determine file vs dir
+                                let resolved = entry_path.parent()
+                                    .unwrap_or(std::path::Path::new("."))
+                                    .join(target);
+                                if resolved.is_dir() {
+                                    std::os::windows::fs::symlink_dir(target, &entry_path)
+                                        .context(format!("failed to create dir symlink {:?}", entry_path))?;
+                                } else {
+                                    std::os::windows::fs::symlink_file(target, &entry_path)
+                                        .context(format!("failed to create file symlink {:?}", entry_path))?;
+                                }
+                            }
+                            #[cfg(not(any(unix, windows)))]
+                            {
+                                std::fs::write(&entry_path, target_str.as_bytes())
                                     .context(format!("failed to write symlink placeholder {:?}", entry_path))?;
                             }
                             Ok(())
@@ -982,16 +998,30 @@ fn extract_tree<'a>(
                         tokio::task::spawn_blocking({
                             let data = blob_body.to_vec();
                             move || -> anyhow::Result<()> {
+                                let target_str = String::from_utf8(data)
+                                    .context("symlink target is not valid UTF-8")?;
+                                let target = std::path::Path::new(&target_str);
                                 #[cfg(unix)]
                                 {
-                                    use std::os::unix::ffi::OsStrExt;
-                                    let target = std::ffi::OsStr::from_bytes(&data);
                                     std::os::unix::fs::symlink(target, &entry_path)
                                         .context(format!("failed to create symlink {:?}", entry_path))?;
                                 }
-                                #[cfg(not(unix))]
+                                #[cfg(windows)]
                                 {
-                                    std::fs::write(&entry_path, &data)
+                                    let resolved = entry_path.parent()
+                                        .unwrap_or(std::path::Path::new("."))
+                                        .join(target);
+                                    if resolved.is_dir() {
+                                        std::os::windows::fs::symlink_dir(target, &entry_path)
+                                            .context(format!("failed to create dir symlink {:?}", entry_path))?;
+                                    } else {
+                                        std::os::windows::fs::symlink_file(target, &entry_path)
+                                            .context(format!("failed to create file symlink {:?}", entry_path))?;
+                                    }
+                                }
+                                #[cfg(not(any(unix, windows)))]
+                                {
+                                    std::fs::write(&entry_path, target_str.as_bytes())
                                         .context(format!("failed to write symlink placeholder {:?}", entry_path))?;
                                 }
                                 Ok(())
@@ -1129,7 +1159,9 @@ fn archive_build_tree(
                     let path = symlink_path.clone();
                     move || -> anyhow::Result<(Vec<u8>, Hash)> {
                         let target = std::fs::read_link(&path)?;
-                        let target_bytes = target.as_os_str().as_encoded_bytes().to_vec();
+                        let target_str = target.to_str()
+                            .ok_or_else(|| anyhow::anyhow!("symlink target is not valid UTF-8: {:?}", target))?;
+                        let target_bytes = target_str.as_bytes().to_vec();
                         let hash = compute_hash(BLOB_KEY, &target_bytes);
                         Ok((target_bytes, hash))
                     }
