@@ -55,7 +55,7 @@ fn set_executable(_path: &Path) -> std::io::Result<()> {
 async fn build_index_from_path(store: &Store, path: &Path) -> anyhow::Result<(object_body::Index, Hash, u128)> {
     anyhow::ensure!(path.is_dir(), "path must be a directory");
 
-    let (tree_hash, total_size) = build_tree_from_dir(store.clone(), path.to_path_buf()).await?;
+    let (tree_hash, total_size) = build_tree_from_dir(store.clone(), path.to_path_buf(), path.to_path_buf()).await?;
 
     let index = object_body::Index {
         tree: tree_hash,
@@ -73,10 +73,46 @@ async fn build_index_from_path(store: &Store, path: &Path) -> anyhow::Result<(ob
     Ok((index, index_hash, total_size))
 }
 
+/// Check whether a symlink target escapes the given root directory.
+/// Returns the canonicalized resolved path if it stays within root, or None if it escapes.
+fn symlink_target_within_root(symlink_path: &Path, root: &Path) -> std::io::Result<Option<PathBuf>> {
+    let target = std::fs::read_link(symlink_path)?;
+    let resolved = if target.is_absolute() {
+        target.clone()
+    } else {
+        symlink_path.parent().unwrap_or(Path::new(".")).join(&target)
+    };
+    // Canonicalize root (already canonical from caller), but resolve the target
+    // through the filesystem to handle ../ chains
+    match resolved.canonicalize() {
+        Ok(canonical) => Ok(if canonical.starts_with(root) { Some(canonical) } else { None }),
+        // Target doesn't exist — check lexically by normalizing path components
+        Err(_) => {
+            let mut components = Vec::new();
+            let base = symlink_path.parent().unwrap_or(Path::new("."));
+            let full = if target.is_absolute() {
+                target
+            } else {
+                base.join(&target)
+            };
+            for comp in full.components() {
+                match comp {
+                    std::path::Component::ParentDir => { components.pop(); }
+                    std::path::Component::CurDir => {}
+                    _ => components.push(comp),
+                }
+            }
+            let normalized: PathBuf = components.iter().collect();
+            Ok(if normalized.starts_with(root) { Some(normalized) } else { None })
+        }
+    }
+}
+
 #[allow(clippy::type_complexity)]
 fn build_tree_from_dir(
     store: Store,
     path: PathBuf,
+    root: PathBuf,
 ) -> std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<(Hash, u128)>> + Send>> {
     Box::pin(async move {
         anyhow::ensure!(path.is_dir(), "path must be a directory");
@@ -106,12 +142,13 @@ fn build_tree_from_dir(
         let mut dir_set = JoinSet::new();
         for dir_path in dir_paths {
             let store_clone = store.clone();
+            let root_clone = root.clone();
             dir_set.spawn(async move {
                 let name = dir_path.file_name()
                     .and_then(|n| n.to_str())
                     .ok_or_else(|| anyhow::anyhow!("invalid file name: {}", dir_path.display()))?
                     .to_string();
-                let (hash, size) = build_tree_from_dir(store_clone, dir_path).await?;
+                let (hash, size) = build_tree_from_dir(store_clone, dir_path, root_clone).await?;
                 Ok::<_, anyhow::Error>((name, hash, size))
             });
         }
@@ -162,6 +199,7 @@ fn build_tree_from_dir(
         for symlink_path in symlink_paths {
             let store_clone = store.clone();
             let sem = semaphore.clone();
+            let root_clone = root.clone();
             symlink_set.spawn(async move {
                 let _permit = sem.acquire().await
                     .map_err(|e| anyhow::anyhow!("semaphore: {e}"))?;
@@ -170,15 +208,31 @@ fn build_tree_from_dir(
                     .ok_or_else(|| anyhow::anyhow!("invalid file name: {}", symlink_path.display()))?
                     .to_string();
 
-                let (data, hash) = tokio::task::spawn_blocking({
+                // Check if symlink target escapes the root directory
+                let (data, hash, mode) = tokio::task::spawn_blocking({
                     let path = symlink_path.clone();
-                    move || -> anyhow::Result<(Vec<u8>, Hash)> {
-                        let target = std::fs::read_link(&path)?;
-                        let target_str = target.to_str()
-                            .ok_or_else(|| anyhow::anyhow!("symlink target is not valid UTF-8: {:?}", target))?;
-                        let target_bytes = target_str.as_bytes().to_vec();
-                        let hash = compute_hash(BLOB_KEY, &target_bytes);
-                        Ok((target_bytes, hash))
+                    move || -> anyhow::Result<(Vec<u8>, Hash, Mode)> {
+                        let within = symlink_target_within_root(&path, &root_clone)?;
+                        if within.is_some() {
+                            // Safe symlink — store as symlink
+                            let target = std::fs::read_link(&path)?;
+                            let target_str = target.to_str()
+                                .ok_or_else(|| anyhow::anyhow!("symlink target is not valid UTF-8: {:?}", target))?;
+                            let target_bytes = target_str.as_bytes().to_vec();
+                            let hash = compute_hash(BLOB_KEY, &target_bytes);
+                            Ok((target_bytes, hash, Mode::SymbolicLink))
+                        } else {
+                            // Escaping symlink — follow it and store the actual file content
+                            tracing::warn!(
+                                symlink = %path.display(),
+                                "symlink target escapes root directory, storing as regular file"
+                            );
+                            let data = std::fs::read(&path)
+                                .context(format!("failed to read through escaping symlink {:?}", path))?;
+                            let file_mode = detect_file_mode(&path);
+                            let hash = compute_hash(BLOB_KEY, &data);
+                            Ok((data, hash, file_mode))
+                        }
                     }
                 }).await??;
                 let size = data.len() as u64;
@@ -192,7 +246,7 @@ fn build_tree_from_dir(
                     }
                 }
 
-                Ok::<_, anyhow::Error>((name, hash, size))
+                Ok::<_, anyhow::Error>((name, hash, size, mode))
             });
         }
 
@@ -220,10 +274,10 @@ fn build_tree_from_dir(
 
         // Collect symlink results
         while let Some(result) = symlink_set.join_next().await {
-            let (name, hash, size) = result??;
+            let (name, hash, size, mode) = result??;
             total_size += size as u128;
             entries.push(object_body::TreeEntry {
-                mode: Mode::SymbolicLink,
+                mode,
                 path: name,
                 hash,
             });
@@ -290,7 +344,7 @@ async fn restore_directory(store: &Store, path: &Path, index_hash: Hash, validat
 
     #[allow(clippy::mutable_key_type)]
     let written_files = Arc::new(tokio::sync::Mutex::new(HashMap::<Hash, PathBuf>::new()));
-    write_tree_to_path(store, &tree, path, written_files).await?;
+    write_tree_to_path(store, &tree, path, path, written_files).await?;
 
     if validate {
         validate_tree_at_path(store, &tree, path).await?;
@@ -336,6 +390,7 @@ fn write_tree_to_path<'a>(
     store: &'a Store,
     tree: &'a object_body::Tree,
     path: &'a Path,
+    root: &'a Path,
     written_files: Arc<tokio::sync::Mutex<HashMap<Hash, PathBuf>>>,
 ) -> std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<()>> + Send + 'a>> {
     Box::pin(async move {
@@ -352,7 +407,7 @@ fn write_tree_to_path<'a>(
                 Mode::Tree => {
                     create_dir(&entry_path).await.context("failed to create directory")?;
                     let subtree = read_tree_from_store(store, &entry.hash).await?;
-                    write_tree_to_path(store, &subtree, &entry_path, written_files.clone()).await?;
+                    write_tree_to_path(store, &subtree, &entry_path, root, written_files.clone()).await?;
                 }
                 Mode::Normal | Mode::Executable => {
                     let is_executable = entry.mode == Mode::Executable;
@@ -395,6 +450,7 @@ fn write_tree_to_path<'a>(
                     let store_clone = store.clone();
                     let hash = entry.hash.clone();
                     let sem = semaphore.clone();
+                    let root_path = root.to_path_buf();
                     blob_set.spawn(async move {
                         let _permit = sem.acquire().await
                             .map_err(|e| anyhow::anyhow!("semaphore: {e}"))?;
@@ -407,6 +463,31 @@ fn write_tree_to_path<'a>(
                             let target_str = String::from_utf8(data)
                                 .context("symlink target is not valid UTF-8")?;
                             let target = std::path::Path::new(&target_str);
+
+                            // Validate symlink target doesn't escape the restore root
+                            let resolved = if target.is_absolute() {
+                                target.to_path_buf()
+                            } else {
+                                entry_path.parent()
+                                    .unwrap_or(std::path::Path::new("."))
+                                    .join(target)
+                            };
+                            // Lexically normalize to check for escapes
+                            let mut components = Vec::new();
+                            for comp in resolved.components() {
+                                match comp {
+                                    std::path::Component::ParentDir => { components.pop(); }
+                                    std::path::Component::CurDir => {}
+                                    _ => components.push(comp),
+                                }
+                            }
+                            let normalized: PathBuf = components.iter().collect();
+                            anyhow::ensure!(
+                                normalized.starts_with(&root_path),
+                                "symlink {:?} target {:?} escapes restore directory {:?}",
+                                entry_path, target_str, root_path
+                            );
+
                             #[cfg(unix)]
                             {
                                 std::os::unix::fs::symlink(target, &entry_path)
@@ -414,11 +495,7 @@ fn write_tree_to_path<'a>(
                             }
                             #[cfg(windows)]
                             {
-                                // Resolve relative to symlink parent to determine file vs dir
-                                let resolved = entry_path.parent()
-                                    .unwrap_or(std::path::Path::new("."))
-                                    .join(target);
-                                if resolved.is_dir() {
+                                if normalized.is_dir() {
                                     std::os::windows::fs::symlink_dir(target, &entry_path)
                                         .context(format!("failed to create dir symlink {:?}", entry_path))?;
                                 } else {
@@ -902,7 +979,7 @@ async fn extract_archive(file: &Path, directory: &Path) -> anyhow::Result<()> {
     let data_map = Arc::new(data_map);
     #[allow(clippy::mutable_key_type)]
     let written_files = Arc::new(tokio::sync::Mutex::new(HashMap::<Hash, PathBuf>::new()));
-    let file_count = extract_tree(&data_map, &root_tree_hash, directory, written_files).await?;
+    let file_count = extract_tree(&data_map, &root_tree_hash, directory, directory, written_files).await?;
 
     tracing::info!("Extracted {} files to {:?}", file_count, directory);
 
@@ -914,6 +991,7 @@ fn extract_tree<'a>(
     data_map: &'a Arc<HashMap<Hash, Vec<u8>>>,
     tree_hash: &'a Hash,
     path: &'a Path,
+    root: &'a Path,
     written_files: Arc<tokio::sync::Mutex<HashMap<Hash, PathBuf>>>,
 ) -> std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<usize>> + Send + 'a>> {
     Box::pin(async move {
@@ -939,7 +1017,7 @@ fn extract_tree<'a>(
                 Mode::Tree => {
                     create_dir(&entry_path).await
                         .context(format!("failed to create directory {:?}", entry_path))?;
-                    file_count += extract_tree(data_map, &entry.hash, &entry_path, written_files.clone()).await?;
+                    file_count += extract_tree(data_map, &entry.hash, &entry_path, root, written_files.clone()).await?;
                 }
                 Mode::Normal | Mode::Executable => {
                     file_count += 1;
@@ -985,6 +1063,7 @@ fn extract_tree<'a>(
                     file_count += 1;
                     let dm = data_map.clone();
                     let sem = semaphore.clone();
+                    let root_path = root.to_path_buf();
                     set.spawn(async move {
                         let _permit = sem.acquire().await
                             .map_err(|e| anyhow::anyhow!("semaphore: {e}"))?;
@@ -1001,6 +1080,30 @@ fn extract_tree<'a>(
                                 let target_str = String::from_utf8(data)
                                     .context("symlink target is not valid UTF-8")?;
                                 let target = std::path::Path::new(&target_str);
+
+                                // Validate symlink target doesn't escape the extract root
+                                let resolved = if target.is_absolute() {
+                                    target.to_path_buf()
+                                } else {
+                                    entry_path.parent()
+                                        .unwrap_or(std::path::Path::new("."))
+                                        .join(target)
+                                };
+                                let mut components = Vec::new();
+                                for comp in resolved.components() {
+                                    match comp {
+                                        std::path::Component::ParentDir => { components.pop(); }
+                                        std::path::Component::CurDir => {}
+                                        _ => components.push(comp),
+                                    }
+                                }
+                                let normalized: PathBuf = components.iter().collect();
+                                anyhow::ensure!(
+                                    normalized.starts_with(&root_path),
+                                    "symlink {:?} target {:?} escapes extract directory {:?}",
+                                    entry_path, target_str, root_path
+                                );
+
                                 #[cfg(unix)]
                                 {
                                     std::os::unix::fs::symlink(target, &entry_path)
@@ -1008,10 +1111,7 @@ fn extract_tree<'a>(
                                 }
                                 #[cfg(windows)]
                                 {
-                                    let resolved = entry_path.parent()
-                                        .unwrap_or(std::path::Path::new("."))
-                                        .join(target);
-                                    if resolved.is_dir() {
+                                    if normalized.is_dir() {
                                         std::os::windows::fs::symlink_dir(target, &entry_path)
                                             .context(format!("failed to create dir symlink {:?}", entry_path))?;
                                     } else {
@@ -1066,6 +1166,7 @@ fn extract_tree<'a>(
 fn archive_build_tree(
     objects: Arc<tokio::sync::Mutex<HashMap<Hash, Vec<u8>>>>,
     path: PathBuf,
+    root: PathBuf,
 ) -> std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<Hash>> + Send>> {
     Box::pin(async move {
         anyhow::ensure!(path.is_dir(), "path must be a directory");
@@ -1092,12 +1193,13 @@ fn archive_build_tree(
         let mut dir_set = JoinSet::new();
         for dir_path in dir_paths {
             let objects_clone = objects.clone();
+            let root_clone = root.clone();
             dir_set.spawn(async move {
                 let name = dir_path.file_name()
                     .and_then(|n| n.to_str())
                     .ok_or_else(|| anyhow::anyhow!("invalid file name: {}", dir_path.display()))?
                     .to_string();
-                let hash = archive_build_tree(objects_clone, dir_path).await?;
+                let hash = archive_build_tree(objects_clone, dir_path, root_clone).await?;
                 Ok::<_, anyhow::Error>((name, hash))
             });
         }
@@ -1147,6 +1249,7 @@ fn archive_build_tree(
         for symlink_path in symlink_paths {
             let objects_clone = objects.clone();
             let sem = semaphore.clone();
+            let root_clone = root.clone();
             symlink_set.spawn(async move {
                 let _permit = sem.acquire().await
                     .map_err(|e| anyhow::anyhow!("semaphore: {e}"))?;
@@ -1155,15 +1258,28 @@ fn archive_build_tree(
                     .ok_or_else(|| anyhow::anyhow!("invalid file name: {}", symlink_path.display()))?
                     .to_string();
 
-                let (data, hash) = tokio::task::spawn_blocking({
+                let (data, hash, mode) = tokio::task::spawn_blocking({
                     let path = symlink_path.clone();
-                    move || -> anyhow::Result<(Vec<u8>, Hash)> {
-                        let target = std::fs::read_link(&path)?;
-                        let target_str = target.to_str()
-                            .ok_or_else(|| anyhow::anyhow!("symlink target is not valid UTF-8: {:?}", target))?;
-                        let target_bytes = target_str.as_bytes().to_vec();
-                        let hash = compute_hash(BLOB_KEY, &target_bytes);
-                        Ok((target_bytes, hash))
+                    move || -> anyhow::Result<(Vec<u8>, Hash, Mode)> {
+                        let within = symlink_target_within_root(&path, &root_clone)?;
+                        if within.is_some() {
+                            let target = std::fs::read_link(&path)?;
+                            let target_str = target.to_str()
+                                .ok_or_else(|| anyhow::anyhow!("symlink target is not valid UTF-8: {:?}", target))?;
+                            let target_bytes = target_str.as_bytes().to_vec();
+                            let hash = compute_hash(BLOB_KEY, &target_bytes);
+                            Ok((target_bytes, hash, Mode::SymbolicLink))
+                        } else {
+                            tracing::warn!(
+                                symlink = %path.display(),
+                                "symlink target escapes root directory, storing as regular file"
+                            );
+                            let data = std::fs::read(&path)
+                                .context(format!("failed to read through escaping symlink {:?}", path))?;
+                            let file_mode = detect_file_mode(&path);
+                            let hash = compute_hash(BLOB_KEY, &data);
+                            Ok((data, hash, file_mode))
+                        }
                     }
                 }).await??;
 
@@ -1179,7 +1295,7 @@ fn archive_build_tree(
                     }
                 }
 
-                Ok::<_, anyhow::Error>((name, hash))
+                Ok::<_, anyhow::Error>((name, hash, mode))
             });
         }
 
@@ -1205,9 +1321,9 @@ fn archive_build_tree(
 
         // Collect symlink results
         while let Some(result) = symlink_set.join_next().await {
-            let (name, hash) = result??;
+            let (name, hash, mode) = result??;
             entries.push(object_body::TreeEntry {
-                mode: Mode::SymbolicLink,
+                mode,
                 path: name,
                 hash,
             });
@@ -1252,7 +1368,7 @@ async fn archive_directory(directory: &Path, file: &Path, compression: Compressi
     let objects: Arc<tokio::sync::Mutex<HashMap<Hash, Vec<u8>>>> =
         Arc::new(tokio::sync::Mutex::new(HashMap::new()));
 
-    let root_hash = archive_build_tree(objects.clone(), path).await?;
+    let root_hash = archive_build_tree(objects.clone(), path.clone(), path).await?;
 
     // Build index
     let index = object_body::Index {
@@ -1970,7 +2086,6 @@ mod tests {
         {
             std::os::unix::fs::symlink("target.txt", source.path().join("relative-link")).unwrap();
             std::os::unix::fs::symlink("subdir/nested.txt", source.path().join("deep-link")).unwrap();
-            std::os::unix::fs::symlink("/absolute/path", source.path().join("abs-link")).unwrap();
         }
 
         let store = create_store(store_dir.path());
@@ -1997,10 +2112,6 @@ mod tests {
             let meta = std::fs::symlink_metadata(restore_path.join("deep-link")).unwrap();
             assert!(meta.is_symlink(), "deep-link should be a symlink");
             assert_eq!(std::fs::read_link(restore_path.join("deep-link")).unwrap().to_str().unwrap(), "subdir/nested.txt");
-
-            let meta = std::fs::symlink_metadata(restore_path.join("abs-link")).unwrap();
-            assert!(meta.is_symlink(), "abs-link should be a symlink");
-            assert_eq!(std::fs::read_link(restore_path.join("abs-link")).unwrap().to_str().unwrap(), "/absolute/path");
         }
     }
 
@@ -2042,6 +2153,97 @@ mod tests {
             assert!(meta.is_symlink(), "dangling should be a symlink");
             assert_eq!(std::fs::read_link(extract_path.join("dangling")).unwrap().to_str().unwrap(), "nonexistent");
         }
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn symlink_escaping_commit_substitutes_file() {
+        // Create an "outside" file that a symlink will point to
+        let outside = TempDir::new().unwrap();
+        tokio::fs::write(outside.path().join("secret.txt"), b"sensitive data").await.unwrap();
+
+        // Create the source directory with an escaping symlink
+        let source = TempDir::new().unwrap();
+        tokio::fs::write(source.path().join("normal.txt"), b"hello").await.unwrap();
+
+        // Symlink that escapes via absolute path to a real file
+        let secret_path = outside.path().join("secret.txt");
+        std::os::unix::fs::symlink(&secret_path, source.path().join("abs_escape")).unwrap();
+
+        // Commit — escaping symlinks should be substituted with file content
+        let store_dir = TempDir::new().unwrap();
+        let store = create_store(store_dir.path());
+        let source_path = source.path().to_path_buf();
+        let (index, _, _) = build_index_from_path(&store, &source_path).await.unwrap();
+
+        // The escaping symlink should have been stored as a Normal file, not a SymbolicLink
+        let tree = read_tree_from_store(&store, &index.tree).await.unwrap();
+        let abs_entry = tree.contents.iter().find(|e| e.path == "abs_escape").unwrap();
+        assert_eq!(abs_entry.mode, Mode::Normal,
+            "escaping symlink should be stored as a regular file");
+
+        // Restore — the file should contain the content from the original target
+        let restore = TempDir::new().unwrap();
+        let restore_path = restore.path().join("output");
+        let index_hash = compute_hash(INDEX_KEY, &object_body::Object::to_data(&index));
+        restore_directory(&store, &restore_path, index_hash, false).await.unwrap();
+
+        let restored = std::fs::read_to_string(restore_path.join("abs_escape")).unwrap();
+        assert_eq!(restored, "sensitive data");
+        // It should NOT be a symlink
+        assert!(!restore_path.join("abs_escape").symlink_metadata().unwrap().is_symlink());
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn symlink_escaping_commit_dangling_errors() {
+        // Escaping symlink to a nonexistent target should error on commit
+        let source = TempDir::new().unwrap();
+        tokio::fs::write(source.path().join("normal.txt"), b"hello").await.unwrap();
+        std::os::unix::fs::symlink("../nonexistent_escape", source.path().join("rel_escape")).unwrap();
+
+        let store_dir = TempDir::new().unwrap();
+        let store = create_store(store_dir.path());
+        let source_path = source.path().to_path_buf();
+        let result = build_index_from_path(&store, &source_path).await;
+
+        assert!(result.is_err(), "dangling escaping symlink should fail on commit");
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn symlink_escaping_extract_errors() {
+        // Test that restore rejects symlinks with escaping targets.
+        // We craft a tree directly with an escaping SymbolicLink entry.
+        let store_dir = TempDir::new().unwrap();
+        let store = create_store(store_dir.path());
+
+        // Create a blob containing an escaping symlink target
+        let target_bytes = b"../../etc/passwd".to_vec();
+        let blob_hash = compute_hash(BLOB_KEY, &target_bytes);
+        let header = Header::new(ObjectType::Blob, target_bytes.len() as u64);
+        store.put_object_bytes(&blob_hash, header, target_bytes.to_vec()).await.unwrap();
+
+        // Create a tree with the escaping symlink entry
+        let tree = object_body::Tree {
+            contents: vec![object_body::TreeEntry {
+                mode: Mode::SymbolicLink,
+                path: "evil_link".to_string(),
+                hash: blob_hash,
+            }],
+        };
+
+        let extract = TempDir::new().unwrap();
+        let extract_path = extract.path().join("output");
+        tokio::fs::create_dir(&extract_path).await.unwrap();
+
+        #[allow(clippy::mutable_key_type)]
+        let written_files = Arc::new(tokio::sync::Mutex::new(HashMap::<Hash, PathBuf>::new()));
+        let result = write_tree_to_path(&store, &tree, &extract_path, &extract_path, written_files).await;
+
+        assert!(result.is_err(), "restore should reject escaping symlinks");
+        let err_msg = format!("{:?}", result.unwrap_err());
+        assert!(err_msg.contains("escapes"), "error should mention escaping: {}", err_msg);
     }
 
     #[tokio::test]
