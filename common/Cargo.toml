@@ -3,15 +3,29 @@ name = "common"
 version = "0.1.0"
 edition = "2021"
 
+[features]
+sha2-asm = ["sha2/asm"]
+
 [dependencies]
-anyhow = "1.0.100"
+anyhow = { workspace = true }
 bytes = "1.10.1"
-chrono = "0.4.41"
+chrono = { workspace = true }
 flate2 = { version = "1.1.5", features = ["zlib-rs"] }
-futures = "0.3.31"
-hex = "0.4.3"
-lzma-rust2 = {version = "0.15.1", features = ["std"] }
-opendal = "0.54.1"
-serde = { version = "1.0.228", features = ["serde_derive"] }
+futures = { workspace = true }
+hex = { workspace = true }
+lzma-rust2 = { version = "0.15.1", features = ["std"] }
+opendal = { workspace = true }
+serde = { workspace = true }
+itoa = "1"
 sha2 = "0.10.9"
-tokio = { version = "1.48.0", features = ["full"] }
+tokio = { workspace = true }
+tracing = { workspace = true }
+zstd = { version = "0.13", features = ["zstdmt"] }
+
+[target.'cfg(unix)'.dependencies]
+sha2 = { version = "0.10.9", features = ["asm"] }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+opendal = { version = "0.54.1", features = ["services-fs"] }
+serde_json = { workspace = true }

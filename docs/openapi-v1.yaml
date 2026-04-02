@@ -1,0 +1,513 @@
+openapi: "3.1.0"
+info:
+  title: ArtifactRepository V1 API
+  version: "1.0.0"
+  description: |
+    Content-addressed artifact storage using SHA-512 Merkle trees.
+    All hashes are 128-character lowercase hexadecimal SHA-512 digests.
+    See docs/rfc-v1-api.md for the full protocol specification.
+
+servers:
+  - url: http://localhost:1287
+    description: Local development server
+
+paths:
+  /v1/info:
+    get:
+      operationId: getServerInfo
+      summary: Get server information and capabilities
+      description: |
+        Returns metadata about the server, supported extensions, authentication
+        methods, and capabilities. Clients SHOULD call this before other operations
+        to discover available features. This endpoint never requires authentication.
+      responses:
+        "200":
+          description: Server information
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ServerInfo"
+
+  /v1/object/{hash}:
+    put:
+      operationId: putObject
+      summary: Upload a single object
+      description: |
+        Stores a raw object in the server's content-addressed store.
+        If the object already exists, the server returns 200 (idempotent no-op).
+      parameters:
+        - $ref: "#/components/parameters/ObjectHash"
+        - name: Object-Type
+          in: header
+          required: true
+          schema:
+            $ref: "#/components/schemas/ObjectType"
+        - name: Object-Size
+          in: header
+          required: true
+          schema:
+            type: integer
+            format: uint64
+            description: Byte count of the object body
+      requestBody:
+        required: true
+        content:
+          application/octet-stream:
+            schema:
+              type: string
+              format: binary
+              description: Raw object bytes (header prefix + null + body)
+      responses:
+        "201":
+          description: Object stored successfully
+        "200":
+          description: Object already exists (no-op)
+        "400":
+          description: Missing or invalid headers, or invalid hash format
+          content:
+            text/plain:
+              schema:
+                type: string
+        "500":
+          description: Storage failure
+          content:
+            text/plain:
+              schema:
+                type: string
+
+    get:
+      operationId: getObject
+      summary: Download a single object
+      description: |
+        Retrieves a stored object by its hash. The response includes
+        Object-Type and Object-Size headers with the raw bytes in the body.
+      parameters:
+        - $ref: "#/components/parameters/ObjectHash"
+      responses:
+        "200":
+          description: Object returned
+          headers:
+            Object-Type:
+              schema:
+                $ref: "#/components/schemas/ObjectType"
+            Object-Size:
+              schema:
+                type: integer
+                format: uint64
+          content:
+            application/octet-stream:
+              schema:
+                type: string
+                format: binary
+        "404":
+          description: Object not found
+          content:
+            text/plain:
+              schema:
+                type: string
+        "500":
+          description: Storage failure
+          content:
+            text/plain:
+              schema:
+                type: string
+
+  /v1/object/missing:
+    post:
+      operationId: checkMissing
+      summary: Check which objects the server is missing
+      description: |
+        Given a list of hashes, returns the subset that do not exist
+        in the server's store. Used for deduplication before upload.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/MissingRequest"
+      responses:
+        "200":
+          description: Missing hashes returned
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/MissingResponse"
+        "400":
+          description: Malformed JSON or invalid hash format
+          content:
+            text/plain:
+              schema:
+                type: string
+        "500":
+          description: Storage failure
+          content:
+            text/plain:
+              schema:
+                type: string
+
+  /v1/archive/{index_hash}:
+    get:
+      operationId: getArchive
+      summary: Download a complete archive (.arx)
+      description: |
+        Streams a complete archive containing all objects reachable from
+        the specified index. The response is a binary .arx file.
+      parameters:
+        - $ref: "#/components/parameters/IndexHash"
+        - $ref: "#/components/parameters/Compression"
+      responses:
+        "200":
+          description: Archive streamed
+          headers:
+            Content-Disposition:
+              schema:
+                type: string
+                example: 'attachment; filename="aabbccddee.arx"'
+          content:
+            application/octet-stream:
+              schema:
+                type: string
+                format: binary
+        "400":
+          description: Invalid compression value or hash format
+          content:
+            text/plain:
+              schema:
+                type: string
+        "404":
+          description: Index object not found
+          content:
+            text/plain:
+              schema:
+                type: string
+        "500":
+          description: Storage or serialization failure
+          content:
+            text/plain:
+              schema:
+                type: string
+
+  /v1/archive/{index_hash}/supplemental:
+    post:
+      operationId: getSupplemental
+      summary: Download a supplemental archive (.sar)
+      description: |
+        Streams a supplemental archive containing the requested objects
+        plus all tree objects and the index. Used for incremental transfers
+        where the client already has some objects.
+      parameters:
+        - $ref: "#/components/parameters/IndexHash"
+        - $ref: "#/components/parameters/Compression"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/SupplementalRequest"
+      responses:
+        "200":
+          description: Supplemental archive streamed
+          headers:
+            Content-Disposition:
+              schema:
+                type: string
+                example: 'attachment; filename="aabbccddee.sar"'
+          content:
+            application/octet-stream:
+              schema:
+                type: string
+                format: binary
+        "400":
+          description: Malformed JSON, invalid compression, or invalid hash
+          content:
+            text/plain:
+              schema:
+                type: string
+        "404":
+          description: Index object not found
+          content:
+            text/plain:
+              schema:
+                type: string
+        "500":
+          description: Storage or serialization failure
+          content:
+            text/plain:
+              schema:
+                type: string
+
+  /v1/archive/upload:
+    post:
+      operationId: uploadArchive
+      summary: Upload and unpack an archive
+      description: |
+        Receives a .arx or .sar archive and unpacks all contained objects
+        into the server's store. Objects that already exist are skipped.
+      requestBody:
+        required: true
+        content:
+          application/octet-stream:
+            schema:
+              type: string
+              format: binary
+              description: Raw .arx or .sar archive bytes
+      responses:
+        "200":
+          description: Archive unpacked successfully
+          content:
+            text/plain:
+              schema:
+                type: string
+                example: "Added 42 objects, skipped 3"
+        "400":
+          description: Invalid archive format
+          content:
+            text/plain:
+              schema:
+                type: string
+        "500":
+          description: Storage failure
+          content:
+            text/plain:
+              schema:
+                type: string
+
+  /v1/index/{index_hash}/metadata:
+    get:
+      operationId: getMetadata
+      summary: Get tree metadata for an index
+      description: |
+        Returns JSON metadata describing the full tree structure referenced
+        by an index, without downloading any file contents. Useful for
+        discovering which objects exist and planning incremental downloads.
+      parameters:
+        - $ref: "#/components/parameters/IndexHash"
+      responses:
+        "200":
+          description: Metadata returned
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/TreeMetadata"
+        "404":
+          description: Index object not found
+          content:
+            text/plain:
+              schema:
+                type: string
+        "500":
+          description: Storage failure
+          content:
+            text/plain:
+              schema:
+                type: string
+
+components:
+  parameters:
+    ObjectHash:
+      name: hash
+      in: path
+      required: true
+      description: 128-character lowercase hexadecimal SHA-512 hash
+      schema:
+        $ref: "#/components/schemas/Hash"
+
+    IndexHash:
+      name: index_hash
+      in: path
+      required: true
+      description: Hash of the index object
+      schema:
+        $ref: "#/components/schemas/Hash"
+
+    Compression:
+      name: compression
+      in: query
+      required: false
+      description: Compression algorithm for the archive
+      schema:
+        type: string
+        enum: [none, gzip, deflate, lzma2, zstd]
+        default: zstd
+
+  schemas:
+    Hash:
+      type: string
+      pattern: "^[0-9a-f]{128}$"
+      description: 128-character lowercase hexadecimal SHA-512 hash
+      example: "aabbccdd0011223344556677889900aabbccdd0011223344556677889900aabbccdd0011223344556677889900aabbccdd0011223344556677889900aabbccdd"
+
+    ObjectType:
+      type: string
+      enum: [blob, tree, indx]
+      description: |
+        Type of object:
+        - blob: raw file contents
+        - tree: directory listing
+        - indx: root index referencing a tree
+
+    MissingRequest:
+      type: object
+      required: [hashes]
+      properties:
+        hashes:
+          type: array
+          items:
+            $ref: "#/components/schemas/Hash"
+          description: List of hashes to check
+
+    MissingResponse:
+      type: object
+      required: [missing]
+      properties:
+        missing:
+          type: array
+          items:
+            $ref: "#/components/schemas/Hash"
+          description: Subset of requested hashes not present on the server
+
+    SupplementalRequest:
+      type: object
+      required: [hashes]
+      properties:
+        hashes:
+          type: array
+          items:
+            $ref: "#/components/schemas/Hash"
+          description: List of object hashes to include in the supplemental archive
+
+    TreeMetadata:
+      type: object
+      required: [index, objects]
+      properties:
+        index:
+          $ref: "#/components/schemas/IndexInfo"
+        objects:
+          type: object
+          additionalProperties:
+            $ref: "#/components/schemas/MetadataObject"
+          description: Map from hash to object metadata
+
+    IndexInfo:
+      type: object
+      required: [hash, tree, timestamp, metadata]
+      properties:
+        hash:
+          $ref: "#/components/schemas/Hash"
+        tree:
+          $ref: "#/components/schemas/Hash"
+        timestamp:
+          type: string
+          format: date-time
+          description: RFC 3339 timestamp
+        metadata:
+          type: object
+          additionalProperties:
+            type: string
+          description: Key-value metadata from the index object
+
+    MetadataObject:
+      oneOf:
+        - $ref: "#/components/schemas/BlobMetadata"
+        - $ref: "#/components/schemas/TreeMetadataObject"
+      discriminator:
+        propertyName: type
+        mapping:
+          blob: "#/components/schemas/BlobMetadata"
+          tree: "#/components/schemas/TreeMetadataObject"
+
+    BlobMetadata:
+      type: object
+      required: [type, size]
+      properties:
+        type:
+          type: string
+          const: blob
+        size:
+          type: integer
+          format: uint64
+          description: Size of the blob in bytes
+
+    TreeMetadataObject:
+      type: object
+      required: [type, entries]
+      properties:
+        type:
+          type: string
+          const: tree
+        entries:
+          type: object
+          additionalProperties:
+            $ref: "#/components/schemas/TreeDirEntry"
+          description: Map from filename to entry info
+
+    TreeDirEntry:
+      type: object
+      required: [mode, hash]
+      properties:
+        mode:
+          type: string
+          enum: ["040000", "100644", "100755", "100646", "120000"]
+          description: |
+            File mode:
+            - 040000: Directory
+            - 100644: Regular file
+            - 100755: Executable
+            - 100646: Zip archive (content-addressed, requires zip-content-addressing extension)
+            - 120000: Symbolic link
+        hash:
+          $ref: "#/components/schemas/Hash"
+
+    ServerInfo:
+      type: object
+      required: [spec_version, server, extensions, authentication, capabilities]
+      properties:
+        spec_version:
+          type: string
+          description: V1 specification version (semver)
+          example: "1.0.0"
+        server:
+          type: object
+          required: [name, version]
+          properties:
+            name:
+              type: string
+              description: Server implementation name
+              example: "ArtifactRepository"
+            version:
+              type: string
+              description: Server implementation version (semver)
+              example: "0.1.0"
+        extensions:
+          type: array
+          items:
+            type: string
+          description: |
+            Supported extension identifiers. Known extensions:
+            - "zip-content-addressing": Transparent zip decomposition
+          example: ["zip-content-addressing"]
+        authentication:
+          type: object
+          required: [methods]
+          properties:
+            methods:
+              type: array
+              items:
+                type: string
+              description: Supported authentication methods (defined by future RFCs)
+              example: []
+        capabilities:
+          type: object
+          required: [compression, max_object_size]
+          properties:
+            compression:
+              type: array
+              items:
+                type: string
+                enum: [none, gzip, deflate, lzma2, zstd]
+              description: Supported compression algorithms
+            max_object_size:
+              type: integer
+              format: uint64
+              nullable: true
+              description: Maximum object size in bytes, or null for no limit

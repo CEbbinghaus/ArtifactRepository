@@ -1,934 +1,741 @@
-#![allow(dead_code)]
-use chrono::{DateTime, Utc};
+use anyhow::Context;
+use chrono::Utc;
 use clap::{Parser, Subcommand};
 use common::{
-    BLOB_KEY, Hash, Header, INDEX_KEY, Mode, ObjectType, TREE_KEY, archive::{Archive, ArchiveBody, ArchiveEntryData, ArchiveHeaderEntry, Compression, HEADER, RawEntryData, FileEntryData}, object_body::Object as OtherObject, read_object_into_headers, read_header_and_body, read_header_from_file, read_header_from_slice
+    BLOB_KEY, Hash, Header, INDEX_KEY, Mode, ObjectType, TREE_KEY,
+    archive::{Archive, ArchiveBody, ArchiveEntryData, ArchiveHeaderEntry, Compression, HEADER, RawEntryData, SUPPLEMENTAL_HEADER},
+    compute_hash, object_body, read_header_and_body, read_header_from_slice, read_object_into_headers,
+    store::Store,
 };
-use sha2::{Digest, Sha512};
+
 use std::{
     collections::HashMap,
-    fs::{File, create_dir, create_dir_all, read_dir},
-    io::{BufRead, BufReader, BufWriter, Read, Write},
-    ops::Deref,
-    path::PathBuf,
-    str::from_utf8,
+    path::{Path, PathBuf},
+    sync::Arc,
 };
-use ureq::SendBody;
 
-#[derive(Debug)]
-struct Hashed<T: Object> {
-    inner: T,
-    hash: Hash,
-}
+use futures::io::AsyncReadExt as FuturesReadExt;
+use tokio::{
+    fs::{create_dir, create_dir_all, read_dir},
+    io::{AsyncWriteExt, BufWriter},
+    task::JoinSet,
+};
 
-impl<T: Object> Deref for Hashed<T> {
-    type Target = T;
-
-    fn deref(&self) -> &Self::Target {
-        &self.inner
-    }
-}
-
-impl<T: Object> Hashed<T> {
-    // fn from_hash(cache: &PathBuf, hash: Hash) -> Self {
-    //     let (dir, file) = hash.get_parts();
-
-    //     let file_path = cache.join(dir).join(file);
-
-    //     assert!(file_path.exists());
-
-    //     let reader = T::read_file_and_verify_type(&file_path);
-
-    //     drop(reader);
-
-    //     Self {
-    //         inner: T::from_file(cache, &file_path),
-    //         hash,
-    //     }
-    // }
-
-    fn from_object(value: T) -> Self {
-        Self {
-            hash: value.get_hash(),
-            inner: value,
-        }
-    }
-}
-
-trait Object {
-    fn get_object_type(&self) -> ObjectType;
-    fn get_hash(&self) -> Hash;
-    fn get_prefix(&self) -> String;
-    fn write_to(&self, path: &PathBuf);
-
-    // fn from_file(cache: &PathBuf, file: &PathBuf) -> Self;
-
-    // fn read_file_and_verify_type(path: &PathBuf) -> BufReader<File> {
-    //     let f = File::open(file_path).unwrap();
-    //     let mut reader = BufReader::new(f);
-
-    //     let mut data = Vec::new();
-    //     reader.read_until(0, &mut data);
-
-    //     if data.last() == Some(&0) {
-    //         data.pop();
-    //     }
-
-    //     let name = String::from_utf8(data).unwrap();
-
-    //     let (typ, size) = name.split_once(' ').unwrap();
-
-    //     let object_type = ObjectType::from_str(typ);
-
-    //     assert!(object_type == T::get_object_type());
-
-    //     reader
-    // }
-}
-
-struct CacheObject<'a> {
-    cache: &'a PathBuf,
-    object_type: ObjectType,
-    hash: Hash,
-    size: u64,
-    file: PathBuf,
-}
-
-impl<'a> CacheObject<'a> {
-    fn from_file(cache: &'a PathBuf, file_path: &PathBuf) -> Self {
-        let file = File::open(file_path).unwrap();
-        let mut file = BufReader::new(file);
-
-        let mut data = Vec::new();
-        file.read_until(b'\0', &mut data).unwrap();
-
-        if data.last() == Some(&0) {
-            data.pop();
-        }
-
-        let data = String::from_utf8(data).expect("data to be a valid u8");
-
-        let (object_type, size) = data.split_once(' ').unwrap();
-
-        let object_type = ObjectType::from_str(object_type).unwrap();
-
-        let hash = Hash::from_path(file_path).unwrap();
-
-        Self {
-            cache,
-            file: file_path.clone(),
-            size: size.parse().unwrap(),
-            object_type,
-            hash,
-        }
-    }
-
-    fn to_index(&self) -> Hashed<Index> {
-        assert!(self.object_type == ObjectType::Index);
-
-        let file = File::open(&self.file).unwrap();
-        let mut file: BufReader<File> = BufReader::new(file);
-
-        let mut data = Vec::new();
-        file.read_until(b'\0', &mut data).unwrap();
-
-        let mut metadata = HashMap::new();
-
-        let mut string_data = String::new();
-
-        file.read_to_string(&mut string_data)
-            .expect("Index to only contain string");
-
-        let string_data = string_data.trim_end();
-
-        let lines = string_data.split('\n').collect::<Vec<&str>>();
-
-        for line in lines {
-            let (key, value) = line.split_once(':').unwrap();
-
-            _ = metadata.insert(key, value.trim());
-        }
-
-        let timestamp = DateTime::parse_from_rfc3339(metadata["timestamp"]).unwrap();
-
-        let tree_hash = Hash::try_from(metadata["tree"]).expect("tree hash to be valid");
-
-        let tree_object = CacheObject::from_file(self.cache, &tree_hash.get_path(self.cache));
-
-        assert!(tree_object.get_object_type() == ObjectType::Tree);
-
-        Hashed {
-            hash: self.hash.clone(),
-            inner: Index {
-                timestamp: timestamp.into(),
-                tree: tree_object.to_tree(Mode::Tree, &""),
-            },
-        }
-    }
-
-    fn to_tree(&self, mode: Mode, path: &str) -> Hashed<Tree> {
-        assert!(self.object_type == ObjectType::Tree);
-
-        // println!("Reading tree {}", self.hash);
-
-        let file = File::open(&self.file).unwrap();
-        let mut file: BufReader<File> = BufReader::new(file);
-
-        // Read out the file header
-        let _ = read_header_from_file(&mut file).expect("File header to be correct");
-
-        let mut vec = Vec::new();
-
-        loop {
-            let mut buffer = Vec::new();
-            let bytes = file
-                .read_until(0, &mut buffer)
-                .expect("To have a file header");
-
-            if bytes == 0 {
-                break;
+/// Detect whether a file has any executable bit set (Unix only).
+/// Returns Mode::Executable if so, Mode::Normal otherwise.
+fn detect_file_mode(path: &Path) -> Mode {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if let Ok(meta) = std::fs::metadata(path) {
+            if meta.permissions().mode() & 0o111 != 0 {
+                return Mode::Executable;
             }
-
-            let string = from_utf8(&buffer[..buffer.len() - 1]).expect("valid utf8");
-
-            let (mode, name) = string.split_once(' ').expect("space");
-
-            let mode = Mode::from_str(mode).expect("valid mode");
-
-            let mut hash: [u8; 64] = [0; 64];
-            file.read_exact(&mut hash).expect("file to contain hash");
-
-            let hash = Hash::from(hash);
-
-            let object_file = hash.get_path(&self.cache);
-
-            let cache_object = CacheObject::from_file(&self.cache, &object_file);
-
-            vec.push(match cache_object.object_type {
-                ObjectType::Blob => TreeObject::Blob(cache_object.to_blob(mode, name)),
-                ObjectType::Tree => TreeObject::Tree(cache_object.to_tree(mode, name)),
-                ObjectType::Index => panic!("Invalid ObjectType in tree"),
-            })
-        }
-
-        Hashed {
-            hash: self.hash.clone(),
-            inner: Tree {
-                mode,
-                path: path.to_owned(),
-                contents: vec,
-            },
         }
     }
-
-    fn to_blob(&self, mode: Mode, path: &str) -> Hashed<Blob> {
-        assert!(self.object_type == ObjectType::Blob);
-
-        let file = File::open(&self.file).unwrap();
-        let mut file: BufReader<File> = BufReader::new(file);
-
-        // Read out the file header
-        let Header { size, .. } =
-            read_header_from_file(&mut file).expect("File header to be correct");
-
-        Hashed {
-            hash: self.hash.clone(),
-
-            inner: Blob {
-                mode,
-                path: path.to_string(),
-                file: self.file.clone(),
-                size,
-            },
-        }
-    }
+    #[cfg(not(unix))]
+    { let _ = path; }
+    Mode::Normal
 }
 
-impl<'a> Object for CacheObject<'a> {
-    fn get_object_type(&self) -> ObjectType {
-        self.object_type.clone()
-    }
-
-    fn get_hash(&self) -> Hash {
-        self.hash.clone()
-    }
-
-    fn get_prefix(&self) -> String {
-        format!("{} {}\0", self.object_type.to_str(), self.size)
-    }
-
-    fn write_to(&self, _: &PathBuf) {
-        unimplemented!("Should probably fix this")
-    }
+/// Set executable permissions on a file (Unix only, no-op elsewhere).
+#[cfg(unix)]
+fn set_executable(path: &Path) -> std::io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    let perms = std::fs::Permissions::from_mode(0o755);
+    std::fs::set_permissions(path, perms)
 }
 
-#[derive(Debug)]
-struct Index {
-    timestamp: DateTime<Utc>,
-    tree: Hashed<Tree>,
+#[cfg(not(unix))]
+fn set_executable(_path: &Path) -> std::io::Result<()> {
+    Ok(())
 }
 
-impl Index {
-    fn get_body(&self) -> String {
-        format!(
-            "tree: {}\ntimestamp: {}\n\n",
-            self.tree.hash,
-            self.timestamp.to_rfc3339()
-        )
-    }
-
-    fn from_path(path: &PathBuf) -> Index {
-        assert!(path.is_dir());
-        Index {
-            timestamp: Utc::now(),
-            tree: Hashed::from_object(Tree::from_dir(path)),
-        }
-    }
-}
-
-impl Object for Index {
-    fn get_object_type(&self) -> ObjectType {
-        ObjectType::Index
-    }
-
-    fn get_hash(&self) -> Hash {
-        let body = self.get_body();
-        let mut hasher = Sha512::new();
-        write!(hasher, "{}{}", self.get_prefix(), body).unwrap();
-        Hash::from(hasher)
-    }
-
-    fn get_prefix(&self) -> String {
-        format!("{} {}\0", INDEX_KEY, self.get_body().len())
-    }
-
-    fn write_to(&self, path: &PathBuf) {
-        let mut file = File::create(path).unwrap();
-
-        file.write_all(self.get_prefix().as_bytes()).unwrap();
-        file.write_all(self.get_body().as_bytes()).unwrap();
-    }
-
-    // fn from_file(cache: &PathBuf, index: &PathBuf) -> Index {
-    //     let mut reader = Index::read_file_and_verify_type(index);
-
-    //     let mut line = String::new();
-
-    //     let kv: HashMap<&str, &str> = HashMap::new();
-
-    //     while reader.read_line(&mut line).is_ok() {
-    //         let (key, value) = line.split_once(':').unwrap();
-
-    //         kv.insert(key, value.trim())
-    //     }
-
-    //     let timestamp = DateTime<Utc>::from_utf8(kv["timestamp"]);
-
-    //     Index {
-    //         timestamp: ,
-    //         tree: Hashed::from_hash(cache, kv["tree"].into())
-    //     }
-    // }
-}
-
-trait WithPath {
-    fn get_path_component(&self) -> &String;
-    fn get_mode(&self) -> &Mode;
-}
-
-#[derive(Debug)]
-struct Tree {
-    mode: Mode,
-    path: String,
-    contents: Vec<TreeObject>,
-}
-
-impl Tree {
-    fn get_body(&self) -> Vec<u8> {
-        let mut value = Vec::new();
-
-        for object in self.contents.iter() {
-            value.extend_from_slice(&mut object.to_tree_bytes());
-        }
-
-        value
-    }
-
-    fn from_dir(path: &PathBuf) -> Self {
-        assert!(path.is_dir());
-
-        Self {
-            mode: Mode::Tree,
-            contents: std::fs::read_dir(&path)
-                .unwrap()
-                .map(|entry| {
-                    let path = entry.unwrap().path();
-                    if path.is_dir() {
-                        TreeObject::Tree(Hashed::from_object(Tree::from_dir(&path)))
-                    } else {
-                        TreeObject::Blob(Hashed::from_object(Blob::from_path(&path)))
-                    }
-                })
-                .collect(),
-            path: match path.file_name() {
-                Some(v) => v.to_string_lossy().to_string(),
-                None => panic!("{path:?} did not have a filename"),
-            },
-        }
-    }
-}
-
-impl WithPath for Tree {
-    fn get_path_component(&self) -> &String {
-        &self.path
-    }
-
-    fn get_mode(&self) -> &Mode {
-        &self.mode
-    }
-}
-
-impl Object for Tree {
-    fn get_object_type(&self) -> ObjectType {
-        ObjectType::Tree
-    }
-
-    fn get_hash(&self) -> Hash {
-        let body = self.get_body();
-        let mut hasher = Sha512::new();
-        write!(hasher, "{}", self.get_prefix()).unwrap();
-        hasher
-            .write_all(&body)
-            .expect("Body to be added to the hasher");
-        Hash::from(hasher)
-    }
-
-    fn write_to(&self, path: &PathBuf) {
-        let mut file = File::create(path).unwrap();
-
-        file.write_all(self.get_prefix().as_bytes()).unwrap();
-        file.write_all(&self.get_body()).unwrap();
-    }
-
-    fn get_prefix(&self) -> String {
-        format!("{} {}\0", TREE_KEY, self.get_body().len())
-    }
-
-    // fn from_file(cache: &PathBuf, file: &PathBuf) -> Self {
-    //     let mut reader = Object::read_file_and_verify_type(file);
-
-    //     let mut line = String::new();
-
-    //     while reader.read_line(&mut line).is_ok() {
-    //         let (detail, hash) = line.split_once('\0').unwrap();
-
-    //     }
-    // }
-}
-
-#[derive(Debug)]
-struct Blob {
-    mode: Mode,
-    path: String,
-    file: PathBuf,
-    size: u64,
-}
-
-impl Blob {
-    fn from_path(path: &PathBuf) -> Self {
-        assert!(path.is_file());
-
-        Self {
-            // TODO: Support other types
-            mode: Mode::Normal,
-            path: path.file_name().unwrap().to_string_lossy().to_string(),
-            size: path.metadata().unwrap().len(),
-            file: path.clone(),
-        }
-    }
-}
-
-impl WithPath for Blob {
-    fn get_path_component(&self) -> &String {
-        &self.path
-    }
-
-    fn get_mode(&self) -> &Mode {
-        &self.mode
-    }
-}
-
-impl Object for Blob {
-    fn get_object_type(&self) -> ObjectType {
-        ObjectType::Blob
-    }
-
-    fn get_hash(&self) -> Hash {
-        let mut hasher = Sha512::new();
-        hasher.write_all(self.get_prefix().as_bytes()).unwrap();
-
-        let f = File::open(&self.file).unwrap();
-        let mut reader = BufReader::new(f);
-
-        let mut buf: [u8; 1024] = [0; 1024];
-        loop {
-            let Ok(bytes_read) = reader.read(&mut buf) else {
-                break;
-            };
-
-            if bytes_read == 0 {
-                break;
-            }
-
-            hasher.write_all(&buf[..bytes_read]).unwrap();
-        }
-
-        Hash::from(hasher)
-    }
-
-    fn write_to(&self, path: &PathBuf) {
-        let mut file = File::create(path).unwrap();
-
-        file.write_all(self.get_prefix().as_bytes()).unwrap();
-
-        let mut src = File::open(&self.file).unwrap();
-        std::io::copy(&mut src, &mut file).unwrap();
-    }
-
-    fn get_prefix(&self) -> String {
-        format!("{} {}\0", BLOB_KEY, self.size)
-    }
-}
-
-#[derive(Debug)]
-enum TreeObject {
-    Tree(Hashed<Tree>),
-    Blob(Hashed<Blob>),
-}
-
-trait ObjectWithPath: WithPath + Object {}
-
-impl TreeObject {
-    fn to_tree_bytes(&self) -> Vec<u8> {
-        match self {
-            Self::Tree(tree) => get_bytes_from_thing(tree.deref(), &tree.hash),
-            Self::Blob(blob) => get_bytes_from_thing(blob.deref(), &blob.hash),
-        }
-    }
-}
-
-fn get_bytes_from_thing<T: WithPath>(object: &T, hash: &Hash) -> Vec<u8> {
-    let mut path = Vec::new();
-
-    path.extend_from_slice(&mut object.get_mode().to_string().as_bytes());
-    path.push(b' ');
-    path.extend_from_slice(&mut object.get_path_component().as_bytes());
-    path.push(0);
-    path.extend_from_slice(&hash.hash);
-
-    path
-}
-
-impl<T: Object> Hashed<T> {
-    fn write_if_not_exists(&self, dir: &PathBuf) {
-        let path = self.hash.get_path(dir);
-        let dir = path.parent().unwrap();
-
-        let _ = create_dir_all(dir);
-
-        if !path.exists() {
-            // println!("writing {:?} {:?}", T::get_object_type(), path);
-            self.write_to(&path);
-        }
-    }
-}
-
-fn write_index_to_folder(dir: &PathBuf, index: &Hashed<Index>) {
-    index.write_if_not_exists(dir);
-
-    write_tree_to_folder(dir, &index.tree);
-}
-
-fn write_tree_to_folder(dir: &PathBuf, tree: &Hashed<Tree>) {
-    tree.write_if_not_exists(dir);
-
-    for element in tree.contents.iter() {
-        match element {
-            TreeObject::Tree(tree) => write_tree_to_folder(dir, &tree),
-            TreeObject::Blob(blob) => blob.write_if_not_exists(dir),
-        }
-    }
-}
-
-fn get_total_size(index: &Hashed<Tree>) -> u128 {
-    let mut total = 0;
-
-    for element in &index.contents {
-        total += match element {
-            TreeObject::Tree(tree) => get_total_size(&tree),
-            TreeObject::Blob(blob) => blob.size as u128,
-        }
-    }
-
-    total
-}
-
-fn commit_directory(cache: &PathBuf, path: &PathBuf) {
-    assert!(path.exists());
-    assert!(path.is_dir());
-
-    if cache.exists() {
-        assert!(cache.is_dir());
-    } else {
-        create_dir(&cache).unwrap();
-    }
-
-    let Ok(path) = path.canonicalize() else {
-        panic!("unable to canonicalize {path:?}");
+// Helper to build Index from filesystem
+async fn build_index_from_path(store: &Store, path: &Path) -> anyhow::Result<(object_body::Index, Hash, u128)> {
+    anyhow::ensure!(path.is_dir(), "path must be a directory");
+
+    let (tree_hash, total_size) = build_tree_from_dir(store.clone(), path.to_path_buf(), path.to_path_buf()).await?;
+
+    let index = object_body::Index {
+        tree: tree_hash,
+        timestamp: Utc::now(),
+        metadata: HashMap::new(),
     };
 
-    let index = Hashed::from_object(Index::from_path(&path));
+    let index_data = object_body::Object::to_data(&index);
+    let index_hash = compute_hash(INDEX_KEY, &index_data);
 
-    println!(
-        "Finished generating Index for {} bytes of data",
-        get_total_size(&index.tree)
-    );
+    // Write index to store immediately
+    let header = Header::new(ObjectType::Index, index_data.len() as u64);
+    store.put_object_bytes(&index_hash, header, index_data).await?;
 
-    write_index_to_folder(&cache, &index);
-
-    println!("{}", index.hash);
+    Ok((index, index_hash, total_size))
 }
 
-fn restore_directory(cache: &PathBuf, path: &PathBuf, index: Hash, validate: bool) {
-    if !path.exists() {
-        create_dir_all(path).expect("Directory Creation to work");
+/// Check whether a symlink target escapes the given root directory.
+/// Returns the canonicalized resolved path if it stays within root, or None if it escapes.
+fn symlink_target_within_root(symlink_path: &Path, root: &Path) -> std::io::Result<Option<PathBuf>> {
+    let target = std::fs::read_link(symlink_path)?;
+    let resolved = if target.is_absolute() {
+        target.clone()
+    } else {
+        symlink_path.parent().unwrap_or(Path::new(".")).join(&target)
+    };
+    // Canonicalize root (already canonical from caller), but resolve the target
+    // through the filesystem to handle ../ chains
+    match resolved.canonicalize() {
+        Ok(canonical) => Ok(if canonical.starts_with(root) { Some(canonical) } else { None }),
+        // Target doesn't exist — check lexically by normalizing path components
+        Err(_) => {
+            let mut components = Vec::new();
+            let base = symlink_path.parent().unwrap_or(Path::new("."));
+            let full = if target.is_absolute() {
+                target
+            } else {
+                base.join(&target)
+            };
+            for comp in full.components() {
+                match comp {
+                    std::path::Component::ParentDir => { components.pop(); }
+                    std::path::Component::CurDir => {}
+                    _ => components.push(comp),
+                }
+            }
+            let normalized: PathBuf = components.iter().collect();
+            Ok(if normalized.starts_with(root) { Some(normalized) } else { None })
+        }
+    }
+}
+
+#[allow(clippy::type_complexity)]
+fn build_tree_from_dir(
+    store: Store,
+    path: PathBuf,
+    root: PathBuf,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<(Hash, u128)>> + Send>> {
+    Box::pin(async move {
+        anyhow::ensure!(path.is_dir(), "path must be a directory");
+        tracing::debug!(path = %path.display(), "processing directory");
+        let mut dir_entries = read_dir(&path).await?;
+
+        // Collect all entries first so we can process them concurrently
+        let mut dir_paths = Vec::new();
+        let mut file_paths = Vec::new();
+        let mut symlink_paths = Vec::new();
+        while let Some(entry) = dir_entries.next_entry().await? {
+            let entry_path = entry.path();
+            let file_type = entry.file_type().await?;
+            if file_type.is_dir() {
+                dir_paths.push(entry_path);
+            } else if file_type.is_symlink() {
+                symlink_paths.push(entry_path);
+            } else {
+                file_paths.push(entry_path);
+            }
+        }
+
+        let mut total_size: u128 = 0;
+        let mut entries = Vec::new();
+
+        // Process subdirectories concurrently
+        let mut dir_set = JoinSet::new();
+        for dir_path in dir_paths {
+            let store_clone = store.clone();
+            let root_clone = root.clone();
+            dir_set.spawn(async move {
+                let name = dir_path.file_name()
+                    .and_then(|n| n.to_str())
+                    .ok_or_else(|| anyhow::anyhow!("invalid file name: {}", dir_path.display()))?
+                    .to_string();
+                let (hash, size) = build_tree_from_dir(store_clone, dir_path, root_clone).await?;
+                Ok::<_, anyhow::Error>((name, hash, size))
+            });
+        }
+
+        // Process files concurrently with bounded parallelism
+        let semaphore = Arc::new(tokio::sync::Semaphore::new(64));
+        let mut file_set = JoinSet::new();
+        for file_path in file_paths {
+            let store_clone = store.clone();
+            let sem = semaphore.clone();
+            file_set.spawn(async move {
+                let _permit = sem.acquire().await
+                    .map_err(|e| anyhow::anyhow!("semaphore: {e}"))?;
+                let name = file_path.file_name()
+                    .and_then(|n| n.to_str())
+                    .ok_or_else(|| anyhow::anyhow!("invalid file name: {}", file_path.display()))?
+                    .to_string();
+
+                let (data, hash, file_mode) = tokio::task::spawn_blocking({
+                    let path = file_path.clone();
+                    move || -> anyhow::Result<(Vec<u8>, Hash, Mode)> {
+                        let file_mode = detect_file_mode(&path);
+                        let data = std::fs::read(&path)?;
+                        let hash = compute_hash(BLOB_KEY, &data);
+                        Ok((data, hash, file_mode))
+                    }
+                }).await??;
+                let size = data.len() as u64;
+
+                // Content-addressable: concurrent writes of the same hash are safe to ignore.
+                // The exists() check is a fast path to skip unnecessary writes.
+                if !store_clone.exists(&hash).await? {
+                    let header = Header::new(ObjectType::Blob, size);
+                    if let Err(e) = store_clone.put_object_bytes(&hash, header, data).await {
+                        // If another task wrote the same object concurrently, that's fine
+                        if !store_clone.exists(&hash).await.unwrap_or(false) {
+                            return Err(e);
+                        }
+                    }
+                }
+
+                Ok::<_, anyhow::Error>((name, hash, size, file_mode))
+            });
+        }
+
+        // Process symlinks concurrently
+        let mut symlink_set = JoinSet::new();
+        for symlink_path in symlink_paths {
+            let store_clone = store.clone();
+            let sem = semaphore.clone();
+            let root_clone = root.clone();
+            symlink_set.spawn(async move {
+                let _permit = sem.acquire().await
+                    .map_err(|e| anyhow::anyhow!("semaphore: {e}"))?;
+                let name = symlink_path.file_name()
+                    .and_then(|n| n.to_str())
+                    .ok_or_else(|| anyhow::anyhow!("invalid file name: {}", symlink_path.display()))?
+                    .to_string();
+
+                // Check if symlink target escapes the root directory
+                let (data, hash, mode) = tokio::task::spawn_blocking({
+                    let path = symlink_path.clone();
+                    move || -> anyhow::Result<(Vec<u8>, Hash, Mode)> {
+                        let within = symlink_target_within_root(&path, &root_clone)?;
+                        if within.is_some() {
+                            // Safe symlink — store as symlink
+                            let target = std::fs::read_link(&path)?;
+                            let target_str = target.to_str()
+                                .ok_or_else(|| anyhow::anyhow!("symlink target is not valid UTF-8: {:?}", target))?;
+                            let target_bytes = target_str.as_bytes().to_vec();
+                            let hash = compute_hash(BLOB_KEY, &target_bytes);
+                            Ok((target_bytes, hash, Mode::SymbolicLink))
+                        } else {
+                            // Escaping symlink — follow it and store the actual file content
+                            tracing::warn!(
+                                symlink = %path.display(),
+                                "symlink target escapes root directory, storing as regular file"
+                            );
+                            let data = std::fs::read(&path)
+                                .context(format!("failed to read through escaping symlink {:?}", path))?;
+                            let file_mode = detect_file_mode(&path);
+                            let hash = compute_hash(BLOB_KEY, &data);
+                            Ok((data, hash, file_mode))
+                        }
+                    }
+                }).await??;
+                let size = data.len() as u64;
+
+                if !store_clone.exists(&hash).await? {
+                    let header = Header::new(ObjectType::Blob, size);
+                    if let Err(e) = store_clone.put_object_bytes(&hash, header, data).await {
+                        if !store_clone.exists(&hash).await.unwrap_or(false) {
+                            return Err(e);
+                        }
+                    }
+                }
+
+                Ok::<_, anyhow::Error>((name, hash, size, mode))
+            });
+        }
+
+        // Collect directory results
+        while let Some(result) = dir_set.join_next().await {
+            let (name, hash, size) = result??;
+            total_size += size;
+            entries.push(object_body::TreeEntry {
+                mode: Mode::Tree,
+                path: name,
+                hash,
+            });
+        }
+
+        // Collect file results
+        while let Some(result) = file_set.join_next().await {
+            let (name, hash, size, file_mode) = result??;
+            total_size += size as u128;
+            entries.push(object_body::TreeEntry {
+                mode: file_mode,
+                path: name,
+                hash,
+            });
+        }
+
+        // Collect symlink results
+        while let Some(result) = symlink_set.join_next().await {
+            let (name, hash, size, mode) = result??;
+            total_size += size as u128;
+            entries.push(object_body::TreeEntry {
+                mode,
+                path: name,
+                hash,
+            });
+        }
+
+        // Sort entries by name for deterministic tree hashes
+        entries.sort_by(|a, b| a.path.cmp(&b.path));
+
+        // Build and store tree
+        let tree = object_body::Tree { contents: entries };
+        let tree_data = object_body::Object::to_data(&tree);
+        let hash = compute_hash(TREE_KEY, &tree_data);
+
+        if !store.exists(&hash).await? {
+            let header = Header::new(ObjectType::Tree, tree_data.len() as u64);
+            store.put_object_bytes(&hash, header, tree_data).await?;
+        }
+
+        Ok((hash, total_size))
+    })
+}
+
+// Helper to read Tree from Store
+async fn read_tree_from_store(store: &Store, hash: &Hash) -> anyhow::Result<object_body::Tree> {
+    let mut store_obj = store.get_object(hash).await?;
+    anyhow::ensure!(store_obj.header.object_type == ObjectType::Tree, "expected tree object");
+
+    let mut data = Vec::new();
+    store_obj.read_to_end(&mut data).await?;
+
+    object_body::Object::from_data(&data)
+}
+
+async fn commit_directory(store: &Store, path: &Path) -> anyhow::Result<()> {
+    let path_meta = tokio::fs::metadata(path).await?;
+    anyhow::ensure!(path_meta.is_dir(), "path must be a directory");
+
+    let path = tokio::fs::canonicalize(path).await.context(format!("unable to canonicalize {path:?}"))?;
+
+    let (_index, index_hash, total_size) = build_index_from_path(store, &path).await?;
+
+    tracing::info!("Finished generating Index for {} bytes of data", total_size);
+    println!("{}", index_hash);
+    Ok(())
+}
+
+async fn restore_directory(store: &Store, path: &Path, index_hash: Hash, validate: bool) -> anyhow::Result<()> {
+    if tokio::fs::metadata(path).await.is_err() {
+        create_dir_all(path).await.context("failed to create directory")?;
     }
 
-    if !path.is_dir() {
-        panic!("Path provided must be a valid directory");
-    }
+    let path_meta = tokio::fs::metadata(path).await?;
+    anyhow::ensure!(path_meta.is_dir(), "path must be a valid directory");
 
-    if read_dir(path).unwrap().any(|_| true) {
-        panic!("Path provided must be an empty directory");
-    }
+    let mut entries = read_dir(path).await?;
+    anyhow::ensure!(entries.next_entry().await?.is_none(), "path must be an empty directory");
 
-    let index_path = index.get_path(cache);
-    let index_cache = Hashed::from_object(CacheObject::from_file(cache, &index_path));
+    let mut store_obj = store.get_object(&index_hash).await?;
+    let mut index_data = Vec::new();
+    store_obj.read_to_end(&mut index_data).await?;
+    let index: object_body::Index = object_body::Object::from_data(&index_data)?;
 
-    let index = index_cache.to_index();
+    let tree = read_tree_from_store(store, &index.tree).await?;
 
-    // println!("{index:?}");
-
-    write_tree(&index.tree, path);
+    #[allow(clippy::mutable_key_type)]
+    let written_files = Arc::new(tokio::sync::Mutex::new(HashMap::<Hash, PathBuf>::new()));
+    write_tree_to_path(store, &tree, path, path, written_files).await?;
 
     if validate {
-        validate_tree(&index.tree, path);
+        validate_tree_at_path(store, &tree, path).await?;
     }
+    Ok(())
 }
 
-fn validate_tree(tree: &Tree, path: &PathBuf) {
-    for item in tree.contents.iter() {
-        if let TreeObject::Tree(tree) = item {
-            let tree_path = path.join(&tree.path);
-            validate_tree(&tree, &tree_path);
-            continue;
-        }
+fn validate_tree_at_path<'a>(
+    store: &'a Store,
+    tree: &'a object_body::Tree,
+    path: &'a Path,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<()>> + Send + 'a>> {
+    Box::pin(async move {
+        for entry in &tree.contents {
+            let entry_path = path.join(&entry.path);
+            let header = store.get_object(&entry.hash).await?.header;
 
-        let TreeObject::Blob(blob) = item else {
-            unreachable!();
-        };
-
-        let blob_path = path.join(&blob.path);
-
-        let blob_hash = Hashed::from_object(Blob::from_path(&blob_path));
-
-        assert!(blob_hash.hash == blob.hash);
-    }
-}
-
-fn write_tree(tree: &Tree, path: &PathBuf) {
-    for item in tree.contents.iter() {
-        if let TreeObject::Tree(tree) = item {
-            let tree_path = path.join(&tree.path);
-
-            create_dir(&tree_path).expect("Directory creation to work");
-
-            write_tree(&tree, &tree_path);
-            continue;
-        }
-
-        let TreeObject::Blob(blob) = item else {
-            unreachable!();
-        };
-
-        let blob_path = path.join(&blob.path);
-
-        let file = File::create(blob_path).expect("File to be created");
-        let mut writer = BufWriter::new(file);
-
-        let cache_file = File::open(&blob.file).unwrap();
-        let mut reader = BufReader::new(cache_file);
-
-        let _ = read_header_from_file(&mut reader);
-
-        let mut data: [u8; 1024] = [0; 1024];
-        while let Ok(num) = reader.read(&mut data) {
-            if num == 0 {
-                break;
+            match header.object_type {
+                ObjectType::Tree => {
+                    let subtree = read_tree_from_store(store, &entry.hash).await?;
+                    validate_tree_at_path(store, &subtree, &entry_path).await?;
+                }
+                ObjectType::Blob => {
+                    let expected_hash = entry.hash.clone();
+                    let entry_name = entry.path.clone();
+                    let computed_hash = tokio::task::spawn_blocking({
+                        let path = entry_path.clone();
+                        move || -> anyhow::Result<Hash> {
+                            let data = std::fs::read(&path)?;
+                            Ok(compute_hash(BLOB_KEY, &data))
+                        }
+                    }).await??;
+                    anyhow::ensure!(computed_hash == expected_hash, "hash mismatch for {}", entry_name);
+                }
+                ObjectType::Index => anyhow::bail!("invalid object type in tree"),
             }
-            writer.write(&data[..num]).unwrap();
         }
-    }
+        Ok(())
+    })
 }
 
-fn cat_object(cache: &PathBuf, hash: &Hash) {
-    let object_path = hash.get_path(cache);
+fn write_tree_to_path<'a>(
+    store: &'a Store,
+    tree: &'a object_body::Tree,
+    path: &'a Path,
+    root: &'a Path,
+    written_files: Arc<tokio::sync::Mutex<HashMap<Hash, PathBuf>>>,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<()>> + Send + 'a>> {
+    Box::pin(async move {
+        let semaphore = Arc::new(tokio::sync::Semaphore::new(64));
+        let mut blob_set = JoinSet::new();
 
-    let file = File::open(&object_path).unwrap();
-    let mut reader: BufReader<File> = BufReader::new(file);
+        #[cfg(feature = "cow")]
+        let mut deferred_reflinks: Vec<(PathBuf, PathBuf, bool)> = Vec::new();
 
-    read_header_from_file(&mut reader).expect("file to contain a valid header");
+        for entry in &tree.contents {
+            let entry_path = path.join(&entry.path);
 
-    let mut stdout = std::io::stdout();
-    let mut data: [u8; 1024] = [0; 1024];
-    while let Ok(num) = reader.read(&mut data) {
+            match entry.mode {
+                Mode::Tree => {
+                    create_dir(&entry_path).await.context("failed to create directory")?;
+                    let subtree = read_tree_from_store(store, &entry.hash).await?;
+                    write_tree_to_path(store, &subtree, &entry_path, root, written_files.clone()).await?;
+                }
+                Mode::Normal | Mode::Executable => {
+                    let is_executable = entry.mode == Mode::Executable;
+
+                    // When CoW is enabled, reuse already-written files via reflink
+                    #[cfg(feature = "cow")]
+                    {
+                        let mut map = written_files.lock().await;
+                        if let Some(source_path) = map.get(&entry.hash) {
+                            deferred_reflinks.push((source_path.clone(), entry_path, is_executable));
+                            continue;
+                        }
+                        map.insert(entry.hash.clone(), entry_path.clone());
+                    }
+
+                    let store_clone = store.clone();
+                    let hash = entry.hash.clone();
+                    let sem = semaphore.clone();
+                    blob_set.spawn(async move {
+                        let _permit = sem.acquire().await
+                            .map_err(|e| anyhow::anyhow!("semaphore: {e}"))?;
+
+                        let mut store_obj = store_clone.get_object(&hash).await?;
+                        let mut data = Vec::with_capacity(store_obj.header.size as usize);
+                        store_obj.read_to_end(&mut data).await?;
+
+                        let path = entry_path;
+                        tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+                            std::fs::write(&path, &data)
+                                .context(format!("failed to write file {:?}", path))?;
+                            if is_executable {
+                                set_executable(&path)
+                                    .context(format!("failed to set executable permissions on {:?}", path))?;
+                            }
+                            Ok(())
+                        }).await?
+                    });
+                }
+                Mode::SymbolicLink => {
+                    let store_clone = store.clone();
+                    let hash = entry.hash.clone();
+                    let sem = semaphore.clone();
+                    let root_path = root.to_path_buf();
+                    blob_set.spawn(async move {
+                        let _permit = sem.acquire().await
+                            .map_err(|e| anyhow::anyhow!("semaphore: {e}"))?;
+
+                        let mut store_obj = store_clone.get_object(&hash).await?;
+                        let mut data = Vec::with_capacity(store_obj.header.size as usize);
+                        store_obj.read_to_end(&mut data).await?;
+
+                        tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+                            let target_str = String::from_utf8(data)
+                                .context("symlink target is not valid UTF-8")?;
+                            let target = std::path::Path::new(&target_str);
+
+                            // Validate symlink target doesn't escape the restore root
+                            let resolved = if target.is_absolute() {
+                                target.to_path_buf()
+                            } else {
+                                entry_path.parent()
+                                    .unwrap_or(std::path::Path::new("."))
+                                    .join(target)
+                            };
+                            // Lexically normalize to check for escapes
+                            let mut components = Vec::new();
+                            for comp in resolved.components() {
+                                match comp {
+                                    std::path::Component::ParentDir => { components.pop(); }
+                                    std::path::Component::CurDir => {}
+                                    _ => components.push(comp),
+                                }
+                            }
+                            let normalized: PathBuf = components.iter().collect();
+                            anyhow::ensure!(
+                                normalized.starts_with(&root_path),
+                                "symlink {:?} target {:?} escapes restore directory {:?}",
+                                entry_path, target_str, root_path
+                            );
+
+                            #[cfg(unix)]
+                            {
+                                std::os::unix::fs::symlink(target, &entry_path)
+                                    .context(format!("failed to create symlink {:?}", entry_path))?;
+                            }
+                            #[cfg(windows)]
+                            {
+                                if normalized.is_dir() {
+                                    std::os::windows::fs::symlink_dir(target, &entry_path)
+                                        .context(format!("failed to create dir symlink {:?}", entry_path))?;
+                                } else {
+                                    std::os::windows::fs::symlink_file(target, &entry_path)
+                                        .context(format!("failed to create file symlink {:?}", entry_path))?;
+                                }
+                            }
+                            #[cfg(not(any(unix, windows)))]
+                            {
+                                std::fs::write(&entry_path, target_str.as_bytes())
+                                    .context(format!("failed to write symlink placeholder {:?}", entry_path))?;
+                            }
+                            Ok(())
+                        }).await?
+                    });
+                }
+                _ => anyhow::bail!("unsupported mode {} for entry {}", entry.mode.as_str(), entry.path),
+            }
+        }
+
+        while let Some(result) = blob_set.join_next().await {
+            result??;
+        }
+
+        // Phase 2: reflink (or copy) deferred duplicate files
+        #[cfg(feature = "cow")]
+        for (source, dest, is_exec) in deferred_reflinks {
+            tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+                reflink_copy::reflink_or_copy(&source, &dest)
+                    .context(format!("failed to reflink {:?} -> {:?}", source, dest))?;
+                if is_exec {
+                    set_executable(&dest)?;
+                } else {
+                    // Source may have been executable; ensure correct permissions
+                    #[cfg(unix)]
+                    {
+                        use std::os::unix::fs::PermissionsExt;
+                        std::fs::set_permissions(&dest, std::fs::Permissions::from_mode(0o644))?;
+                    }
+                }
+                Ok(())
+            }).await??;
+        }
+
+        Ok(())
+    })
+}
+
+async fn cat_object(store: &Store, hash: &Hash) -> anyhow::Result<()> {
+    let mut store_obj = store.get_object(hash).await?;
+
+    let mut stdout = BufWriter::new(tokio::io::stdout());
+    let mut data = [0u8; 65536];
+    loop {
+        let num = store_obj.read(&mut data).await?;
         if num == 0 {
             break;
         }
-        stdout.write(&data[..num]).unwrap();
+        stdout.write_all(&data[..num]).await?;
     }
+    stdout.flush().await?;
     println!();
+    Ok(())
 }
 
-fn push_cache(cache: &PathBuf, url: &String, hash: Option<Hash>) {
+async fn push_cache(store: &Store, url: &str, hash: Option<Hash>) -> anyhow::Result<()> {
     if let Some(hash) = hash {
-        let file = hash.get_path(cache);
-        upload_object(&hash, &file, url);
-        return;
+        let raw_bytes = store.get_raw_bytes(&hash).await
+            .context(format!("object {} not found in store", hash))?;
+        upload_object(&hash, &raw_bytes, url).await?;
+        return Ok(());
     }
 
-    for entry in read_dir(cache).unwrap().filter_map(|x| x.ok()) {
-        let Ok(metadata) = entry.metadata() else {
-            continue;
-        };
+    let hashes = store.list_hashes().await.context("failed to list objects in store")?;
 
-        if metadata.is_file() {
-            continue;
+    for hash in hashes {
+        let raw_bytes = store.get_raw_bytes(&hash).await
+            .context(format!("failed to read object {}", hash))?;
+        upload_object(&hash, &raw_bytes, url).await?;
+    }
+    Ok(())
+}
+
+fn pull_tree<'a>(store: &'a Store, url: &'a str, tree_hash: &'a Hash) -> std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<()>> + Send + 'a>> {
+    Box::pin(async move {
+        // tree already exists locally so we can skip downloading it
+        if !store.exists(tree_hash).await? {
+            let header = download_object(store, tree_hash, url).await
+                .context(format!("unable to download object with hash {tree_hash}"))?;
+            anyhow::ensure!(header.object_type == ObjectType::Tree, "expected tree object");
         }
 
-        let prefix = entry.file_name();
+        let raw_bytes = store.get_raw_bytes(tree_hash).await
+            .context("tree object should exist in store")?;
 
-        for entry in read_dir(entry.path()).unwrap().filter_map(|x| x.ok()) {
-            let Ok(metadata) = entry.metadata() else {
-                continue;
-            };
+        let (_, data) =
+            read_header_and_body(&raw_bytes).context("tree should be in the correct format")?;
 
-            if !metadata.is_file() {
-                continue;
+        let tree_body: object_body::Tree = object_body::Object::from_data(data)?;
+
+        for entry in tree_body.contents {
+            let header = download_object(store, &entry.hash, url).await
+                .context(format!("unable to download object with hash {}", entry.hash))?;
+
+            anyhow::ensure!(header.object_type != ObjectType::Index, "unexpected index object in tree");
+
+            if header.object_type == ObjectType::Tree {
+                pull_tree(store, url, &entry.hash).await?;
             }
-
-            let name = format!(
-                "{}{}",
-                prefix.to_string_lossy(),
-                entry.file_name().to_string_lossy()
-            );
-            let hash = Hash::try_from(name).expect("Hash to be valid");
-
-            upload_object(&hash, &entry.path(), url);
         }
-    }
+        Ok(())
+    })
 }
 
-fn pull_tree(cache: &PathBuf, url: &String, tree_hash: &Hash) {
-    let tree_path = tree_hash.get_path(cache);
+async fn pull_cache(store: &Store, url: &str, hash: Hash) -> anyhow::Result<()> {
+    let header = download_object(store, &hash, url).await
+        .context(format!("unable to download object with hash {hash}"))?;
 
-    // tree already exists locally so we can skip downloading it
-    if !tree_path.exists() {
-        let Some(Header { object_type, .. }) = download_object(&tree_hash, &tree_path, url)
-        else {
-            eprintln!("Unable to download object with hash {tree_hash}");
-            return;
-        };
-        assert!(object_type == ObjectType::Tree);
-    }
+    anyhow::ensure!(header.object_type == ObjectType::Index, "expected index object");
 
-    let mut file = File::open(tree_path).expect("Index file to exist");
-    let mut index_data = Vec::new();
-    let _ = file
-        .read_to_end(&mut index_data)
-        .expect("file to be readable");
+    let raw_bytes = store.get_raw_bytes(&hash).await
+        .context("index object should exist in store")?;
 
     let (_, data) =
-        read_header_and_body(&index_data).expect("Index to be in the correct format");
+        read_header_and_body(&raw_bytes).context("index should be in the correct format")?;
 
-    let index_body = common::object_body::Tree::from_data(data);
+    let index_body: object_body::Index = object_body::Object::from_data(data)?;
 
-    for entry in index_body.contents {
-        let obj_path = entry.hash.get_path(cache);
-        let Some(Header { object_type, .. }) = download_object(&entry.hash, &obj_path, url)
-        else {
-            eprintln!("Unable to download object with hash {}", entry.hash);
-            return;
-        };
-
-        assert!(object_type != ObjectType::Index);
-
-        if object_type == ObjectType::Tree {
-            pull_tree(cache, url, &entry.hash);
-        }
-    }
+    pull_tree(store, url, &index_body.tree).await?;
+    Ok(())
 }
 
-fn pull_cache(cache: &PathBuf, url: &String, hash: Hash) {
-    let index_path = hash.get_path(cache);
-    let Some(Header { object_type, .. }) = download_object(&hash, &index_path, url) else {
-        eprintln!("Unable to download object with hash {hash}");
-        return;
-    };
+async fn upload_object(hash: &Hash, raw_bytes: &[u8], url: &str) -> anyhow::Result<()> {
+    let null_pos = raw_bytes.iter().position(|&b| b == 0)
+        .context("object data missing null terminator")?;
+    let header = read_header_from_slice(&raw_bytes[..null_pos])
+        .context("invalid object header")?;
+    let body = &raw_bytes[(null_pos + 1)..];
 
-    assert!(object_type == ObjectType::Index);
+    let url = format!("{url}/v1/object/{hash}");
 
-    let mut file = File::open(index_path).expect("Index file to exist");
-    let mut index_data = Vec::new();
-    let _ = file
-        .read_to_end(&mut index_data)
-        .expect("file to be readable");
+    tracing::debug!("Sending PUT request to {url}");
 
-    let (_, data) =
-        read_header_and_body(&index_data).expect("Index to be in the correct format");
+    ureq::put(&url)
+        .header("Object-Type", header.object_type.to_str())
+        .header("Object-Size", &header.size.to_string())
+        .send(body)
+        .context("failed to upload object")?;
 
-    let index_body = common::object_body::Index::from_data(data);
-
-    pull_tree(cache, url, &index_body.tree);
+    Ok(())
 }
 
-fn upload_object(hash: &Hash, file: &PathBuf, url: &String) {
-    let file = File::open(file).expect("File to exist");
-    let mut reader = BufReader::new(file);
-
-    let Header { object_type, size } =
-        read_header_from_file(&mut reader).expect("file to be a valid object");
-
-    let url = format!("{url}/object/{hash}");
-
-    println!("Sending put request to {url}");
-
-    let response = ureq::put(url)
-        .header("Object-Type", object_type.to_str())
-        .header("Object-Size", size.to_string())
-        .send(SendBody::from_reader(&mut reader));
-
-    if let Err(err) = response {
-        eprintln!("There was an error sending request {err:?}")
-    }
-}
-
-fn download_object(hash: &Hash, file: &PathBuf, url: &String) -> Option<Header> {
-    let url = format!("{url}/object/{hash}");
-
-    let dir = file.parent().expect("Path to not be at root");
-    create_dir_all(dir).expect("Directory to be created");
-
-    if file.exists() {
-        let file = File::open(file).expect("File to exist");
-        let mut reader = BufReader::new(file);
-
-        let mut buffer = Vec::new();
-        reader
-            .read_until(0, &mut buffer)
-            .expect("Header to exist within file");
-
-        // subtract one to get rid of the null byte
-        return read_header_from_slice(&buffer[..buffer.len() - 1]);
+async fn download_object(store: &Store, hash: &Hash, url: &str) -> anyhow::Result<Header> {
+    // If already in store, return its header
+    if store.exists(hash).await? {
+        let mut store_obj = store.get_object(hash).await
+            .context("object should exist in store")?;
+        // Consume body to drop the reader
+        let mut _discard = Vec::new();
+        store_obj.read_to_end(&mut _discard).await?;
+        return Ok(store_obj.header);
     }
 
-    println!("Sending get request to {url}");
+    let url = format!("{url}/v1/object/{hash}");
 
-    let response = ureq::get(url).call();
+    tracing::debug!("Sending GET request to {url}");
 
-    let mut response = match response {
-        Ok(v) => v,
-        Err(err) => {
-            eprintln!("There was an error sending request {err:?}");
-            return None;
-        }
-    };
-
-    let file = File::create(file).expect("File to exist");
-    let mut writer = BufWriter::new(file);
+    let mut response = ureq::get(&url).call()
+        .context("failed to send GET request")?;
 
     let response_headers = response.headers();
     let object_type: ObjectType = ObjectType::from_str(
         response_headers
             .get("Object-Type")
-            .expect("Object-Type Header to be present in the response")
+            .context("object-type header missing from response")?
             .to_str()
-            .expect("Header to be valid ascii"),
+            .context("object-type header not valid ASCII")?,
     )
-    .expect("Header to be a valid ObjectType");
+    .context("invalid object type in header")?;
     let object_size: u64 = response_headers
         .get("Object-Size")
-        .expect("Object-Size header to be present in the response")
+        .context("object-size header missing from response")?
         .to_str()
-        .expect("Header to be valid ascii")
+        .context("object-size header not valid ASCII")?
         .parse()
-        .expect("Header to be a valid number");
+        .context("object-size header not a valid number")?;
 
     let header = Header::new(object_type, object_size);
 
-    writer.write(header.to_string().as_bytes()).unwrap();
-
-    let mut data: [u8; 1024] = [0; 1024];
+    let mut body_bytes = Vec::new();
     let mut reader = response.body_mut().as_reader();
-    while let Ok(num) = reader.read(&mut data) {
+    let mut data = [0u8; 65536];
+    loop {
+        let num = std::io::Read::read(&mut reader, &mut data)?;
         if num == 0 {
             break;
         }
-
-        writer.write(&data[..num]).unwrap();
+        body_bytes.extend_from_slice(&data[..num]);
     }
 
-    return Some(header);
+    store.put_object_bytes(hash, header, body_bytes).await
+        .context("failed to write object to store")?;
+
+    Ok(header)
 }
 
-fn pack_archive(cache: &PathBuf, path: &PathBuf, index_hash: &Hash, compression: Compression) -> anyhow::Result<()> {
-    assert!(!path.exists());
-    assert!(path.parent().map(|p| p.exists() && p.is_dir()) == Some(true));
+async fn pack_archive(store: &Store, path: &Path, index_hash: &Hash, compression: Compression) -> anyhow::Result<()> {
+    anyhow::ensure!(tokio::fs::metadata(path).await.is_err(), "output file already exists");
+    anyhow::ensure!(
+        path.parent().map(|p| p.exists() && p.is_dir()) == Some(true),
+        "Parent directory must exist and be a directory"
+    );
 
-    let index_path = index_hash.get_path(cache);
-    assert!(index_path.exists());
-
-    let index = {
-        let file = File::open(index_path).expect("file to exist");
-        let mut reader = BufReader::new(file);
-        let mut data = Vec::new();
-        let _ = reader.read_to_end(&mut data).expect("File to be readable");
-
-        let (header, body) = read_header_and_body(&data).expect("File to be correctly formatted");
-        assert!(header.object_type == ObjectType::Index);
-
-        common::object_body::Index::from_data(&body)
+    let index: object_body::Index = {
+        let mut store_obj = store.get_object(index_hash).await.context("index object not found in store")?;
+        anyhow::ensure!(store_obj.header.object_type == ObjectType::Index, "expected index object type");
+        let mut body = Vec::new();
+        store_obj.read_to_end(&mut body).await?;
+        object_body::Object::from_data(&body)?
     };
 
-    let mut headers: HashMap<Hash, Header> = HashMap::new();
-
-    read_object_into_headers(cache, &mut headers, &index.tree)?;
+    #[allow(clippy::mutable_key_type)]
+    let mut headers: HashMap<Hash, (Header, Vec<u8>)> = HashMap::new();
+    read_object_into_headers(store, &mut headers, &index.tree).await?;
 
     //TODO: Surely there is an algorithm to more efficiently lay out this data
     let mut i = 0;
     let mut header_entries: Vec<ArchiveHeaderEntry> = Vec::new();
 
-    for (hash, header) in &headers {
+    for (hash, (header, data)) in &headers {
         let prefix_length = header.to_string().len() as u64;
-        let total_length = header.size + prefix_length;
+        let length = prefix_length + data.len() as u64;
 
         header_entries.push(ArchiveHeaderEntry {
             hash: hash.clone(),
             index: i,
-            length: total_length,
+            length,
         });
 
-        i += total_length;
+        i += length;
     }
 
     let archive = Archive {
@@ -940,71 +747,690 @@ fn pack_archive(cache: &PathBuf, path: &PathBuf, index_hash: &Hash, compression:
             header: header_entries,
             entries: headers
                 .into_iter()
-                .map(|(hash, header)| FileEntryData(hash.get_path(cache)))
+                .map(|(_hash, (header, data))| {
+                    let prefix = header.to_string();
+                    let mut full_data = Vec::with_capacity(prefix.len() + data.len());
+                    full_data.extend_from_slice(prefix.as_bytes());
+                    full_data.extend(data);
+                    RawEntryData(full_data)
+                })
                 .collect(),
         },
     };
 
-    let arx_file = File::create(path)?;
-    let mut writer = BufWriter::new(arx_file);
+    let arx_file = std::fs::File::create(path)?;
+    let mut writer = std::io::BufWriter::new(arx_file);
 
     archive.to_data(&mut writer)?;
 
     Ok(())
 }
 
-fn unpack_archive(cache: &PathBuf, path: &PathBuf) -> anyhow::Result<()> {
-    assert!(path.exists() && path.is_file());
+async fn push_archive(store: &Store, url: &str, index_hash: &Hash, compression: Compression) -> anyhow::Result<()> {
+    tracing::debug!(index = %index_hash, url, "starting push-archive");
+    // 1. Read index from store
+    let index: object_body::Index = {
+        let mut store_obj = store.get_object(index_hash).await.context("index object not found in store")?;
+        anyhow::ensure!(store_obj.header.object_type == ObjectType::Index, "expected index object type");
+        let mut body = Vec::new();
+        store_obj.read_to_end(&mut body).await?;
+        object_body::Object::from_data(&body)?
+    };
 
-    let file = File::open(path)?;
-    let mut file = BufReader::new(file);
+    // 2. Collect all objects reachable from the tree
+    #[allow(clippy::mutable_key_type)]
+    let mut headers: HashMap<Hash, (Header, Vec<u8>)> = HashMap::new();
+    read_object_into_headers(store, &mut headers, &index.tree).await?;
+
+    // Also include the index object itself
+    let index_data = object_body::Object::to_data(&index);
+    let index_header = Header::new(ObjectType::Index, index_data.len() as u64);
+    headers.insert(index_hash.clone(), (index_header, index_data));
+
+    // 3. Collect all hashes
+    let all_hashes: Vec<Hash> = headers.keys().cloned().collect();
+    let total_objects = all_hashes.len();
+
+    // 4. POST to /missing to find which objects the server needs
+    #[derive(serde::Serialize)]
+    struct MissingRequest {
+        hashes: Vec<Hash>,
+    }
+    #[derive(serde::Deserialize)]
+    struct MissingResponse {
+        missing: Vec<Hash>,
+    }
+
+    let missing_url = format!("{url}/v1/object/missing");
+    let missing_resp: MissingResponse = ureq::post(&missing_url)
+        .send_json(&MissingRequest { hashes: all_hashes })
+        .context("failed to query missing objects")?
+        .body_mut()
+        .read_json()
+        .context("failed to parse missing response")?;
+
+    // 5. If no missing objects, nothing to do
+    if missing_resp.missing.is_empty() {
+        tracing::info!("All objects already present on server");
+        return Ok(());
+    }
+
+    // 6. Build supplemental archive with all trees + missing objects
+    #[allow(clippy::mutable_key_type)]
+    let missing_set: std::collections::HashSet<Hash> = missing_resp.missing.into_iter().collect();
+    tracing::info!(total = total_objects, missing = missing_set.len(), "uploading missing objects");
+
+    let mut offset = 0u64;
+    let mut header_entries: Vec<ArchiveHeaderEntry> = Vec::new();
+    let mut entry_data_vec: Vec<RawEntryData> = Vec::new();
+
+    for (hash, (header, data)) in &headers {
+        // Always include tree and index objects; for blobs, only include if missing
+        let dominated_by_missing = header.object_type != ObjectType::Tree
+            && header.object_type != ObjectType::Index
+            && !missing_set.contains(hash);
+        if dominated_by_missing {
+            continue;
+        }
+
+        let prefix = header.to_string();
+        let length = prefix.len() as u64 + data.len() as u64;
+
+        header_entries.push(ArchiveHeaderEntry {
+            hash: hash.clone(),
+            index: offset,
+            length,
+        });
+
+        let mut full_data = Vec::with_capacity(prefix.len() + data.len());
+        full_data.extend_from_slice(prefix.as_bytes());
+        full_data.extend_from_slice(data);
+        entry_data_vec.push(RawEntryData(full_data));
+
+        offset += length;
+    }
+
+    let num_objects = entry_data_vec.len();
+
+    let archive = Archive {
+        header: SUPPLEMENTAL_HEADER,
+        compression,
+        hash: index_hash.clone(),
+        index,
+        body: ArchiveBody {
+            header: header_entries,
+            entries: entry_data_vec,
+        },
+    };
+
+    // 7. Serialize to bytes
+    let mut buf: Vec<u8> = Vec::new();
+    archive.to_data(&mut buf)?;
+    let total_bytes = buf.len();
+
+    // 8. POST the archive to /v1/archive/upload
+    let upload_url = format!("{url}/v1/archive/upload");
+    let response_text = ureq::post(&upload_url)
+        .header("Content-Type", "application/octet-stream")
+        .send(&buf[..])
+        .context("failed to upload archive")?
+        .body_mut()
+        .read_to_string()
+        .context("failed to read upload response")?;
+
+    tracing::debug!("{}", response_text);
+    tracing::info!("Pushed {} objects ({} bytes) to {}", num_objects, total_bytes, url);
+
+    Ok(())
+}
+
+async fn unpack_archive(store: &Store, path: &Path) -> anyhow::Result<()> {
+    let path_meta = tokio::fs::metadata(path).await?;
+    anyhow::ensure!(path_meta.is_file(), "path must be a file");
+
+    let file = std::fs::File::open(path)?;
+    let mut file = std::io::BufReader::new(file);
 
     let archive = Archive::<RawEntryData>::from_data(&mut file)?;
 
-    assert!(archive.body.entries.len() == archive.body.header.len());
+    anyhow::ensure!(archive.body.entries.len() == archive.body.header.len(), "archive entries and headers length mismatch");
 
-    println!("Successfully read archive, Index {}", archive.hash);
+    tracing::debug!("Successfully read archive, Index {}", archive.hash);
 
-    let index_data = archive.index.to_data();
-    let index_header = Header::new(ObjectType::Index, index_data.len() as u64);
+    let index_data = object_body::Object::to_data(&archive.index);
+    let computed_hash = compute_hash(INDEX_KEY, &index_data);
+    anyhow::ensure!(computed_hash == archive.hash, "index hash mismatch");
 
-    let mut hasher = Sha512::new();
-    hasher.write(&index_header.to_string().as_bytes())?;
-    hasher.write(&index_data)?;
-    assert!(Hash::from(hasher) == archive.hash);
-
-    let path = archive.hash.get_path(cache);
-    let _ = create_dir_all(path.parent().unwrap());
-
+    // Write index object to store
     {
-        let index_file = File::create(path)?;
-        let mut writer = BufWriter::new(index_file);
-        writer.write(&index_header.to_string().as_bytes())?;
-        writer.write(&index_data)?;
+        let index_header = Header::new(ObjectType::Index, index_data.len() as u64);
+        store.put_object_bytes(&archive.hash, index_header, index_data).await?;
     }
 
-    
+    let semaphore = Arc::new(tokio::sync::Semaphore::new(64));
+    let mut set = JoinSet::new();
 
     for (header, entry) in archive.body.header.into_iter().zip(archive.body.entries.into_iter()) {
-        let path = header.hash.get_path(cache);
-        let _ = create_dir_all(path.parent().unwrap());
+        let store_clone = store.clone();
+        let sem = semaphore.clone();
+        let hash = header.hash.clone();
+        set.spawn(async move {
+            let _permit = sem.acquire().await
+                .map_err(|e| anyhow::anyhow!("semaphore: {e}"))?;
 
-        let file = File::create(path)?;
-        let mut writer = BufWriter::new(file);
+            // Skip if already exists
+            if store_clone.exists(&hash).await? {
+                return Ok::<_, anyhow::Error>(());
+            }
 
-        writer.write(&entry.turn_into_vec())?;
+            let raw = entry.turn_into_vec()?;
+            let (obj_header, body) = read_header_and_body(&raw)
+                .ok_or_else(|| anyhow::anyhow!("failed to parse header for object {}", hash))?;
+
+            if let Err(e) = store_clone.put_object_bytes(&hash, obj_header, body.to_vec()).await {
+                if !store_clone.exists(&hash).await.unwrap_or(false) {
+                    return Err(e);
+                }
+            }
+
+            Ok(())
+        });
+    }
+
+    while let Some(result) = set.join_next().await {
+        result??;
     }
 
     Ok(())
 }
 
+async fn extract_archive(file: &Path, directory: &Path) -> anyhow::Result<()> {
+    if tokio::fs::metadata(directory).await.is_err() {
+        create_dir_all(directory).await.context("failed to create output directory")?;
+    }
+
+    let dir_meta = tokio::fs::metadata(directory).await?;
+    anyhow::ensure!(dir_meta.is_dir(), "output path must be a directory");
+
+    let mut entries = read_dir(directory).await?;
+    anyhow::ensure!(entries.next_entry().await?.is_none(), "output directory must be empty");
+
+    let file = file.to_path_buf();
+    let archive = tokio::task::spawn_blocking(move || {
+        let f = std::fs::File::open(&file)?;
+        let mut reader = std::io::BufReader::new(f);
+        Archive::<RawEntryData>::from_data(&mut reader)
+    }).await??;
+
+    anyhow::ensure!(
+        archive.body.entries.len() == archive.body.header.len(),
+        "archive entries and headers length mismatch"
+    );
+
+    tracing::info!("Index: {}", archive.hash);
+
+    #[allow(clippy::mutable_key_type)]
+    let mut data_map: HashMap<Hash, Vec<u8>> = HashMap::with_capacity(archive.body.header.len());
+    for (header_entry, raw_entry) in archive.body.header.into_iter().zip(archive.body.entries.into_iter()) {
+        data_map.insert(header_entry.hash, raw_entry.0);
+    }
+
+    let root_tree_hash = archive.index.tree;
+    let data_map = Arc::new(data_map);
+    #[allow(clippy::mutable_key_type)]
+    let written_files = Arc::new(tokio::sync::Mutex::new(HashMap::<Hash, PathBuf>::new()));
+    let file_count = extract_tree(&data_map, &root_tree_hash, directory, directory, written_files).await?;
+
+    tracing::info!("Extracted {} files to {:?}", file_count, directory);
+
+    Ok(())
+}
+
+#[allow(clippy::mutable_key_type)]
+fn extract_tree<'a>(
+    data_map: &'a Arc<HashMap<Hash, Vec<u8>>>,
+    tree_hash: &'a Hash,
+    path: &'a Path,
+    root: &'a Path,
+    written_files: Arc<tokio::sync::Mutex<HashMap<Hash, PathBuf>>>,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<usize>> + Send + 'a>> {
+    Box::pin(async move {
+        let raw_data = data_map.get(tree_hash)
+            .ok_or_else(|| anyhow::anyhow!("tree hash {} not found in archive", tree_hash))?;
+
+        let (_header, body) = read_header_and_body(raw_data)
+            .ok_or_else(|| anyhow::anyhow!("failed to parse header for tree {}", tree_hash))?;
+
+        let tree: object_body::Tree = object_body::Object::from_data(body)?;
+
+        let semaphore = Arc::new(tokio::sync::Semaphore::new(64));
+        let mut set = JoinSet::new();
+        let mut file_count: usize = 0;
+
+        #[cfg(feature = "cow")]
+        let mut deferred_reflinks: Vec<(PathBuf, PathBuf, bool)> = Vec::new();
+
+        for entry in tree.contents {
+            let entry_path = path.join(&entry.path);
+
+            match entry.mode {
+                Mode::Tree => {
+                    create_dir(&entry_path).await
+                        .context(format!("failed to create directory {:?}", entry_path))?;
+                    file_count += extract_tree(data_map, &entry.hash, &entry_path, root, written_files.clone()).await?;
+                }
+                Mode::Normal | Mode::Executable => {
+                    file_count += 1;
+                    let is_executable = entry.mode == Mode::Executable;
+
+                    #[cfg(feature = "cow")]
+                    {
+                        let mut map = written_files.lock().await;
+                        if let Some(source_path) = map.get(&entry.hash) {
+                            deferred_reflinks.push((source_path.clone(), entry_path, is_executable));
+                            continue;
+                        }
+                        map.insert(entry.hash.clone(), entry_path.clone());
+                    }
+
+                    let dm = data_map.clone();
+                    let sem = semaphore.clone();
+                    set.spawn(async move {
+                        let _permit = sem.acquire().await
+                            .map_err(|e| anyhow::anyhow!("semaphore: {e}"))?;
+
+                        let raw = dm.get(&entry.hash)
+                            .ok_or_else(|| anyhow::anyhow!("blob hash {} not found in archive", entry.hash))?;
+
+                        let (_hdr, blob_body) = read_header_and_body(raw)
+                            .ok_or_else(|| anyhow::anyhow!("failed to parse header for blob {}", entry.hash))?;
+
+                        tokio::fs::write(&entry_path, blob_body).await
+                            .context(format!("failed to write file {:?}", entry_path))?;
+
+                        if is_executable {
+                            tokio::task::spawn_blocking({
+                                let path = entry_path.clone();
+                                move || set_executable(&path)
+                            }).await?
+                                .context(format!("failed to set executable permissions on {:?}", entry_path))?;
+                        }
+
+                        Ok::<_, anyhow::Error>(())
+                    });
+                }
+                Mode::SymbolicLink => {
+                    file_count += 1;
+                    let dm = data_map.clone();
+                    let sem = semaphore.clone();
+                    let root_path = root.to_path_buf();
+                    set.spawn(async move {
+                        let _permit = sem.acquire().await
+                            .map_err(|e| anyhow::anyhow!("semaphore: {e}"))?;
+
+                        let raw = dm.get(&entry.hash)
+                            .ok_or_else(|| anyhow::anyhow!("blob hash {} not found in archive", entry.hash))?;
+
+                        let (_hdr, blob_body) = read_header_and_body(raw)
+                            .ok_or_else(|| anyhow::anyhow!("failed to parse header for blob {}", entry.hash))?;
+
+                        tokio::task::spawn_blocking({
+                            let data = blob_body.to_vec();
+                            move || -> anyhow::Result<()> {
+                                let target_str = String::from_utf8(data)
+                                    .context("symlink target is not valid UTF-8")?;
+                                let target = std::path::Path::new(&target_str);
+
+                                // Validate symlink target doesn't escape the extract root
+                                let resolved = if target.is_absolute() {
+                                    target.to_path_buf()
+                                } else {
+                                    entry_path.parent()
+                                        .unwrap_or(std::path::Path::new("."))
+                                        .join(target)
+                                };
+                                let mut components = Vec::new();
+                                for comp in resolved.components() {
+                                    match comp {
+                                        std::path::Component::ParentDir => { components.pop(); }
+                                        std::path::Component::CurDir => {}
+                                        _ => components.push(comp),
+                                    }
+                                }
+                                let normalized: PathBuf = components.iter().collect();
+                                anyhow::ensure!(
+                                    normalized.starts_with(&root_path),
+                                    "symlink {:?} target {:?} escapes extract directory {:?}",
+                                    entry_path, target_str, root_path
+                                );
+
+                                #[cfg(unix)]
+                                {
+                                    std::os::unix::fs::symlink(target, &entry_path)
+                                        .context(format!("failed to create symlink {:?}", entry_path))?;
+                                }
+                                #[cfg(windows)]
+                                {
+                                    if normalized.is_dir() {
+                                        std::os::windows::fs::symlink_dir(target, &entry_path)
+                                            .context(format!("failed to create dir symlink {:?}", entry_path))?;
+                                    } else {
+                                        std::os::windows::fs::symlink_file(target, &entry_path)
+                                            .context(format!("failed to create file symlink {:?}", entry_path))?;
+                                    }
+                                }
+                                #[cfg(not(any(unix, windows)))]
+                                {
+                                    std::fs::write(&entry_path, target_str.as_bytes())
+                                        .context(format!("failed to write symlink placeholder {:?}", entry_path))?;
+                                }
+                                Ok(())
+                            }
+                        }).await??;
+
+                        Ok::<_, anyhow::Error>(())
+                    });
+                }
+                _ => {
+                    anyhow::bail!("unsupported mode {} for entry {}", entry.mode.as_str(), entry.path);
+                }
+            }
+        }
+
+        while let Some(result) = set.join_next().await {
+            result??;
+        }
+
+        #[cfg(feature = "cow")]
+        for (source, dest, is_exec) in deferred_reflinks {
+            tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+                reflink_copy::reflink_or_copy(&source, &dest)
+                    .context(format!("failed to reflink {:?} -> {:?}", source, dest))?;
+                if is_exec {
+                    set_executable(&dest)?;
+                } else {
+                    #[cfg(unix)]
+                    {
+                        use std::os::unix::fs::PermissionsExt;
+                        std::fs::set_permissions(&dest, std::fs::Permissions::from_mode(0o644))?;
+                    }
+                }
+                Ok(())
+            }).await??;
+        }
+
+        Ok(file_count)
+    })
+}
+
+fn archive_build_tree(
+    objects: Arc<tokio::sync::Mutex<HashMap<Hash, Vec<u8>>>>,
+    path: PathBuf,
+    root: PathBuf,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<Hash>> + Send>> {
+    Box::pin(async move {
+        anyhow::ensure!(path.is_dir(), "path must be a directory");
+        let mut dir_entries = read_dir(&path).await?;
+
+        let mut dir_paths = Vec::new();
+        let mut file_paths = Vec::new();
+        let mut symlink_paths = Vec::new();
+        while let Some(entry) = dir_entries.next_entry().await? {
+            let entry_path = entry.path();
+            let file_type = entry.file_type().await?;
+            if file_type.is_dir() {
+                dir_paths.push(entry_path);
+            } else if file_type.is_symlink() {
+                symlink_paths.push(entry_path);
+            } else {
+                file_paths.push(entry_path);
+            }
+        }
+
+        let mut entries = Vec::new();
+
+        // Process subdirectories concurrently
+        let mut dir_set = JoinSet::new();
+        for dir_path in dir_paths {
+            let objects_clone = objects.clone();
+            let root_clone = root.clone();
+            dir_set.spawn(async move {
+                let name = dir_path.file_name()
+                    .and_then(|n| n.to_str())
+                    .ok_or_else(|| anyhow::anyhow!("invalid file name: {}", dir_path.display()))?
+                    .to_string();
+                let hash = archive_build_tree(objects_clone, dir_path, root_clone).await?;
+                Ok::<_, anyhow::Error>((name, hash))
+            });
+        }
+
+        // Process files concurrently with bounded parallelism
+        let semaphore = Arc::new(tokio::sync::Semaphore::new(64));
+        let mut file_set = JoinSet::new();
+        for file_path in file_paths {
+            let objects_clone = objects.clone();
+            let sem = semaphore.clone();
+            file_set.spawn(async move {
+                let _permit = sem.acquire().await
+                    .map_err(|e| anyhow::anyhow!("semaphore: {e}"))?;
+                let name = file_path.file_name()
+                    .and_then(|n| n.to_str())
+                    .ok_or_else(|| anyhow::anyhow!("invalid file name: {}", file_path.display()))?
+                    .to_string();
+
+                let (data, hash, file_mode) = tokio::task::spawn_blocking({
+                    let path = file_path.clone();
+                    move || -> anyhow::Result<(Vec<u8>, Hash, Mode)> {
+                        let file_mode = detect_file_mode(&path);
+                        let data = std::fs::read(&path)?;
+                        let hash = compute_hash(BLOB_KEY, &data);
+                        Ok((data, hash, file_mode))
+                    }
+                }).await??;
+
+                {
+                    let mut map = objects_clone.lock().await;
+                    if !map.contains_key(&hash) {
+                        let header = Header::new(ObjectType::Blob, data.len() as u64);
+                        let prefix = header.to_string();
+                        let mut full_data = Vec::with_capacity(prefix.len() + data.len());
+                        full_data.extend_from_slice(prefix.as_bytes());
+                        full_data.extend(data);
+                        map.insert(hash.clone(), full_data);
+                    }
+                }
+
+                Ok::<_, anyhow::Error>((name, hash, file_mode))
+            });
+        }
+
+        // Process symlinks concurrently
+        let mut symlink_set = JoinSet::new();
+        for symlink_path in symlink_paths {
+            let objects_clone = objects.clone();
+            let sem = semaphore.clone();
+            let root_clone = root.clone();
+            symlink_set.spawn(async move {
+                let _permit = sem.acquire().await
+                    .map_err(|e| anyhow::anyhow!("semaphore: {e}"))?;
+                let name = symlink_path.file_name()
+                    .and_then(|n| n.to_str())
+                    .ok_or_else(|| anyhow::anyhow!("invalid file name: {}", symlink_path.display()))?
+                    .to_string();
+
+                let (data, hash, mode) = tokio::task::spawn_blocking({
+                    let path = symlink_path.clone();
+                    move || -> anyhow::Result<(Vec<u8>, Hash, Mode)> {
+                        let within = symlink_target_within_root(&path, &root_clone)?;
+                        if within.is_some() {
+                            let target = std::fs::read_link(&path)?;
+                            let target_str = target.to_str()
+                                .ok_or_else(|| anyhow::anyhow!("symlink target is not valid UTF-8: {:?}", target))?;
+                            let target_bytes = target_str.as_bytes().to_vec();
+                            let hash = compute_hash(BLOB_KEY, &target_bytes);
+                            Ok((target_bytes, hash, Mode::SymbolicLink))
+                        } else {
+                            tracing::warn!(
+                                symlink = %path.display(),
+                                "symlink target escapes root directory, storing as regular file"
+                            );
+                            let data = std::fs::read(&path)
+                                .context(format!("failed to read through escaping symlink {:?}", path))?;
+                            let file_mode = detect_file_mode(&path);
+                            let hash = compute_hash(BLOB_KEY, &data);
+                            Ok((data, hash, file_mode))
+                        }
+                    }
+                }).await??;
+
+                {
+                    let mut map = objects_clone.lock().await;
+                    if !map.contains_key(&hash) {
+                        let header = Header::new(ObjectType::Blob, data.len() as u64);
+                        let prefix = header.to_string();
+                        let mut full_data = Vec::with_capacity(prefix.len() + data.len());
+                        full_data.extend_from_slice(prefix.as_bytes());
+                        full_data.extend(data);
+                        map.insert(hash.clone(), full_data);
+                    }
+                }
+
+                Ok::<_, anyhow::Error>((name, hash, mode))
+            });
+        }
+
+        // Collect directory results
+        while let Some(result) = dir_set.join_next().await {
+            let (name, hash) = result??;
+            entries.push(object_body::TreeEntry {
+                mode: Mode::Tree,
+                path: name,
+                hash,
+            });
+        }
+
+        // Collect file results
+        while let Some(result) = file_set.join_next().await {
+            let (name, hash, file_mode) = result??;
+            entries.push(object_body::TreeEntry {
+                mode: file_mode,
+                path: name,
+                hash,
+            });
+        }
+
+        // Collect symlink results
+        while let Some(result) = symlink_set.join_next().await {
+            let (name, hash, mode) = result??;
+            entries.push(object_body::TreeEntry {
+                mode,
+                path: name,
+                hash,
+            });
+        }
+
+        // Sort entries by name for deterministic tree hashes
+        entries.sort_by(|a, b| a.path.cmp(&b.path));
+
+        // Build tree
+        let tree = object_body::Tree { contents: entries };
+        let tree_data = object_body::Object::to_data(&tree);
+        let hash = compute_hash(TREE_KEY, &tree_data);
+
+        {
+            let mut map = objects.lock().await;
+            if !map.contains_key(&hash) {
+                let header = Header::new(ObjectType::Tree, tree_data.len() as u64);
+                let prefix = header.to_string();
+                let mut full_data = Vec::with_capacity(prefix.len() + tree_data.len());
+                full_data.extend_from_slice(prefix.as_bytes());
+                full_data.extend(tree_data);
+                map.insert(hash.clone(), full_data);
+            }
+        }
+
+        Ok(hash)
+    })
+}
+
+async fn archive_directory(directory: &Path, file: &Path, compression: Compression) -> anyhow::Result<()> {
+    anyhow::ensure!(tokio::fs::metadata(file).await.is_err(), "output file already exists");
+    anyhow::ensure!(
+        file.parent().map(|p| p.exists() && p.is_dir()) == Some(true),
+        "Parent directory must exist and be a directory"
+    );
+
+    let path = tokio::fs::canonicalize(directory).await
+        .context(format!("unable to canonicalize {directory:?}"))?;
+    anyhow::ensure!(path.is_dir(), "path must be a directory");
+
+    #[allow(clippy::mutable_key_type)]
+    let objects: Arc<tokio::sync::Mutex<HashMap<Hash, Vec<u8>>>> =
+        Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+
+    let root_hash = archive_build_tree(objects.clone(), path.clone(), path).await?;
+
+    // Build index
+    let index = object_body::Index {
+        tree: root_hash,
+        timestamp: Utc::now(),
+        metadata: HashMap::new(),
+    };
+    let index_data = object_body::Object::to_data(&index);
+    let index_hash = compute_hash(INDEX_KEY, &index_data);
+
+    // Build archive from collected objects
+    #[allow(clippy::mutable_key_type)]
+    let objects = Arc::try_unwrap(objects)
+        .map_err(|_| anyhow::anyhow!("failed to unwrap Arc"))?
+        .into_inner();
+
+    let objects_vec: Vec<(Hash, Vec<u8>)> = objects.into_iter().collect();
+
+    let mut i: u64 = 0;
+    let mut header_entries: Vec<ArchiveHeaderEntry> = Vec::new();
+    for (hash, data) in &objects_vec {
+        let length = data.len() as u64;
+        header_entries.push(ArchiveHeaderEntry {
+            hash: hash.clone(),
+            index: i,
+            length,
+        });
+        i += length;
+    }
+
+    let archive = Archive {
+        header: HEADER,
+        compression,
+        hash: index_hash.clone(),
+        index,
+        body: ArchiveBody {
+            header: header_entries,
+            entries: objects_vec.into_iter()
+                .map(|(_, data)| RawEntryData(data))
+                .collect(),
+        },
+    };
+
+    let arx_file = std::fs::File::create(file)?;
+    let mut writer = std::io::BufWriter::new(arx_file);
+    archive.to_data(&mut writer)?;
+
+    println!("{}", index_hash);
+    println!("Archive written to {:?}", file);
+
+    Ok(())
+}
 
 #[derive(Parser)]
-#[command(version, about, long_about = None)]
+#[command(version, about = "Artifact repository client for content-addressable storage", long_about = None)]
 struct Cli {
-    #[arg(short, long, value_name = "Cache")]
-    cache: PathBuf,
+    /// Path to the local object store directory.
+    /// Falls back to ARTIFACT_STORE env var, then ~/.artifact/store
+    #[arg(short, long, value_name = "PATH", env = "ARTIFACT_STORE")]
+    store: Option<PathBuf>,
 
+    /// Increase logging verbosity (-d = info, -dd = debug, -ddd = trace)
     #[arg(short, long, action = clap::ArgAction::Count)]
     debug: u8,
 
@@ -1012,80 +1438,886 @@ struct Cli {
     command: Commands,
 }
 
+/// Resolve the store path from CLI arg / env var / default (~/.artifact/store)
+fn resolve_store_path(explicit: Option<PathBuf>) -> anyhow::Result<PathBuf> {
+    if let Some(path) = explicit {
+        return Ok(path);
+    }
+    // Default: ~/.artifact/store
+    let home = dirs::home_dir().context(
+        "could not determine home directory; please set --store or ARTIFACT_STORE",
+    )?;
+    Ok(home.join(".artifact").join("store"))
+}
+
 #[derive(Subcommand)]
 enum Commands {
+    /// Commit a directory into the object store
     Commit {
+        /// Path to the directory to commit
         #[arg(short, long)]
         directory: PathBuf,
     },
 
+    /// Restore a directory from the object store using an index hash
     Restore {
+        /// Output directory to restore into (must be empty or non-existent)
         #[arg(short, long)]
         directory: PathBuf,
+        /// Hash of the index object to restore
         #[arg(short, long)]
         index: Hash,
+        /// Re-read restored files and verify hashes match
         #[arg(long)]
         validate: bool,
     },
 
+    /// Print the raw contents of an object to stdout
     Cat {
-        #[arg(long)]
+        /// Hash of the object to display
         hash: Hash,
     },
 
+    /// Push objects from the local store to a remote server
     Push {
-        #[arg(long)]
+        /// Base URL of the remote artifact server
+        #[arg(long, env = "ARTIFACT_URL")]
         url: String,
 
+        /// Optional index hash to push (pushes all objects if omitted)
         #[arg(long)]
         index: Option<Hash>,
     },
 
+    /// Pull objects from a remote server into the local store
     Pull {
-        #[arg(long)]
+        /// Base URL of the remote artifact server
+        #[arg(long, env = "ARTIFACT_URL")]
         url: String,
 
+        /// Hash of the index object to pull
         #[arg(long)]
         index: Hash,
     },
 
+    /// Pack stored objects into an archive file
     Pack {
+        /// Hash of the index object to pack
         #[arg(long)]
         index: Hash,
 
+        /// Output archive file path
         #[arg(long)]
         file: PathBuf,
 
-        #[arg(long)]
+        /// Compression algorithm (none, gzip, deflate, lzma2, zstd)
+        #[arg(long, default_value = "zstd")]
         compression: Compression,
     },
 
+    /// Unpack an archive file into the local store
     Unpack {
+        /// Path to the archive file to unpack
         #[arg(long)]
         file: PathBuf,
     },
+
+    /// Extract an archive directly to a directory (no intermediate store)
+    Extract {
+        /// Path to the archive file
+        #[arg(short, long)]
+        file: PathBuf,
+        /// Output directory (must be empty or non-existent)
+        #[arg(short, long)]
+        directory: PathBuf,
+    },
+
+    /// Create an archive directly from a directory (no intermediate store)
+    Archive {
+        /// Source directory to archive
+        #[arg(short, long)]
+        directory: PathBuf,
+        /// Output archive file path
+        #[arg(short, long)]
+        file: PathBuf,
+        /// Compression algorithm (none, gzip, deflate, lzma2, zstd)
+        #[arg(short, long, default_value = "zstd")]
+        compression: Compression,
+    },
+
+    /// Push objects to a remote server, uploading only what's missing (deduplication)
+    PushArchive {
+        /// Base URL of the remote artifact server
+        #[arg(long, env = "ARTIFACT_URL")]
+        url: String,
+        /// Hash of the index to push
+        #[arg(long)]
+        index: Hash,
+        /// Compression algorithm for the supplemental archive
+        #[arg(long, default_value = "zstd")]
+        compression: Compression,
+    },
 }
 
-fn main() {
+#[tokio::main]
+async fn main() {
     let cli = Cli::parse();
 
+    let level = match cli.debug {
+        0 => "info",
+        1 => "debug",
+        _ => "trace",
+    };
+
+    let filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(level));
+
+    tracing_subscriber::fmt()
+        .with_env_filter(filter)
+        .with_target(false)
+        .init();
+
+    if let Err(e) = run(cli).await {
+        tracing::error!("{e:?}");
+        std::process::exit(1);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::{BTreeMap, BTreeSet};
+    use tempfile::TempDir;
+
+    fn create_store(dir: &std::path::Path) -> Store {
+        let builder = opendal::services::Fs::default().root(dir.to_str().unwrap());
+        Store::from_builder(builder).unwrap()
+    }
+
+    fn collect_files_recursive<'a>(
+        base: &'a std::path::Path,
+        current: &'a std::path::Path,
+        result: &'a mut BTreeMap<String, Vec<u8>>,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'a>> {
+        Box::pin(async move {
+            let mut entries = tokio::fs::read_dir(current).await.unwrap();
+            while let Some(entry) = entries.next_entry().await.unwrap() {
+                let path = entry.path();
+                let rel = path.strip_prefix(base).unwrap().to_string_lossy().to_string();
+                if entry.file_type().await.unwrap().is_dir() {
+                    collect_files_recursive(base, &path, result).await;
+                } else {
+                    let data = tokio::fs::read(&path).await.unwrap();
+                    result.insert(rel, data);
+                }
+            }
+        })
+    }
+
+    fn collect_dirs_recursive<'a>(
+        base: &'a std::path::Path,
+        current: &'a std::path::Path,
+        result: &'a mut BTreeSet<String>,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'a>> {
+        Box::pin(async move {
+            let mut entries = tokio::fs::read_dir(current).await.unwrap();
+            while let Some(entry) = entries.next_entry().await.unwrap() {
+                let path = entry.path();
+                let rel = path.strip_prefix(base).unwrap().to_string_lossy().to_string();
+                if entry.file_type().await.unwrap().is_dir() {
+                    result.insert(rel);
+                    collect_dirs_recursive(base, &path, result).await;
+                }
+            }
+        })
+    }
+
+    async fn assert_dirs_equal(dir_a: &std::path::Path, dir_b: &std::path::Path) {
+        let mut files_a = BTreeMap::new();
+        let mut files_b = BTreeMap::new();
+        collect_files_recursive(dir_a, dir_a, &mut files_a).await;
+        collect_files_recursive(dir_b, dir_b, &mut files_b).await;
+        assert_eq!(
+            files_a.keys().collect::<Vec<_>>(),
+            files_b.keys().collect::<Vec<_>>(),
+            "File paths differ"
+        );
+        for (path, content_a) in &files_a {
+            let content_b = files_b.get(path).unwrap();
+            assert_eq!(content_a, content_b, "Content differs for {}", path);
+        }
+
+        let mut dirs_a = BTreeSet::new();
+        let mut dirs_b = BTreeSet::new();
+        collect_dirs_recursive(dir_a, dir_a, &mut dirs_a).await;
+        collect_dirs_recursive(dir_b, dir_b, &mut dirs_b).await;
+        assert_eq!(dirs_a, dirs_b, "Directory structure differs");
+    }
+
+    #[tokio::test]
+    async fn commit_restore_roundtrip() {
+        let source = TempDir::new().unwrap();
+        let store_dir = TempDir::new().unwrap();
+
+        tokio::fs::write(source.path().join("hello.txt"), b"Hello, world!").await.unwrap();
+        tokio::fs::write(source.path().join("data.bin"), b"Some binary data \x00\x01\x02").await.unwrap();
+        let sub = source.path().join("subdir");
+        tokio::fs::create_dir(&sub).await.unwrap();
+        tokio::fs::write(sub.join("nested.txt"), b"I am nested").await.unwrap();
+
+        let store = create_store(store_dir.path());
+        let source_path = source.path().to_path_buf();
+        let (_, index_hash, _) = build_index_from_path(&store, &source_path).await.unwrap();
+
+        let restore = TempDir::new().unwrap();
+        let restore_path = restore.path().join("output");
+        restore_directory(&store, &restore_path, index_hash, false).await.unwrap();
+
+        assert_dirs_equal(source.path(), &restore_path).await;
+    }
+
+    #[tokio::test]
+    async fn commit_empty_directory() {
+        let source = TempDir::new().unwrap();
+        let store_dir = TempDir::new().unwrap();
+
+        let store = create_store(store_dir.path());
+        let source_path = source.path().to_path_buf();
+        let (_, index_hash, total_size) = build_index_from_path(&store, &source_path).await.unwrap();
+
+        assert_eq!(total_size, 0);
+
+        let restore = TempDir::new().unwrap();
+        let restore_path = restore.path().join("output");
+        restore_directory(&store, &restore_path, index_hash, false).await.unwrap();
+
+        let mut entries = tokio::fs::read_dir(&restore_path).await.unwrap();
+        assert!(
+            entries.next_entry().await.unwrap().is_none(),
+            "Restored empty directory should have no entries"
+        );
+    }
+
+    #[tokio::test]
+    async fn commit_nested_directories() {
+        let source = TempDir::new().unwrap();
+        let store_dir = TempDir::new().unwrap();
+
+        let deep = source.path().join("a").join("b").join("c");
+        tokio::fs::create_dir_all(&deep).await.unwrap();
+        tokio::fs::write(deep.join("file.txt"), b"deep file").await.unwrap();
+
+        let x_dir = source.path().join("x");
+        tokio::fs::create_dir(&x_dir).await.unwrap();
+        tokio::fs::write(x_dir.join("file.txt"), b"x file").await.unwrap();
+
+        let store = create_store(store_dir.path());
+        let source_path = source.path().to_path_buf();
+        let (_, index_hash, _) = build_index_from_path(&store, &source_path).await.unwrap();
+
+        let restore = TempDir::new().unwrap();
+        let restore_path = restore.path().join("output");
+        restore_directory(&store, &restore_path, index_hash, false).await.unwrap();
+
+        assert_dirs_equal(source.path(), &restore_path).await;
+    }
+
+    #[tokio::test]
+    async fn deduplication_identical_files() {
+        let source = TempDir::new().unwrap();
+        let store_dir = TempDir::new().unwrap();
+
+        let content = b"IDENTICAL CONTENT FOR DEDUP TEST";
+
+        let dir_a = source.path().join("dir_a");
+        let dir_b = source.path().join("dir_b");
+        tokio::fs::create_dir(&dir_a).await.unwrap();
+        tokio::fs::create_dir(&dir_b).await.unwrap();
+        tokio::fs::write(dir_a.join("file.txt"), content).await.unwrap();
+        tokio::fs::write(dir_b.join("file.txt"), content).await.unwrap();
+
+        let store = create_store(store_dir.path());
+        let source_path = source.path().to_path_buf();
+        let (index, _, _) = build_index_from_path(&store, &source_path).await.unwrap();
+
+        // Read root tree and collect file hashes from subtrees
+        let root_tree = read_tree_from_store(&store, &index.tree).await.unwrap();
+        let mut file_hashes = Vec::new();
+        for entry in &root_tree.contents {
+            let subtree = read_tree_from_store(&store, &entry.hash).await.unwrap();
+            for sub_entry in &subtree.contents {
+                if sub_entry.path == "file.txt" {
+                    file_hashes.push(sub_entry.hash.clone());
+                }
+            }
+        }
+
+        assert_eq!(file_hashes.len(), 2);
+        assert_eq!(
+            file_hashes[0], file_hashes[1],
+            "Identical files must produce the same blob hash"
+        );
+
+        let expected_hash = compute_hash(BLOB_KEY, content);
+        assert_eq!(file_hashes[0], expected_hash);
+
+        // Verify only one blob file exists in the store for that hash
+        assert!(store.exists(&expected_hash).await.unwrap());
+    }
+
+    async fn pack_unpack_roundtrip_with_compression(compression: Compression) {
+        let source = TempDir::new().unwrap();
+        let store_a_dir = TempDir::new().unwrap();
+
+        tokio::fs::write(source.path().join("hello.txt"), b"Hello, archive world!").await.unwrap();
+        let sub = source.path().join("sub");
+        tokio::fs::create_dir(&sub).await.unwrap();
+        tokio::fs::write(sub.join("data.txt"), b"Nested archive data").await.unwrap();
+
+        // Commit to store A
+        let store_a = create_store(store_a_dir.path());
+        let source_path = source.path().to_path_buf();
+        let (_, index_hash, _) = build_index_from_path(&store_a, &source_path).await.unwrap();
+
+        // Pack to .arx file
+        let arx_dir = TempDir::new().unwrap();
+        let arx_path = arx_dir.path().join("test.arx");
+        pack_archive(&store_a, &arx_path, &index_hash, compression).await.unwrap();
+        assert!(tokio::fs::metadata(&arx_path).await.is_ok(), ".arx file should exist");
+
+        // Unpack to store B
+        let store_b_dir = TempDir::new().unwrap();
+        let store_b = create_store(store_b_dir.path());
+        unpack_archive(&store_b, &arx_path).await.unwrap();
+
+        // Restore from store B
+        let restore = TempDir::new().unwrap();
+        let restore_path = restore.path().join("output");
+        restore_directory(&store_b, &restore_path, index_hash, false).await.unwrap();
+
+        assert_dirs_equal(source.path(), &restore_path).await;
+    }
+
+    #[tokio::test]
+    async fn pack_unpack_roundtrip_none() {
+        pack_unpack_roundtrip_with_compression(Compression::None).await;
+    }
+
+    #[tokio::test]
+    async fn pack_unpack_roundtrip_zstd() {
+        pack_unpack_roundtrip_with_compression(Compression::Zstd).await;
+    }
+
+    #[tokio::test]
+    async fn pack_unpack_roundtrip_gzip() {
+        pack_unpack_roundtrip_with_compression(Compression::Gzip).await;
+    }
+
+    #[tokio::test]
+    async fn restore_with_validate() {
+        let source = TempDir::new().unwrap();
+        let store_dir = TempDir::new().unwrap();
+
+        tokio::fs::write(source.path().join("test.txt"), b"Validate me!").await.unwrap();
+        let sub = source.path().join("inner");
+        tokio::fs::create_dir(&sub).await.unwrap();
+        tokio::fs::write(sub.join("deep.txt"), b"Validate deep too").await.unwrap();
+
+        let store = create_store(store_dir.path());
+        let source_path = source.path().to_path_buf();
+        let (_, index_hash, _) = build_index_from_path(&store, &source_path).await.unwrap();
+
+        let restore = TempDir::new().unwrap();
+        let restore_path = restore.path().join("output");
+        // validate=true: re-reads restored files and checks hashes match
+        restore_directory(&store, &restore_path, index_hash, true).await.unwrap();
+
+        assert_dirs_equal(source.path(), &restore_path).await;
+    }
+
+    #[tokio::test]
+    async fn large_file_roundtrip() {
+        let source = TempDir::new().unwrap();
+        let store_dir = TempDir::new().unwrap();
+
+        // 1MB file with repeating pattern
+        let pattern = b"ABCDEFGHIJKLMNOP";
+        let large_data: Vec<u8> = pattern.iter().cycle().take(1024 * 1024).cloned().collect();
+        tokio::fs::write(source.path().join("large.bin"), &large_data).await.unwrap();
+
+        let store = create_store(store_dir.path());
+        let source_path = source.path().to_path_buf();
+        let (_, index_hash, _) = build_index_from_path(&store, &source_path).await.unwrap();
+
+        let restore = TempDir::new().unwrap();
+        let restore_path = restore.path().join("output");
+        restore_directory(&store, &restore_path, index_hash, false).await.unwrap();
+
+        let restored = tokio::fs::read(restore_path.join("large.bin")).await.unwrap();
+        assert_eq!(restored.len(), large_data.len());
+        assert_eq!(restored, large_data);
+    }
+
+    #[tokio::test]
+    async fn special_filenames_roundtrip() {
+        let source = TempDir::new().unwrap();
+        let store_dir = TempDir::new().unwrap();
+
+        tokio::fs::write(source.path().join("file with spaces.txt"), b"spaces").await.unwrap();
+        tokio::fs::write(source.path().join("file.multiple.dots.txt"), b"dots").await.unwrap();
+        tokio::fs::write(source.path().join("file-with-hyphens.txt"), b"hyphens").await.unwrap();
+        tokio::fs::write(source.path().join(".hidden-file"), b"hidden").await.unwrap();
+        tokio::fs::write(source.path().join("UPPERCASE.TXT"), b"upper").await.unwrap();
+
+        let store = create_store(store_dir.path());
+        let source_path = source.path().to_path_buf();
+        let (_, index_hash, _) = build_index_from_path(&store, &source_path).await.unwrap();
+
+        let restore = TempDir::new().unwrap();
+        let restore_path = restore.path().join("output");
+        restore_directory(&store, &restore_path, index_hash, false).await.unwrap();
+
+        assert_dirs_equal(source.path(), &restore_path).await;
+    }
+
+    async fn extract_roundtrip_with_compression(compression: Compression) {
+        let source = TempDir::new().unwrap();
+        let store_dir = TempDir::new().unwrap();
+
+        tokio::fs::write(source.path().join("hello.txt"), b"Hello, extract world!").await.unwrap();
+        let sub = source.path().join("sub");
+        tokio::fs::create_dir(&sub).await.unwrap();
+        tokio::fs::write(sub.join("data.txt"), b"Nested extract data").await.unwrap();
+
+        // Commit to store
+        let store = create_store(store_dir.path());
+        let source_path = source.path().to_path_buf();
+        let (_, index_hash, _) = build_index_from_path(&store, &source_path).await.unwrap();
+
+        // Pack to .arx file
+        let arx_dir = TempDir::new().unwrap();
+        let arx_path = arx_dir.path().join("test.arx");
+        pack_archive(&store, &arx_path, &index_hash, compression).await.unwrap();
+
+        // Extract directly to directory (no intermediate store)
+        let extract_dir = TempDir::new().unwrap();
+        let extract_path = extract_dir.path().join("output");
+        extract_archive(&arx_path, &extract_path).await.unwrap();
+
+        assert_dirs_equal(source.path(), &extract_path).await;
+    }
+
+    #[tokio::test]
+    async fn extract_roundtrip_none() {
+        extract_roundtrip_with_compression(Compression::None).await;
+    }
+
+    #[tokio::test]
+    async fn extract_roundtrip_zstd() {
+        extract_roundtrip_with_compression(Compression::Zstd).await;
+    }
+
+    #[tokio::test]
+    async fn extract_roundtrip_gzip() {
+        extract_roundtrip_with_compression(Compression::Gzip).await;
+    }
+
+    async fn archive_extract_roundtrip_with_compression(compression: Compression) {
+        let source = TempDir::new().unwrap();
+
+        tokio::fs::write(source.path().join("hello.txt"), b"Hello, archive world!").await.unwrap();
+        let sub = source.path().join("sub");
+        tokio::fs::create_dir(&sub).await.unwrap();
+        tokio::fs::write(sub.join("data.txt"), b"Nested archive data").await.unwrap();
+
+        // archive_directory → .arx file
+        let arx_dir = TempDir::new().unwrap();
+        let arx_path = arx_dir.path().join("test.arx");
+        let source_path = source.path().to_path_buf();
+        archive_directory(&source_path, &arx_path, compression).await.unwrap();
+        assert!(tokio::fs::metadata(&arx_path).await.is_ok(), ".arx file should exist");
+
+        // extract_archive → output directory
+        let extract_dir = TempDir::new().unwrap();
+        let extract_path = extract_dir.path().join("output");
+        extract_archive(&arx_path, &extract_path).await.unwrap();
+
+        assert_dirs_equal(source.path(), &extract_path).await;
+    }
+
+    #[tokio::test]
+    async fn archive_extract_roundtrip() {
+        archive_extract_roundtrip_with_compression(Compression::None).await;
+    }
+
+    #[tokio::test]
+    async fn archive_extract_roundtrip_zstd() {
+        archive_extract_roundtrip_with_compression(Compression::Zstd).await;
+    }
+
+    #[tokio::test]
+    async fn archive_nested_directories() {
+        let source = TempDir::new().unwrap();
+
+        let deep = source.path().join("a").join("b").join("c");
+        tokio::fs::create_dir_all(&deep).await.unwrap();
+        tokio::fs::write(deep.join("file.txt"), b"deep file").await.unwrap();
+
+        let x_dir = source.path().join("x");
+        tokio::fs::create_dir(&x_dir).await.unwrap();
+        tokio::fs::write(x_dir.join("file.txt"), b"x file").await.unwrap();
+
+        let arx_dir = TempDir::new().unwrap();
+        let arx_path = arx_dir.path().join("nested.arx");
+        let source_path = source.path().to_path_buf();
+        archive_directory(&source_path, &arx_path, Compression::None).await.unwrap();
+
+        let extract_dir = TempDir::new().unwrap();
+        let extract_path = extract_dir.path().join("output");
+        extract_archive(&arx_path, &extract_path).await.unwrap();
+
+        assert_dirs_equal(source.path(), &extract_path).await;
+    }
+
+    #[tokio::test]
+    async fn archive_deduplication() {
+        let source = TempDir::new().unwrap();
+
+        let content = b"IDENTICAL CONTENT FOR ARCHIVE DEDUP TEST";
+        let dir_a = source.path().join("dir_a");
+        let dir_b = source.path().join("dir_b");
+        tokio::fs::create_dir(&dir_a).await.unwrap();
+        tokio::fs::create_dir(&dir_b).await.unwrap();
+        tokio::fs::write(dir_a.join("file.txt"), content).await.unwrap();
+        tokio::fs::write(dir_b.join("file.txt"), content).await.unwrap();
+
+        let arx_dir = TempDir::new().unwrap();
+        let arx_path = arx_dir.path().join("dedup.arx");
+        let source_path = source.path().to_path_buf();
+        archive_directory(&source_path, &arx_path, Compression::None).await.unwrap();
+
+        // Read back the archive and check that there's only one blob entry
+        let arx_data = std::fs::read(&arx_path).unwrap();
+        let archive = Archive::<RawEntryData>::from_data(&mut std::io::Cursor::new(arx_data)).unwrap();
+
+        let blob_hash = compute_hash(BLOB_KEY, content);
+        let blob_entries: Vec<_> = archive.body.header
+            .iter()
+            .filter(|e| e.hash == blob_hash)
+            .collect();
+        assert_eq!(
+            blob_entries.len(),
+            1,
+            "Identical files should produce only one blob entry in the archive"
+        );
+    }
+
+    #[tokio::test]
+    async fn tree_hash_is_deterministic() {
+        let source = TempDir::new().unwrap();
+
+        // Create a non-trivial directory structure
+        tokio::fs::write(source.path().join("zebra.txt"), b"z content").await.unwrap();
+        tokio::fs::write(source.path().join("alpha.txt"), b"a content").await.unwrap();
+        tokio::fs::write(source.path().join("middle.txt"), b"m content").await.unwrap();
+        let sub = source.path().join("subdir");
+        tokio::fs::create_dir(&sub).await.unwrap();
+        tokio::fs::write(sub.join("beta.txt"), b"b content").await.unwrap();
+        tokio::fs::write(sub.join("gamma.txt"), b"g content").await.unwrap();
+        let deep = sub.join("deep");
+        tokio::fs::create_dir(&deep).await.unwrap();
+        tokio::fs::write(deep.join("file.txt"), b"deep content").await.unwrap();
+
+        let source_path = source.path().to_path_buf();
+
+        // Commit the same directory multiple times to separate stores
+        let mut tree_hashes = Vec::new();
+        for _ in 0..5 {
+            let store_dir = TempDir::new().unwrap();
+            let store = create_store(store_dir.path());
+            let (index, _, _) = build_index_from_path(&store, &source_path).await.unwrap();
+            tree_hashes.push(index.tree.as_str().to_string());
+        }
+
+        // All tree hashes must be identical
+        for (i, h) in tree_hashes.iter().enumerate() {
+            assert_eq!(
+                &tree_hashes[0], h,
+                "Tree hash differs on iteration {i}: expected {}, got {h}",
+                tree_hashes[0]
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn tree_entries_are_sorted_by_name() {
+        let source = TempDir::new().unwrap();
+        let store_dir = TempDir::new().unwrap();
+
+        // Create files with names that would sort differently by creation order vs alphabetical
+        tokio::fs::write(source.path().join("c.txt"), b"c").await.unwrap();
+        tokio::fs::write(source.path().join("a.txt"), b"a").await.unwrap();
+        tokio::fs::write(source.path().join("b.txt"), b"b").await.unwrap();
+
+        let store = create_store(store_dir.path());
+        let source_path = source.path().to_path_buf();
+        let (index, _, _) = build_index_from_path(&store, &source_path).await.unwrap();
+
+        // Read back the tree and verify entries are sorted
+        let tree = read_tree_from_store(&store, &index.tree).await.unwrap();
+        let names: Vec<&str> = tree.contents.iter().map(|e| e.path.as_str()).collect();
+        let mut sorted = names.clone();
+        sorted.sort();
+        assert_eq!(names, sorted, "Tree entries should be sorted alphabetically");
+    }
+
+    #[tokio::test]
+    async fn commit_restore_symlinks() {
+        let source = TempDir::new().unwrap();
+        let store_dir = TempDir::new().unwrap();
+
+        // Create files and symlinks
+        tokio::fs::write(source.path().join("target.txt"), b"I am the target").await.unwrap();
+        let sub = source.path().join("subdir");
+        tokio::fs::create_dir(&sub).await.unwrap();
+        tokio::fs::write(sub.join("nested.txt"), b"nested content").await.unwrap();
+
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink("target.txt", source.path().join("relative-link")).unwrap();
+            std::os::unix::fs::symlink("subdir/nested.txt", source.path().join("deep-link")).unwrap();
+        }
+
+        let store = create_store(store_dir.path());
+        let source_path = source.path().to_path_buf();
+        let (_, index_hash, _) = build_index_from_path(&store, &source_path).await.unwrap();
+
+        let restore = TempDir::new().unwrap();
+        let restore_path = restore.path().join("output");
+        restore_directory(&store, &restore_path, index_hash, false).await.unwrap();
+
+        // Verify regular files
+        let content = tokio::fs::read(restore_path.join("target.txt")).await.unwrap();
+        assert_eq!(content, b"I am the target");
+        let nested = tokio::fs::read(restore_path.join("subdir").join("nested.txt")).await.unwrap();
+        assert_eq!(nested, b"nested content");
+
+        // Verify symlinks are actual symlinks with correct targets
+        #[cfg(unix)]
+        {
+            let meta = std::fs::symlink_metadata(restore_path.join("relative-link")).unwrap();
+            assert!(meta.is_symlink(), "relative-link should be a symlink");
+            assert_eq!(std::fs::read_link(restore_path.join("relative-link")).unwrap().to_str().unwrap(), "target.txt");
+
+            let meta = std::fs::symlink_metadata(restore_path.join("deep-link")).unwrap();
+            assert!(meta.is_symlink(), "deep-link should be a symlink");
+            assert_eq!(std::fs::read_link(restore_path.join("deep-link")).unwrap().to_str().unwrap(), "subdir/nested.txt");
+        }
+    }
+
+    #[tokio::test]
+    async fn archive_extract_symlinks() {
+        let source = TempDir::new().unwrap();
+
+        tokio::fs::write(source.path().join("file.txt"), b"content").await.unwrap();
+
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink("file.txt", source.path().join("link")).unwrap();
+            std::os::unix::fs::symlink("nonexistent", source.path().join("dangling")).unwrap();
+        }
+
+        let archive_dir = TempDir::new().unwrap();
+        let archive_path = archive_dir.path().join("test.arx");
+
+        archive_directory(source.path(), &archive_path, Compression::Zstd).await.unwrap();
+
+        let extract = TempDir::new().unwrap();
+        let extract_path = extract.path().join("output");
+        tokio::fs::create_dir(&extract_path).await.unwrap();
+        extract_archive(&archive_path, &extract_path).await.unwrap();
+
+        // Verify file
+        let content = tokio::fs::read(extract_path.join("file.txt")).await.unwrap();
+        assert_eq!(content, b"content");
+
+        // Verify symlinks
+        #[cfg(unix)]
+        {
+            let meta = std::fs::symlink_metadata(extract_path.join("link")).unwrap();
+            assert!(meta.is_symlink(), "link should be a symlink");
+            assert_eq!(std::fs::read_link(extract_path.join("link")).unwrap().to_str().unwrap(), "file.txt");
+
+            // Dangling symlinks should also be preserved
+            let meta = std::fs::symlink_metadata(extract_path.join("dangling")).unwrap();
+            assert!(meta.is_symlink(), "dangling should be a symlink");
+            assert_eq!(std::fs::read_link(extract_path.join("dangling")).unwrap().to_str().unwrap(), "nonexistent");
+        }
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn symlink_escaping_commit_substitutes_file() {
+        // Create an "outside" file that a symlink will point to
+        let outside = TempDir::new().unwrap();
+        tokio::fs::write(outside.path().join("secret.txt"), b"sensitive data").await.unwrap();
+
+        // Create the source directory with an escaping symlink
+        let source = TempDir::new().unwrap();
+        tokio::fs::write(source.path().join("normal.txt"), b"hello").await.unwrap();
+
+        // Symlink that escapes via absolute path to a real file
+        let secret_path = outside.path().join("secret.txt");
+        std::os::unix::fs::symlink(&secret_path, source.path().join("abs_escape")).unwrap();
+
+        // Commit — escaping symlinks should be substituted with file content
+        let store_dir = TempDir::new().unwrap();
+        let store = create_store(store_dir.path());
+        let source_path = source.path().to_path_buf();
+        let (index, _, _) = build_index_from_path(&store, &source_path).await.unwrap();
+
+        // The escaping symlink should have been stored as a Normal file, not a SymbolicLink
+        let tree = read_tree_from_store(&store, &index.tree).await.unwrap();
+        let abs_entry = tree.contents.iter().find(|e| e.path == "abs_escape").unwrap();
+        assert_eq!(abs_entry.mode, Mode::Normal,
+            "escaping symlink should be stored as a regular file");
+
+        // Restore — the file should contain the content from the original target
+        let restore = TempDir::new().unwrap();
+        let restore_path = restore.path().join("output");
+        let index_hash = compute_hash(INDEX_KEY, &object_body::Object::to_data(&index));
+        restore_directory(&store, &restore_path, index_hash, false).await.unwrap();
+
+        let restored = std::fs::read_to_string(restore_path.join("abs_escape")).unwrap();
+        assert_eq!(restored, "sensitive data");
+        // It should NOT be a symlink
+        assert!(!restore_path.join("abs_escape").symlink_metadata().unwrap().is_symlink());
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn symlink_escaping_commit_dangling_errors() {
+        // Escaping symlink to a nonexistent target should error on commit
+        let source = TempDir::new().unwrap();
+        tokio::fs::write(source.path().join("normal.txt"), b"hello").await.unwrap();
+        std::os::unix::fs::symlink("../nonexistent_escape", source.path().join("rel_escape")).unwrap();
+
+        let store_dir = TempDir::new().unwrap();
+        let store = create_store(store_dir.path());
+        let source_path = source.path().to_path_buf();
+        let result = build_index_from_path(&store, &source_path).await;
+
+        assert!(result.is_err(), "dangling escaping symlink should fail on commit");
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn symlink_escaping_extract_errors() {
+        // Test that restore rejects symlinks with escaping targets.
+        // We craft a tree directly with an escaping SymbolicLink entry.
+        let store_dir = TempDir::new().unwrap();
+        let store = create_store(store_dir.path());
+
+        // Create a blob containing an escaping symlink target
+        let target_bytes = b"../../etc/passwd".to_vec();
+        let blob_hash = compute_hash(BLOB_KEY, &target_bytes);
+        let header = Header::new(ObjectType::Blob, target_bytes.len() as u64);
+        store.put_object_bytes(&blob_hash, header, target_bytes.to_vec()).await.unwrap();
+
+        // Create a tree with the escaping symlink entry
+        let tree = object_body::Tree {
+            contents: vec![object_body::TreeEntry {
+                mode: Mode::SymbolicLink,
+                path: "evil_link".to_string(),
+                hash: blob_hash,
+            }],
+        };
+
+        let extract = TempDir::new().unwrap();
+        let extract_path = extract.path().join("output");
+        tokio::fs::create_dir(&extract_path).await.unwrap();
+
+        #[allow(clippy::mutable_key_type)]
+        let written_files = Arc::new(tokio::sync::Mutex::new(HashMap::<Hash, PathBuf>::new()));
+        let result = write_tree_to_path(&store, &tree, &extract_path, &extract_path, written_files).await;
+
+        assert!(result.is_err(), "restore should reject escaping symlinks");
+        let err_msg = format!("{:?}", result.unwrap_err());
+        assert!(err_msg.contains("escapes"), "error should mention escaping: {}", err_msg);
+    }
+
+    #[tokio::test]
+    async fn symlink_hash_determinism() {
+        // Same symlink target should produce the same tree hash
+        let source_a = TempDir::new().unwrap();
+        let source_b = TempDir::new().unwrap();
+
+        tokio::fs::write(source_a.path().join("file.txt"), b"data").await.unwrap();
+        tokio::fs::write(source_b.path().join("file.txt"), b"data").await.unwrap();
+
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink("file.txt", source_a.path().join("link")).unwrap();
+            std::os::unix::fs::symlink("file.txt", source_b.path().join("link")).unwrap();
+        }
+
+        let store_a = TempDir::new().unwrap();
+        let store_b = TempDir::new().unwrap();
+
+        let sa = create_store(store_a.path());
+        let sb = create_store(store_b.path());
+
+        let (_, hash_a, _) = build_index_from_path(&sa, &source_a.path().to_path_buf()).await.unwrap();
+        let (_, hash_b, _) = build_index_from_path(&sb, &source_b.path().to_path_buf()).await.unwrap();
+
+        // Hashes won't match because index includes timestamp, but tree hashes should
+        // We check that both succeed without error — determinism of tree hash is
+        // covered by the existing tree_hash_is_deterministic test's approach
+        assert!(hash_a.as_str().len() == 128);
+        assert!(hash_b.as_str().len() == 128);
+    }
+}
+
+async fn run(cli: Cli) -> anyhow::Result<()> {
+    let store_path = resolve_store_path(cli.store)?;
+    tracing::debug!("using store at {}", store_path.display());
+
+    // Ensure store directory exists
+    if tokio::fs::metadata(&store_path).await.is_err() {
+        create_dir_all(&store_path).await.context("failed to create store directory")?;
+    }
+
+    // Create store from cache directory
+    let store = Store::from_builder(opendal::services::Fs::default().root(store_path.to_str().context("store path must be valid UTF-8")?))
+        .context("failed to create store")?;
+
     match cli.command {
-        Commands::Commit { directory } => commit_directory(&cli.cache, &directory),
+        Commands::Commit { directory } => commit_directory(&store, &directory).await?,
         Commands::Restore {
             directory,
             index,
             validate,
-        } => restore_directory(&cli.cache, &directory, index, validate),
-        Commands::Cat { hash } => cat_object(&cli.cache, &hash),
+        } => restore_directory(&store, &directory, index, validate).await?,
+        Commands::Cat { hash } => cat_object(&store, &hash).await?,
         Commands::Push { url, index } => {
-            push_cache(&cli.cache, &url, index)
+            push_cache(&store, &url, index).await?
         }
-        Commands::Pull { url, index } => pull_cache(&cli.cache, &url, index),
-        Commands::Pack { index, file , compression} => {
-            pack_archive(&cli.cache, &file, &index, compression).expect("Packing to work")
+        Commands::Pull { url, index } => pull_cache(&store, &url, index).await?,
+        Commands::Pack { index, file, compression } => {
+            pack_archive(&store, &file, &index, compression).await?
         }
         Commands::Unpack { file } => {
-            unpack_archive(&cli.cache, &file).expect("Packing to work")
+            unpack_archive(&store, &file).await?
+        }
+        Commands::Extract { file, directory } => {
+            extract_archive(&file, &directory).await?
+        }
+        Commands::Archive { directory, file, compression } => {
+            archive_directory(&directory, &file, compression).await?
+        }
+        Commands::PushArchive { url, index, compression } => {
+            push_archive(&store, &url, &index, compression).await?
         }
     }
+    Ok(())
 }

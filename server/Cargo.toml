@@ -4,16 +4,28 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
+anyhow = { workspace = true }
+async_zip = { version = "0.0.18", features = ["tokio", "deflate"] }
 axum = { version = "0.8.4", features = ["macros"] }
+chrono = { workspace = true }
 clap = { version = "4.5.51", features = ["derive"] }
 common = { path = "../common" }
-futures = "0.3.31"
+futures = { workspace = true }
 futures-core = "0.3.31"
 http-body = "1.0.1"
-lazy_static = "1.5.0"
-opendal = { version = "0.54.1", features = ["services-fs", "services-s3"] }
+opendal = { version = "0.54.1", features = ["services-fs", "services-s3", "services-memory"] }
+serde = { workspace = true }
+serde_json = { workspace = true }
 sha2 = "0.10.9"
-tokio = { version = "1.45.1", features = ["full"] }
+tokio = { workspace = true }
 tokio-stream = "0.1.17"
-tokio-util = { version = "0.7.15", features = ["codec", "io"] }
-tower-http = { version = "0.6.6", features = ["compression-br", "compression-deflate", "compression-gzip", "compression-zstd"] }
+tokio-util = { version = "0.7.15", features = ["codec", "compat", "io"] }
+toml = "0.8"
+tower-http = { version = "0.6.6", features = ["compression-br", "compression-deflate", "compression-gzip", "compression-zstd", "trace"] }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+tower = { version = "0.5", features = ["util"] }
+http-body-util = "0.1"
