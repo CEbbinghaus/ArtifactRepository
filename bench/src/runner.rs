@@ -58,7 +58,7 @@ pub struct IncrementalResult {
 }
 
 struct ServerHandle {
-    pid: u32,
+    child: std::process::Child,
     port: u16,
     #[allow(dead_code)]
     store_dir: PathBuf,
@@ -72,10 +72,8 @@ impl ServerHandle {
 
 impl Drop for ServerHandle {
     fn drop(&mut self) {
-        // Kill the server process
-        let _ = Command::new("kill").arg(self.pid.to_string()).output();
-        // Wait briefly for cleanup
-        std::thread::sleep(Duration::from_millis(200));
+        let _ = self.child.kill();
+        let _ = self.child.wait();
     }
 }
 
@@ -92,7 +90,7 @@ fn start_server(config: &BenchConfig, store_dir: &Path) -> ServerHandle {
 
     std::fs::create_dir_all(store_dir).expect("cannot create server store dir");
 
-    let child = Command::new(&config.server_bin)
+    let mut child = Command::new(&config.server_bin)
         .arg(store_dir.to_str().unwrap())
         .arg("-p")
         .arg(port.to_string())
@@ -101,12 +99,12 @@ fn start_server(config: &BenchConfig, store_dir: &Path) -> ServerHandle {
         .spawn()
         .expect("cannot start server");
 
-    let pid = child.id();
-
     // Wait for server to be ready
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {
         if Instant::now() > deadline {
+            let _ = child.kill();
+            let _ = child.wait();
             panic!("server did not start within 10 seconds");
         }
         if std::net::TcpStream::connect(format!("127.0.0.1:{}", port)).is_ok() {
@@ -115,11 +113,8 @@ fn start_server(config: &BenchConfig, store_dir: &Path) -> ServerHandle {
         std::thread::sleep(Duration::from_millis(50));
     }
 
-    // Leak the child handle — we manage the process via pid
-    std::mem::forget(child);
-
     ServerHandle {
-        pid,
+        child,
         port,
         store_dir: store_dir.to_path_buf(),
     }
@@ -174,6 +169,10 @@ fn run_client_no_store(config: &BenchConfig, args: &[&str]) -> (Duration, String
     (elapsed, stdout)
 }
 
+fn null_device() -> &'static str {
+    if cfg!(windows) { "NUL" } else { "/dev/null" }
+}
+
 fn run_curl(url: &str, output_file: Option<&Path>) -> Duration {
     let start = Instant::now();
     let mut cmd = Command::new("curl");
@@ -181,7 +180,7 @@ fn run_curl(url: &str, output_file: Option<&Path>) -> Duration {
     if let Some(path) = output_file {
         cmd.arg("-o").arg(path.to_str().unwrap());
     } else {
-        cmd.arg("-o").arg("/dev/null");
+        cmd.arg("-o").arg(null_device());
     }
     cmd.arg(url);
 
@@ -211,7 +210,7 @@ fn run_curl_post_file(url: &str, file: &Path) -> Duration {
         .arg("--data-binary")
         .arg(format!("@{}", file.to_str().unwrap()))
         .arg("-o")
-        .arg("/dev/null")
+        .arg(null_device())
         .arg(url)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -238,7 +237,7 @@ fn run_curl_post_json(url: &str, json_file: &Path) -> Duration {
         .arg("-d")
         .arg(format!("@{}", json_file.to_str().unwrap()))
         .arg("-o")
-        .arg("/dev/null")
+        .arg(null_device())
         .arg(url)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())

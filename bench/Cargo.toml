@@ -8,6 +8,7 @@ name = "artifact-bench"
 path = "src/main.rs"
 
 [dependencies]
+chrono = { workspace = true }
 clap = { version = "4", features = ["derive"] }
 rand = { version = "0.9", features = ["small_rng"] }
 serde = { workspace = true }

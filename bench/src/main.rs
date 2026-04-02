@@ -11,12 +11,12 @@ use clap::Parser;
 #[clap(name = "artifact-bench", about = "Benchmark harness for ArtifactRepository")]
 pub struct Cli {
     /// Directory for generated test data
-    #[arg(long, default_value = "/tmp/artifact-bench/data")]
-    data_dir: PathBuf,
+    #[arg(long)]
+    data_dir: Option<PathBuf>,
 
     /// Directory for benchmark working files
-    #[arg(long, default_value = "/tmp/artifact-bench/work")]
-    work_dir: PathBuf,
+    #[arg(long)]
+    work_dir: Option<PathBuf>,
 
     /// Target total data size (e.g. "10G", "500M", "1G")
     #[arg(long, default_value = "10G")]
@@ -62,6 +62,13 @@ pub struct Cli {
 fn main() {
     let cli = Cli::parse();
 
+    let data_dir = cli.data_dir.unwrap_or_else(|| {
+        std::env::temp_dir().join("artifact-bench").join("data")
+    });
+    let work_dir = cli.work_dir.unwrap_or_else(|| {
+        std::env::temp_dir().join("artifact-bench").join("work")
+    });
+
     // Validate args
     if cli.duplicate_pct > 100 {
         eprintln!("Error: --duplicate-pct must be 0-100");
@@ -78,8 +85,8 @@ fn main() {
     });
 
     println!("=== ArtifactRepository Benchmark ===");
-    println!("Data dir:      {}", cli.data_dir.display());
-    println!("Work dir:      {}", cli.work_dir.display());
+    println!("Data dir:      {}", data_dir.display());
+    println!("Work dir:      {}", work_dir.display());
     println!("Total size:    {} ({} bytes)", cli.total_size, total_bytes);
     println!("Duplicate %:   {}%", cli.duplicate_pct);
     println!("Seed:          {}", cli.seed);
@@ -92,8 +99,8 @@ fn main() {
     // Resolve binary paths (sibling to our own binary)
     let self_path = std::env::current_exe().expect("cannot determine own path");
     let bin_dir = self_path.parent().expect("binary has no parent dir");
-    let client_bin = bin_dir.join("client");
-    let server_bin = bin_dir.join("server");
+    let client_bin = bin_dir.join(format!("client{}", std::env::consts::EXE_SUFFIX));
+    let server_bin = bin_dir.join(format!("server{}", std::env::consts::EXE_SUFFIX));
 
     if !client_bin.exists() {
         eprintln!("Error: client binary not found at {}", client_bin.display());
@@ -109,14 +116,14 @@ fn main() {
     // Step 1: Generate test data
     let manifest = if cli.skip_generate {
         println!("[1/4] Skipping data generation (--skip-generate)");
-        generate::load_manifest(&cli.data_dir).unwrap_or_else(|e| {
+        generate::load_manifest(&data_dir).unwrap_or_else(|e| {
             eprintln!("Error: cannot load existing data manifest: {}", e);
             eprintln!("Run without --skip-generate first");
             std::process::exit(1);
         })
     } else {
         println!("[1/4] Generating test data...");
-        generate::generate_data(&cli.data_dir, total_bytes, cli.duplicate_pct, cli.seed)
+        generate::generate_data(&data_dir, total_bytes, cli.duplicate_pct, cli.seed)
     };
 
     println!(
@@ -127,13 +134,13 @@ fn main() {
 
     // Step 2: Run benchmarks
     println!("[2/4] Running benchmarks ({} runs each)...", cli.runs);
-    std::fs::create_dir_all(&cli.work_dir).expect("cannot create work dir");
+    std::fs::create_dir_all(&work_dir).expect("cannot create work dir");
 
     let config = runner::BenchConfig {
         client_bin,
         server_bin,
-        data_dir: cli.data_dir.clone(),
-        work_dir: cli.work_dir.clone(),
+        data_dir: data_dir.clone(),
+        work_dir: work_dir.clone(),
         compression: cli.compression.clone(),
         runs: cli.runs,
         verify: !cli.no_verify,

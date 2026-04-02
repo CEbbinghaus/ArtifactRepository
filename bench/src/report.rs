@@ -199,47 +199,48 @@ fn human_bytes(bytes: u64) -> String {
 }
 
 fn system_info() -> String {
-    let os = std::fs::read_to_string("/etc/os-release")
-        .ok()
-        .and_then(|c| {
-            c.lines()
-                .find(|l| l.starts_with("PRETTY_NAME="))
-                .map(|l| l.trim_start_matches("PRETTY_NAME=").trim_matches('"').to_string())
-        })
-        .unwrap_or_else(|| "Linux".into());
+    let os = if cfg!(target_os = "windows") {
+        "Windows".to_string()
+    } else {
+        std::fs::read_to_string("/etc/os-release")
+            .ok()
+            .and_then(|c| {
+                c.lines()
+                    .find(|l| l.starts_with("PRETTY_NAME="))
+                    .map(|l| l.trim_start_matches("PRETTY_NAME=").trim_matches('"').to_string())
+            })
+            .unwrap_or_else(|| std::env::consts::OS.to_string())
+    };
 
     let cpus = std::thread::available_parallelism()
         .map(|n| n.get())
         .unwrap_or(1);
 
-    let mem_kb = std::fs::read_to_string("/proc/meminfo")
-        .ok()
-        .and_then(|c| {
-            c.lines()
-                .find(|l| l.starts_with("MemTotal:"))
-                .and_then(|l| {
-                    l.split_whitespace()
-                        .nth(1)
-                        .and_then(|s| s.parse::<u64>().ok())
-                })
-        })
-        .unwrap_or(0);
+    let mem_gb = if cfg!(target_os = "linux") {
+        std::fs::read_to_string("/proc/meminfo")
+            .ok()
+            .and_then(|c| {
+                c.lines()
+                    .find(|l| l.starts_with("MemTotal:"))
+                    .and_then(|l| {
+                        l.split_whitespace()
+                            .nth(1)
+                            .and_then(|s| s.parse::<u64>().ok())
+                    })
+            })
+            .map(|kb| kb as f64 / 1_048_576.0)
+            .unwrap_or(0.0)
+    } else {
+        0.0
+    };
 
-    let mem_gb = mem_kb as f64 / 1_048_576.0;
-
-    format!("{}, {} cores, {:.0} GB RAM", os, cpus, mem_gb)
+    if mem_gb > 0.0 {
+        format!("{}, {} cores, {:.0} GB RAM", os, cpus, mem_gb)
+    } else {
+        format!("{}, {} cores", os, cpus)
+    }
 }
 
 fn chrono_now() -> String {
-    // Simple ISO 8601 timestamp without chrono dependency
-    let output = std::process::Command::new("date")
-        .arg("-u")
-        .arg("+%Y-%m-%dT%H:%M:%SZ")
-        .output()
-        .ok();
-
-    output
-        .and_then(|o| String::from_utf8(o.stdout).ok())
-        .map(|s| s.trim().to_string())
-        .unwrap_or_else(|| "unknown".into())
+    chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string()
 }
