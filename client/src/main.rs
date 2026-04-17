@@ -940,7 +940,7 @@ fn pack_archive(cache: &PathBuf, path: &PathBuf, index_hash: &Hash, compression:
             header: header_entries,
             entries: headers
                 .into_iter()
-                .map(|(hash, header)| FileEntryData(hash.get_path(cache)))
+                .map(|(hash, _header)| FileEntryData(hash.get_path(cache)))
                 .collect(),
         },
     };

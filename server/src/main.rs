@@ -2,12 +2,12 @@ use axum::{
     Router, body::{Body, BodyDataStream}, debug_handler, extract::{Path as AxumPath, Request, State}, http::{HeaderMap, HeaderValue, StatusCode}, response::Response, routing::{get, put}
 };
 use clap::Parser;
-use common::{Hash, Header, ObjectType, archive::{Archive, ArchiveBody, ArchiveEntryData, ArchiveHeaderEntry, FileEntryData, HEADER}, object_body::{Index, Object}, read_object_into_headers};
+use common::{Hash, Header, ObjectType, archive::{Archive, ArchiveBody, ArchiveHeaderEntry, FileEntryData, HEADER}, object_body::{Index, Object}, read_object_into_headers};
 use lazy_static::lazy_static;
 use sha2::{Digest, Sha512};
 use tower_http::compression::CompressionLayer;
 use std::{
-    collections::{HashMap, HashSet}, fs::{self, create_dir, remove_file}, io::Write, path::{Path, PathBuf}, str::from_utf8, sync::RwLock
+    collections::{HashMap, HashSet}, fs::{self, create_dir, remove_file}, io::Write, path::{Path, PathBuf}, sync::RwLock
 };
 use tokio::{fs::File, io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt, BufReader, BufWriter}};
 use tokio_stream::StreamExt;
@@ -279,7 +279,7 @@ async fn get_bundle(
 
     let mut headers = HashMap::new();
 
-    read_object_into_headers(&cache_path, &mut headers, &index.tree);
+    let _ = read_object_into_headers(&cache_path, &mut headers, &index.tree);
 
     //TODO: Surely there is an algorithm to more efficiently lay out this data
     let mut i = 0;
@@ -306,7 +306,7 @@ async fn get_bundle(
         index: index,
         body: ArchiveBody {
             header: header_entries,
-            entries: headers.into_iter().map(|(hash, header)| FileEntryData(hash.get_path(&cache_path))).collect()
+            entries: headers.into_iter().map(|(hash, _header)| FileEntryData(hash.get_path(&cache_path))).collect()
         }
     };
 

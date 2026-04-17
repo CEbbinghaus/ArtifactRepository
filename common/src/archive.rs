@@ -4,7 +4,7 @@ use anyhow::{Error, anyhow};
 use sha2::{Digest, Sha512};
 
 use crate::{
-    Hash, Header, object_body::{Index, Object}, pipe, read_header_and_body
+    Hash, object_body::{Index, Object}, pipe
 };
 
 pub const HEADER: [u8; 4] = [b'a', b'r', b'x', b'a'];
