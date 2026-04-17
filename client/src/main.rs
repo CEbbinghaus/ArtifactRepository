@@ -363,19 +363,26 @@ impl Tree {
     fn from_dir(path: &PathBuf) -> Self {
         assert!(path.is_dir());
 
+        let mut contents: Vec<TreeObject> = std::fs::read_dir(&path)
+            .expect("Failed to read directory")
+            .map(|entry| {
+                let path = entry.expect("Failed to read directory entry").path();
+                if path.is_dir() {
+                    TreeObject::Tree(Hashed::from_object(Tree::from_dir(&path)))
+                } else {
+                    TreeObject::Blob(Hashed::from_object(Blob::from_path(&path)))
+                }
+            })
+            .collect();
+
+        // read_dir returns entries in filesystem order, which is not
+        // guaranteed to be stable. Sort by name so the resulting tree hash
+        // is deterministic across platforms and repeated runs.
+        contents.sort_by(|a, b| a.path_component().cmp(b.path_component()));
+
         Self {
             mode: Mode::Tree,
-            contents: std::fs::read_dir(&path)
-                .unwrap()
-                .map(|entry| {
-                    let path = entry.unwrap().path();
-                    if path.is_dir() {
-                        TreeObject::Tree(Hashed::from_object(Tree::from_dir(&path)))
-                    } else {
-                        TreeObject::Blob(Hashed::from_object(Blob::from_path(&path)))
-                    }
-                })
-                .collect(),
+            contents,
             path: match path.file_name() {
                 Some(v) => v.to_string_lossy().to_string(),
                 None => panic!("{path:?} did not have a filename"),
@@ -519,6 +526,13 @@ impl TreeObject {
         match self {
             Self::Tree(tree) => get_bytes_from_thing(tree.deref(), &tree.hash),
             Self::Blob(blob) => get_bytes_from_thing(blob.deref(), &blob.hash),
+        }
+    }
+
+    fn path_component(&self) -> &str {
+        match self {
+            Self::Tree(tree) => tree.get_path_component(),
+            Self::Blob(blob) => blob.get_path_component(),
         }
     }
 }
@@ -1094,5 +1108,41 @@ fn main() {
             compression,
         } => pack_archive(&cli.cache, &file, &index, compression).expect("Packing to work"),
         Commands::Unpack { file } => unpack_archive(&cli.cache, &file).expect("Packing to work"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    fn make_dir_with_files(files: &[&str]) -> TempDir {
+        let dir = TempDir::new().unwrap();
+        for name in files {
+            std::fs::write(dir.path().join(name), name.as_bytes()).unwrap();
+        }
+        dir
+    }
+
+    #[test]
+    fn tree_entries_are_sorted_by_name() {
+        // Created in deliberately non-alphabetical order.
+        let dir = make_dir_with_files(&["zebra.txt", "alpha.txt", "middle.txt"]);
+
+        let tree = Tree::from_dir(&dir.path().to_path_buf());
+
+        let names: Vec<&str> = tree.contents.iter().map(|o| o.path_component()).collect();
+        assert_eq!(names, vec!["alpha.txt", "middle.txt", "zebra.txt"]);
+    }
+
+    #[test]
+    fn tree_hash_is_deterministic() {
+        let dir = make_dir_with_files(&["c.txt", "a.txt", "b.txt"]);
+
+        let path = dir.path().to_path_buf();
+        let first = Hashed::from_object(Tree::from_dir(&path)).hash;
+        let second = Hashed::from_object(Tree::from_dir(&path)).hash;
+
+        assert_eq!(first, second, "tree hash must be stable across runs");
     }
 }
