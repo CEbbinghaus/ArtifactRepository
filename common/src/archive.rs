@@ -419,7 +419,7 @@ where
 
         let mut counter: u64 = 0;
 
-        header_entries.sort_by(|a, b| a.index.cmp(&b.index));
+        header_entries.sort_by_key(|a| a.index);
         assert!(header_entries[0].index == 0);
 
         let mut entries: Vec<RawEntryData> = Vec::with_capacity(header_entries.len());

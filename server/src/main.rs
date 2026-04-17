@@ -324,7 +324,9 @@ async fn get_bundle(
         index,
         body: ArchiveBody {
             header: header_entries,
-            entries: headers.keys().map(|hash| StoreEntryData {
+            entries: headers
+                .keys()
+                .map(|hash| StoreEntryData {
                     store: store.clone(),
                     hash: hash.clone(),
                 })
