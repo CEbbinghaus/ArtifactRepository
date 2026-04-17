@@ -7,9 +7,8 @@ use std::{
     str::FromStr,
 };
 
-use anyhow::{anyhow, Error};
-use bytes::Bytes;
-use futures::{AsyncReadExt, Stream};
+use anyhow::anyhow;
+use futures::AsyncReadExt;
 use lzma_rust2::LzmaOptions;
 use sha2::{Digest, Sha512};
 
