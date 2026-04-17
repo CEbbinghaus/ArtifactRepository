@@ -209,10 +209,16 @@ async fn put_object(
 
     let store_object = StoreObject::new_with_header(header, buffered_reader);
 
-    store
-        .put_object(&object_hash, store_object)
-        .await
-        .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))?;
+    // Content-addressable writes are idempotent. A concurrent PUT for the
+    // same hash can race past the exists() check above; opendal's Fs
+    // backend then errors with "writer got too much data" for the loser.
+    // Treat any put_object failure as success if the object now exists.
+    if let Err(err) = store.put_object(&object_hash, store_object).await {
+        if !store.exists(&object_hash).await.unwrap_or(false) {
+            return Err((StatusCode::INTERNAL_SERVER_ERROR, err.to_string()));
+        }
+        return Ok(StatusCode::OK);
+    }
 
     Ok(StatusCode::CREATED)
 }
