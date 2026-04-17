@@ -92,6 +92,7 @@ struct ServerState {
     store: Store,
 }
 
+#[allow(dead_code)]
 enum ErrorResult {
     HashDoesntMatch,
     LengthDoesntMatch,
@@ -99,6 +100,7 @@ enum ErrorResult {
 }
 
 impl ErrorResult {
+    #[allow(dead_code)]
     fn get_response(&self) -> (StatusCode, String) {
         match self {
             ErrorResult::HashDoesntMatch => (
