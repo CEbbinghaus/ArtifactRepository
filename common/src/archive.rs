@@ -92,8 +92,8 @@ impl CompressionLevel {
         let algorithm_index = match algorithm {
             CompressionAlgorithm::None => 0,
             CompressionAlgorithm::Zstd => 1,
-            CompressionAlgorithm::Deflate => 3,
-            CompressionAlgorithm::LZMA2 => 4,
+            CompressionAlgorithm::Deflate => 2,
+            CompressionAlgorithm::LZMA2 => 3,
         };
 
         let level = match self {
