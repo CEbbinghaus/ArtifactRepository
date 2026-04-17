@@ -71,7 +71,7 @@ impl<T> Archive<T>
 where
     T: ArchiveEntryData,
 {
-    pub fn to_data<'a>(self, writer: &'a mut impl Write) -> anyhow::Result<()> {
+    pub fn to_data(self, writer: &mut impl Write) -> anyhow::Result<()> {
         writer.write_all(&HEADER)?;
         writer.write_all(&(self.compression as u16).to_be_bytes())?;
         writer.write_all(&self.hash.hash)?;
@@ -108,7 +108,7 @@ where
         Ok(())
     }
 
-    pub fn from_data<'a>(reader: &'a mut impl Read) -> anyhow::Result<Archive<RawEntryData>> {
+    pub fn from_data(reader: &mut impl Read) -> anyhow::Result<Archive<RawEntryData>> {
         let mut reader = BufReader::new(reader);
 
         let mut header: [u8; 4] = [0; 4];
@@ -270,7 +270,7 @@ impl<T> ArchiveBody<T>
 where
     T: ArchiveEntryData,
 {
-    fn to_data<'a>(self, writer: &'a mut impl Write) -> anyhow::Result<()> {
+    fn to_data(self, writer: &mut impl Write) -> anyhow::Result<()> {
         writer.write_all(&(self.header.len() as u64).to_be_bytes())?;
         for entry in &self.header {
             writer.write_all(&entry.hash.hash)?;
@@ -287,7 +287,7 @@ where
         Ok(())
     }
 
-    fn from_data<'a>(reader: &'a mut impl Read) -> anyhow::Result<ArchiveBody<RawEntryData>> {
+    fn from_data(reader: &mut impl Read) -> anyhow::Result<ArchiveBody<RawEntryData>> {
         let mut long: [u8; 8] = [0; 8];
         reader.read_exact(&mut long)?;
         let count = u64::from_be_bytes(long);

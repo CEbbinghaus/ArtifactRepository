@@ -61,7 +61,7 @@ impl Object for Index {
                     if timestamp.is_none() {
                         panic!("Timestamp MUST come second");
                     }
-                    if let Some(_) = metadata.insert(key.to_string(), value.trim().to_string()) {
+                    if metadata.insert(key.to_string(), value.trim().to_string()).is_some() {
                         panic!("No duplicate keys allowed within Index Metadata");
                     }
                 }
@@ -71,7 +71,7 @@ impl Object for Index {
         Index {
             tree: tree_hash.expect("tree to exist within artifact metadata"),
             timestamp: timestamp.expect("timestamp to exist within artifact metadata"),
-            metadata: metadata,
+            metadata,
         }
     }
 
@@ -88,11 +88,11 @@ impl Object for Index {
             Ok(())
         }
 
-        write_kv(&mut data, TREE_KEY, &self.tree.as_str()).expect("Write to work");
+        write_kv(&mut data, TREE_KEY, self.tree.as_str()).expect("Write to work");
         write_kv(&mut data, TIMESTAMP_KEY, &self.timestamp.to_rfc3339()).expect("Write to work");
 
         for (key, value) in &self.metadata {
-            write_kv(&mut data, &key, &value).expect("Write to work");
+            write_kv(&mut data, key, value).expect("Write to work");
         }
         data.push(b'\n');
 
@@ -155,7 +155,7 @@ impl Object for Tree {
         fn write_entry(data: &mut Vec<u8>, entry: &TreeEntry) -> anyhow::Result<()> {
             data.write(entry.mode.as_str().as_bytes())?;
             data.push(b' ');
-            data.write(&entry.path.as_bytes())?;
+            data.write(entry.path.as_bytes())?;
             data.push(0);
             data.write(&entry.hash.hash)?;
 
@@ -163,7 +163,7 @@ impl Object for Tree {
         }
 
         for entry in &self.contents {
-            write_entry(&mut data, &entry).expect("Writing to works");
+            write_entry(&mut data, entry).expect("Writing to works");
         }
 
         data
