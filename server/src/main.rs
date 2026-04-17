@@ -8,11 +8,7 @@ use axum::{
 };
 use clap::Parser;
 use common::{
-    archive::{Archive, ArchiveBody, ArchiveHeaderEntry, StoreEntryData, HEADER},
-    object_body::{Index, Object},
-    read_object_into_headers,
-    store::{Store, StoreObject},
-    Hash, Header, ObjectType,
+    Hash, Header, ObjectType, archive::{Archive, ArchiveBody, ArchiveHeaderEntry, CompressionLevel, HEADER, StoreEntryData}, object_body::{Index, Object}, read_object_into_headers, store::{Store, StoreObject}
 };
 use std::{collections::HashMap, fs::create_dir, path::PathBuf};
 use tower_http::compression::CompressionLayer;
@@ -313,7 +309,7 @@ async fn get_bundle(
 
     let archive = Archive {
         header: HEADER,
-        compression: common::archive::Compression::None,
+        compression: common::archive::CompressionAlgorithm::None,
         hash: index_hash.clone(),
         index: index,
         body: ArchiveBody {
@@ -331,7 +327,7 @@ async fn get_bundle(
     let mut body = Vec::new();
 
     archive
-        .to_data(&mut body)
+        .to_data(CompressionLevel::Fast, &mut body)
         .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))?;
 
     let mut response = Response::new(Body::from(body));

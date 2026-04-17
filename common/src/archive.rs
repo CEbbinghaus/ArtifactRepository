@@ -4,10 +4,13 @@ use std::{
     num::NonZero,
     path::PathBuf,
     str::FromStr,
+    fmt::{self, Display},
 };
 
 use anyhow::{anyhow, Error};
-use futures::AsyncReadExt;
+use bytes::Bytes;
+use futures::{AsyncReadExt, Stream};
+use lzma_rust2::LzmaOptions;
 use sha2::{Digest, Sha512};
 
 use crate::{
@@ -20,48 +23,122 @@ use crate::{
 pub const HEADER: [u8; 4] = [b'a', b'r', b'x', b'a'];
 
 #[repr(u16)]
-#[derive(Clone, Copy)]
-pub enum Compression {
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CompressionAlgorithm {
     None = 0,
-    Gzip = 4,
-    Deflate = 8,
-    LZMA2 = 16,
+    Zstd = 2,
+    Deflate = 4,
+    LZMA2 = 8,
 }
 
-impl FromStr for Compression {
-    type Err = Error;
+impl FromStr for CompressionAlgorithm {
+    type Err = anyhow::Error;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s {
-            "none" => Ok(Compression::None),
-            "gzip" => Ok(Compression::Gzip),
-            "deflate" => Ok(Compression::Deflate),
-            "lzma2" => Ok(Compression::LZMA2),
+            "none" => Ok(CompressionAlgorithm::None),
+            "deflate" => Ok(CompressionAlgorithm::Deflate),
+            "lzma2" => Ok(CompressionAlgorithm::LZMA2),
+            "zstd" => Ok(CompressionAlgorithm::Zstd),
             _ => Err(anyhow!("Invalid Compression Type")),
         }
     }
 }
 
-impl TryFrom<u16> for Compression {
+impl Display for CompressionAlgorithm {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            CompressionAlgorithm::None => write!(f, "none"),
+            CompressionAlgorithm::Deflate => write!(f, "deflate"),
+            CompressionAlgorithm::LZMA2 => write!(f, "lzma2"),
+            CompressionAlgorithm::Zstd => write!(f, "zstd"),
+        }
+    }
+}
+
+impl TryFrom<u16> for CompressionAlgorithm {
     type Error = ();
 
     fn try_from(v: u16) -> Result<Self, Self::Error> {
         match v {
-            x if x == Compression::None as u16 => Ok(Compression::None),
-            x if x == Compression::Gzip as u16 => Ok(Compression::Gzip),
-            x if x == Compression::Deflate as u16 => Ok(Compression::Deflate),
-            x if x == Compression::LZMA2 as u16 => Ok(Compression::LZMA2),
+            x if x == CompressionAlgorithm::None as u16 => Ok(CompressionAlgorithm::None),
+            x if x == CompressionAlgorithm::Zstd as u16 => Ok(CompressionAlgorithm::Zstd),
+            x if x == CompressionAlgorithm::Deflate as u16 => Ok(CompressionAlgorithm::Deflate),
+            x if x == CompressionAlgorithm::LZMA2 as u16 => Ok(CompressionAlgorithm::LZMA2),
             _ => Err(()),
         }
     }
 }
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CompressionLevel {
+    Default,
+    Fast,
+    Best,
+    Exact(i32),
+}
+
+impl CompressionLevel {
+    pub fn get_compression_level(&self, algorithm: CompressionAlgorithm) -> Result<i32, anyhow::Error> {
+        // matrix of compression levels for each algorithm. The first dimension is the algorithm, the second dimension is the level (0-3)
+        const LEVELS: [[i32; 3]; 4] = [
+            [0, 0, 0], // None
+            [3, 6, 15], // Zstd
+            [6, 1, 9], // Deflate
+            [5, 1, 9], // LZMA2
+        ];
+
+        let algorithm_index = match algorithm {
+            CompressionAlgorithm::None => 0,
+            CompressionAlgorithm::Zstd => 1,
+            CompressionAlgorithm::Deflate => 3,
+            CompressionAlgorithm::LZMA2 => 4,
+        };
+
+        let level = match self {
+            CompressionLevel::Default => LEVELS[algorithm_index][0],
+            CompressionLevel::Fast => LEVELS[algorithm_index][1],
+            CompressionLevel::Best => LEVELS[algorithm_index][2],
+            CompressionLevel::Exact(i) => *i,
+        };
+
+        if !Self::is_valid_for_algorithm(level, algorithm) {
+            return Err(anyhow!(
+                "Invalid compression level {level} for algorithm {algorithm}"
+            ));
+        }
+
+        Ok(level)
+    }
+
+    fn is_valid_for_algorithm(level: i32, algorithm: CompressionAlgorithm) -> bool {
+        match algorithm {
+            CompressionAlgorithm::None => true,
+            // how about the negative values?
+            CompressionAlgorithm::Zstd => (-22..=22).contains(&level),
+            CompressionAlgorithm::Deflate => (0..=9).contains(&level),
+            CompressionAlgorithm::LZMA2 => (0..=9).contains(&level),
+        }
+    }
+}
+
+impl Display for CompressionLevel {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            CompressionLevel::Default => write!(f, "default"),
+            CompressionLevel::Fast => write!(f, "fast"),
+            CompressionLevel::Best => write!(f, "best"),
+            CompressionLevel::Exact(i) => write!(f, "exact({i})"),
+        }
+    }
+}
+
 
 pub struct Archive<T>
 where
     T: ArchiveEntryData,
 {
     pub header: [u8; 4],
-    pub compression: Compression,
+    pub compression: CompressionAlgorithm,
     pub hash: Hash,
     pub index: Index,
     pub body: ArchiveBody<T>,
@@ -71,38 +148,44 @@ impl<T> Archive<T>
 where
     T: ArchiveEntryData,
 {
-    pub fn to_data(self, writer: &mut impl Write) -> anyhow::Result<()> {
+    pub fn to_data(self, compression_level: CompressionLevel, writer: &mut impl Write) -> anyhow::Result<()> {
         writer.write_all(&HEADER)?;
         writer.write_all(&(self.compression as u16).to_be_bytes())?;
         writer.write_all(&self.hash.hash)?;
         writer.write_all(&self.index.to_data())?;
         writer.write_all(&[0])?;
 
+        let numerical_level = compression_level.get_compression_level(self.compression)?;
+
         match self.compression {
-            Compression::None => self.body.to_data(writer)?,
-            Compression::Gzip => {
+            CompressionAlgorithm::None => self.body.to_data(writer)?,
+            CompressionAlgorithm::Deflate => {
                 let mut gz_encoder =
-                    flate2::write::GzEncoder::new(writer, flate2::Compression::default());
+                    flate2::write::DeflateEncoder::new(writer, flate2::Compression::new(numerical_level as u32));
                 self.body.to_data(&mut gz_encoder)?;
                 gz_encoder.finish()?.flush()?;
             }
-            Compression::Deflate => {
-                let mut gz_encoder =
-                    flate2::write::DeflateEncoder::new(writer, flate2::Compression::default());
-                self.body.to_data(&mut gz_encoder)?;
-                gz_encoder.finish()?.flush()?;
-            }
-            Compression::LZMA2 => self.body.to_data(
+            CompressionAlgorithm::LZMA2 => self.body.to_data(
                 &mut lzma_rust2::Lzma2WriterMt::new(
                     writer,
                     lzma_rust2::Lzma2Options {
-                        lzma_options: Default::default(),
+                        lzma_options: LzmaOptions::with_preset(numerical_level as u32),
                         chunk_size: NonZero::new(1024 * 64),
                     },
                     std::thread::available_parallelism().unwrap().get() as u32,
                 )?
                 .auto_finish(),
             )?,
+            CompressionAlgorithm::Zstd => {
+                let mut encoder = zstd::stream::write::Encoder::new(writer, numerical_level)?;
+                encoder.multithread(
+                    std::thread::available_parallelism()
+                        .map(|n| n.get() as u32)
+                        .unwrap_or(1),
+                )?;
+                self.body.to_data(&mut encoder)?;
+                encoder.finish()?.flush()?;
+            }
         }
 
         Ok(())
@@ -118,7 +201,7 @@ where
         let mut compression: [u8; 2] = [0; 2];
         reader.read_exact(&mut compression)?;
 
-        let compression: Compression = u16::from_be_bytes(compression)
+        let compression: CompressionAlgorithm = u16::from_be_bytes(compression)
             .try_into()
             .map_err(|_| anyhow!("Invalid Compression"))?;
 
@@ -132,14 +215,11 @@ where
         let index = Index::from_data(&index_bytes[..index_bytes_read - 1]);
 
         let body = match compression {
-            Compression::None => ArchiveBody::<RawEntryData>::from_data(&mut reader)?,
-            Compression::Gzip => ArchiveBody::<RawEntryData>::from_data(
-                &mut flate2::read::GzDecoder::new(&mut reader),
-            )?,
-            Compression::Deflate => ArchiveBody::<RawEntryData>::from_data(
+            CompressionAlgorithm::None => ArchiveBody::<RawEntryData>::from_data(&mut reader)?,
+            CompressionAlgorithm::Deflate => ArchiveBody::<RawEntryData>::from_data(
                 &mut flate2::read::DeflateDecoder::new(&mut reader),
             )?,
-            Compression::LZMA2 => ArchiveBody::<RawEntryData>::from_data({
+            CompressionAlgorithm::LZMA2 => ArchiveBody::<RawEntryData>::from_data({
                 &mut lzma_rust2::Lzma2ReaderMt::new(
                     &mut reader,
                     lzma_rust2::LzmaOptions::DICT_SIZE_DEFAULT,
@@ -147,6 +227,9 @@ where
                     std::thread::available_parallelism().unwrap().get() as u32,
                 )
             })?,
+            CompressionAlgorithm::Zstd => ArchiveBody::<RawEntryData>::from_data(
+                &mut zstd::stream::read::Decoder::new(&mut reader)?,
+            )?,
         };
 
         Ok(Archive {
@@ -353,5 +436,44 @@ where
             header: header_entries,
             entries,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::{TimeZone, Utc};
+    use std::collections::HashMap;
+
+    fn empty_archive(compression: CompressionAlgorithm) -> Archive<RawEntryData> {
+        let zero = Hash::from([0u8; 64]);
+        Archive {
+            header: HEADER,
+            compression,
+            hash: zero.clone(),
+            index: Index {
+                tree: zero,
+                timestamp: Utc.timestamp_opt(0, 0).unwrap(),
+                metadata: HashMap::new(),
+            },
+            body: ArchiveBody {
+                header: Vec::new(),
+                entries: Vec::new(),
+            },
+        }
+    }
+
+    #[test]
+    fn zstd_archive_round_trip() {
+        let mut bytes = Vec::new();
+        empty_archive(CompressionAlgorithm::Zstd)
+            .to_data(CompressionLevel::Default, &mut bytes)
+            .expect("encode");
+
+        let decoded = Archive::<RawEntryData>::from_data(&mut bytes.as_slice()).expect("decode");
+
+        assert!(matches!(decoded.compression, CompressionAlgorithm::Zstd));
+        assert!(decoded.body.header.is_empty());
+        assert!(decoded.body.entries.is_empty());
     }
 }
