@@ -61,7 +61,10 @@ impl Object for Index {
                     if timestamp.is_none() {
                         panic!("Timestamp MUST come second");
                     }
-                    if metadata.insert(key.to_string(), value.trim().to_string()).is_some() {
+                    if metadata
+                        .insert(key.to_string(), value.trim().to_string())
+                        .is_some()
+                    {
                         panic!("No duplicate keys allowed within Index Metadata");
                     }
                 }

@@ -8,7 +8,11 @@ use axum::{
 };
 use clap::Parser;
 use common::{
-    Hash, Header, ObjectType, archive::{Archive, ArchiveBody, ArchiveHeaderEntry, CompressionLevel, HEADER, StoreEntryData}, object_body::{Index, Object}, read_object_into_headers, store::{Store, StoreObject}
+    archive::{Archive, ArchiveBody, ArchiveHeaderEntry, CompressionLevel, StoreEntryData, HEADER},
+    object_body::{Index, Object},
+    read_object_into_headers,
+    store::{Store, StoreObject},
+    Hash, Header, ObjectType,
 };
 use std::{collections::HashMap, fs::create_dir, path::PathBuf};
 use tower_http::compression::CompressionLayer;

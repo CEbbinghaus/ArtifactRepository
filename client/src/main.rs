@@ -2,9 +2,13 @@
 use chrono::{DateTime, Utc};
 use clap::{Parser, Subcommand};
 use common::{
-    BLOB_KEY, Hash, Header, INDEX_KEY, Mode, ObjectType, TREE_KEY, archive::{
-        Archive, ArchiveBody, ArchiveEntryData, ArchiveHeaderEntry, CompressionAlgorithm, CompressionLevel, FileEntryData, HEADER, RawEntryData
-    }, object_body::Object as OtherObject, read_header_and_body, read_header_from_file, read_header_from_slice, read_object_into_headers_sync
+    archive::{
+        Archive, ArchiveBody, ArchiveEntryData, ArchiveHeaderEntry, CompressionAlgorithm,
+        CompressionLevel, FileEntryData, RawEntryData, HEADER,
+    },
+    object_body::Object as OtherObject,
+    read_header_and_body, read_header_from_file, read_header_from_slice,
+    read_object_into_headers_sync, Hash, Header, Mode, ObjectType, BLOB_KEY, INDEX_KEY, TREE_KEY,
 };
 use sha2::{Digest, Sha512};
 use std::{

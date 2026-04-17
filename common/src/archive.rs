@@ -1,10 +1,10 @@
 use std::{
+    fmt::{self, Display},
     fs::File,
     io::{BufRead, BufReader, Read, Write},
     num::NonZero,
     path::PathBuf,
     str::FromStr,
-    fmt::{self, Display},
 };
 
 use anyhow::{anyhow, Error};
@@ -78,13 +78,16 @@ pub enum CompressionLevel {
 }
 
 impl CompressionLevel {
-    pub fn get_compression_level(&self, algorithm: CompressionAlgorithm) -> Result<i32, anyhow::Error> {
+    pub fn get_compression_level(
+        &self,
+        algorithm: CompressionAlgorithm,
+    ) -> Result<i32, anyhow::Error> {
         // matrix of compression levels for each algorithm. The first dimension is the algorithm, the second dimension is the level (0-3)
         const LEVELS: [[i32; 3]; 4] = [
-            [0, 0, 0], // None
+            [0, 0, 0],  // None
             [3, 6, 15], // Zstd
-            [6, 1, 9], // Deflate
-            [5, 1, 9], // LZMA2
+            [6, 1, 9],  // Deflate
+            [5, 1, 9],  // LZMA2
         ];
 
         let algorithm_index = match algorithm {
@@ -132,7 +135,6 @@ impl Display for CompressionLevel {
     }
 }
 
-
 pub struct Archive<T>
 where
     T: ArchiveEntryData,
@@ -148,7 +150,11 @@ impl<T> Archive<T>
 where
     T: ArchiveEntryData,
 {
-    pub fn to_data(self, compression_level: CompressionLevel, writer: &mut impl Write) -> anyhow::Result<()> {
+    pub fn to_data(
+        self,
+        compression_level: CompressionLevel,
+        writer: &mut impl Write,
+    ) -> anyhow::Result<()> {
         writer.write_all(&HEADER)?;
         writer.write_all(&(self.compression as u16).to_be_bytes())?;
         writer.write_all(&self.hash.hash)?;
@@ -160,8 +166,10 @@ where
         match self.compression {
             CompressionAlgorithm::None => self.body.to_data(writer)?,
             CompressionAlgorithm::Deflate => {
-                let mut gz_encoder =
-                    flate2::write::DeflateEncoder::new(writer, flate2::Compression::new(numerical_level as u32));
+                let mut gz_encoder = flate2::write::DeflateEncoder::new(
+                    writer,
+                    flate2::Compression::new(numerical_level as u32),
+                );
                 self.body.to_data(&mut gz_encoder)?;
                 gz_encoder.finish()?.flush()?;
             }

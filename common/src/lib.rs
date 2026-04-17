@@ -82,7 +82,7 @@ pub async fn read_object_into_headers(
         }
 
         headers.insert(current_hash.clone(), object.header);
-        
+
         if object.header.object_type == ObjectType::Blob {
             continue;
         }
