@@ -13,7 +13,7 @@ use common::{
 use sha2::{Digest, Sha512};
 use std::{
     collections::HashMap,
-    fs::{File, create_dir, create_dir_all, read_dir},
+    fs::{create_dir, create_dir_all, read_dir, File},
     io::{BufRead, BufReader, BufWriter, Read, Write},
     ops::Deref,
     path::{Path, PathBuf},
@@ -959,7 +959,9 @@ fn pack_archive(
         index,
         body: ArchiveBody {
             header: header_entries,
-            entries: headers.into_keys().map(|hash| FileEntryData(hash.get_path(cache)))
+            entries: headers
+                .into_keys()
+                .map(|hash| FileEntryData(hash.get_path(cache)))
                 .collect(),
         },
     };
