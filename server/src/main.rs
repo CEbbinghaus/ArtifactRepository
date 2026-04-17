@@ -8,7 +8,7 @@ use axum::{
 };
 use clap::Parser;
 use common::{
-    archive::{Archive, ArchiveBody, ArchiveHeaderEntry, StoreEntryData, HEADER},
+    archive::{Archive, ArchiveBody, ArchiveHeaderEntry, CompressionLevel, StoreEntryData, HEADER},
     object_body::{Index, Object},
     read_object_into_headers,
     store::{Store, StoreObject},
@@ -313,7 +313,7 @@ async fn get_bundle(
 
     let archive = Archive {
         header: HEADER,
-        compression: common::archive::Compression::None,
+        compression: common::archive::CompressionAlgorithm::None,
         hash: index_hash.clone(),
         index: index,
         body: ArchiveBody {
@@ -331,7 +331,7 @@ async fn get_bundle(
     let mut body = Vec::new();
 
     archive
-        .to_data(&mut body)
+        .to_data(CompressionLevel::Fast, &mut body)
         .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))?;
 
     let mut response = Response::new(Body::from(body));

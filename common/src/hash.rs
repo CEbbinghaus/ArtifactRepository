@@ -138,7 +138,7 @@ impl TryFrom<&[u8]> for Hash {
 
         let data: [u8; 64] = value.try_into()?;
         Ok(Self {
-            hash_string: hex::encode(&value),
+            hash_string: hex::encode(value),
             hash: data,
         })
     }
@@ -147,7 +147,7 @@ impl TryFrom<&[u8]> for Hash {
 impl From<[u8; 64]> for Hash {
     fn from(value: [u8; 64]) -> Self {
         Self {
-            hash_string: hex::encode(&value),
+            hash_string: hex::encode(value),
             hash: value,
         }
     }

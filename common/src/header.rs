@@ -35,7 +35,7 @@ impl Header {
     }
 
     pub fn from_data(data: &[u8]) -> Result<Self> {
-        if data.len() == 0 {
+        if data.is_empty() {
             return Err(anyhow!("Invalid Header: No Data"));
         }
 
@@ -62,14 +62,14 @@ impl Header {
     }
 
     pub fn from_buf(buffer: &[u8]) -> Result<Self> {
-        if buffer.len() == 0 {
+        if buffer.is_empty() {
             return Err(anyhow!("Invalid Header: No Data"));
         }
         // Find the null marker of the header. If its not available then we just gotta assume the whole buffer is a valid utf8 header
         let null_position = buffer.iter().position(|x| *x == 0).unwrap_or(buffer.len());
         let buffer = &buffer[..null_position];
 
-        Self::from_data(&buffer)
+        Self::from_data(buffer)
     }
 
     pub async fn read_from_async(
@@ -92,7 +92,7 @@ impl Header {
             .seek(std::io::SeekFrom::Start(null_position as u64))
             .await?;
 
-        Self::from_data(&buffer)
+        Self::from_data(buffer)
     }
 
     pub fn read_from(reader: &mut impl Read) -> Result<Self> {
@@ -104,6 +104,6 @@ impl Header {
         }
 
         let buffer = &buffer[..bytes_read];
-        Self::from_buf(&buffer)
+        Self::from_buf(buffer)
     }
 }

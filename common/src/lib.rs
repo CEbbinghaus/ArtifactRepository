@@ -24,7 +24,7 @@ pub mod object_body;
 mod primitives;
 pub mod store;
 
-pub fn read_slice_until_byte<'a>(data: &'a [u8], byte: u8) -> Option<&'a [u8]> {
+pub fn read_slice_until_byte(data: &[u8], byte: u8) -> Option<&[u8]> {
     let Some(position) = data.iter().position(|v| *v == byte) else {
         return None;
     };
@@ -32,7 +32,7 @@ pub fn read_slice_until_byte<'a>(data: &'a [u8], byte: u8) -> Option<&'a [u8]> {
     Some(&data[..position])
 }
 
-pub fn read_header_and_body<'a>(data: &'a [u8]) -> Option<(Header, &'a [u8])> {
+pub fn read_header_and_body(data: &[u8]) -> Option<(Header, &[u8])> {
     let header = read_slice_until_byte(data, 0)?;
 
     let body_index = header.len() + 1; // one extra for the 0 byte
@@ -81,7 +81,7 @@ pub async fn read_object_into_headers(
             ));
         }
 
-        headers.insert(current_hash.clone(), object.header.clone());
+        headers.insert(current_hash.clone(), object.header);
 
         if object.header.object_type == ObjectType::Blob {
             continue;
@@ -149,7 +149,7 @@ pub fn read_object_into_headers_sync(
     Ok(())
 }
 
-pub fn pipe<'a, 'b>(reader: &'a mut dyn Read, writer: &'b mut dyn Write) -> anyhow::Result<()> {
+pub fn pipe(reader: &mut dyn Read, writer: &mut dyn Write) -> anyhow::Result<()> {
     let mut buffer: [u8; 1024] = [0; 1024];
     loop {
         let read = reader.read(&mut buffer)?;

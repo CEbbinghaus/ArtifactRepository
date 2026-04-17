@@ -3,8 +3,8 @@ use chrono::{DateTime, Utc};
 use clap::{Parser, Subcommand};
 use common::{
     archive::{
-        Archive, ArchiveBody, ArchiveEntryData, ArchiveHeaderEntry, Compression, FileEntryData,
-        RawEntryData, HEADER,
+        Archive, ArchiveBody, ArchiveEntryData, ArchiveHeaderEntry, CompressionAlgorithm,
+        CompressionLevel, FileEntryData, RawEntryData, HEADER,
     },
     object_body::Object as OtherObject,
     read_header_and_body, read_header_from_file, read_header_from_slice,
@@ -897,7 +897,7 @@ fn pack_archive(
     cache: &PathBuf,
     path: &PathBuf,
     index_hash: &Hash,
-    compression: Compression,
+    compression: CompressionAlgorithm,
 ) -> anyhow::Result<()> {
     assert!(!path.exists());
     assert!(path.parent().map(|p| p.exists() && p.is_dir()) == Some(true));
@@ -955,7 +955,7 @@ fn pack_archive(
     let arx_file = File::create(path)?;
     let mut writer = BufWriter::new(arx_file);
 
-    archive.to_data(&mut writer)?;
+    archive.to_data(CompressionLevel::Default, &mut writer)?;
 
     Ok(())
 }
@@ -1066,7 +1066,7 @@ enum Commands {
         file: PathBuf,
 
         #[arg(long)]
-        compression: Compression,
+        compression: CompressionAlgorithm,
     },
 
     Unpack {
