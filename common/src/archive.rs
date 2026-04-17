@@ -470,6 +470,76 @@ mod tests {
     }
 
     #[test]
+    fn all_named_compression_levels_are_valid_for_all_algorithms() {
+        let algorithms = [
+            CompressionAlgorithm::None,
+            CompressionAlgorithm::Zstd,
+            CompressionAlgorithm::Deflate,
+            CompressionAlgorithm::LZMA2,
+        ];
+        let levels = [
+            CompressionLevel::Default,
+            CompressionLevel::Fast,
+            CompressionLevel::Best,
+        ];
+
+        for algorithm in &algorithms {
+            for level in &levels {
+                level.get_compression_level(*algorithm).unwrap_or_else(|e| {
+                    panic!("{level} should be valid for {algorithm}: {e}");
+                });
+            }
+        }
+    }
+
+    #[test]
+    fn exact_levels_at_algorithm_bounds_are_valid() {
+        // (algorithm, valid min, valid max)
+        let bounds: [(CompressionAlgorithm, i32, i32); 3] = [
+            (CompressionAlgorithm::Zstd, -22, 22),
+            (CompressionAlgorithm::Deflate, 0, 9),
+            (CompressionAlgorithm::LZMA2, 0, 9),
+        ];
+
+        for (algorithm, min, max) in &bounds {
+            // min and max should succeed
+            CompressionLevel::Exact(*min)
+                .get_compression_level(*algorithm)
+                .unwrap_or_else(|e| panic!("Exact({min}) should be valid for {algorithm}: {e}"));
+            CompressionLevel::Exact(*max)
+                .get_compression_level(*algorithm)
+                .unwrap_or_else(|e| panic!("Exact({max}) should be valid for {algorithm}: {e}"));
+
+            // one past each bound should fail
+            assert!(
+                CompressionLevel::Exact(min - 1)
+                    .get_compression_level(*algorithm)
+                    .is_err(),
+                "Exact({}) should be invalid for {algorithm}",
+                min - 1
+            );
+            assert!(
+                CompressionLevel::Exact(max + 1)
+                    .get_compression_level(*algorithm)
+                    .is_err(),
+                "Exact({}) should be invalid for {algorithm}",
+                max + 1
+            );
+        }
+    }
+
+    #[test]
+    fn none_algorithm_accepts_any_exact_level() {
+        for level in [-100, -1, 0, 1, 100] {
+            CompressionLevel::Exact(level)
+                .get_compression_level(CompressionAlgorithm::None)
+                .unwrap_or_else(|e| {
+                    panic!("None algorithm should accept Exact({level}): {e}");
+                });
+        }
+    }
+
+    #[test]
     fn zstd_archive_round_trip() {
         let mut bytes = Vec::new();
         empty_archive(CompressionAlgorithm::Zstd)
