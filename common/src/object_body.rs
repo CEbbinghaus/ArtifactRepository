@@ -82,10 +82,10 @@ impl Object for Index {
         let mut data: Vec<u8> = Vec::new();
 
         fn write_kv(data: &mut Vec<u8>, key: &str, value: &str) -> anyhow::Result<()> {
-            data.write(key.as_bytes())?;
+            data.write_all(key.as_bytes())?;
             data.push(b':');
             data.push(b' ');
-            data.write(value.as_bytes())?;
+            data.write_all(value.as_bytes())?;
             data.push(b'\n');
 
             Ok(())
@@ -156,11 +156,11 @@ impl Object for Tree {
         let mut data: Vec<u8> = Vec::new();
 
         fn write_entry(data: &mut Vec<u8>, entry: &TreeEntry) -> anyhow::Result<()> {
-            data.write(entry.mode.as_str().as_bytes())?;
+            data.write_all(entry.mode.as_str().as_bytes())?;
             data.push(b' ');
-            data.write(entry.path.as_bytes())?;
+            data.write_all(entry.path.as_bytes())?;
             data.push(0);
-            data.write(&entry.hash.hash)?;
+            data.write_all(&entry.hash.hash)?;
 
             Ok(())
         }

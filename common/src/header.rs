@@ -19,6 +19,7 @@ impl Header {
         Header { object_type, size }
     }
 
+    #[allow(clippy::inherent_to_string)]
     pub fn to_string(&self) -> String {
         format!("{} {}\0", self.object_type.to_str(), self.size)
     }
@@ -48,6 +49,7 @@ impl Header {
         Self::from_str(from_utf8(data)?)
     }
 
+    #[allow(clippy::should_implement_trait)]
     pub fn from_str(string: &str) -> Result<Self> {
         let (object_type, size) = string
             .split_once(' ')

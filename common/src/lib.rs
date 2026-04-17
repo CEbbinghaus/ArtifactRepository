@@ -2,7 +2,7 @@ use std::{
     collections::HashMap,
     fs::File,
     io::{BufRead, BufReader, Read, Write},
-    path::PathBuf,
+    path::Path,
     str::from_utf8,
 };
 
@@ -25,9 +25,7 @@ mod primitives;
 pub mod store;
 
 pub fn read_slice_until_byte(data: &[u8], byte: u8) -> Option<&[u8]> {
-    let Some(position) = data.iter().position(|v| *v == byte) else {
-        return None;
-    };
+    let position = data.iter().position(|v| *v == byte)?;
 
     Some(&data[..position])
 }
@@ -106,7 +104,7 @@ pub async fn read_object_into_headers(
 }
 
 pub fn read_object_into_headers_sync(
-    cache: &PathBuf,
+    cache: &Path,
     headers: &mut HashMap<Hash, Header>,
     object_hash: &Hash,
 ) -> anyhow::Result<()> {
@@ -130,7 +128,7 @@ pub fn read_object_into_headers_sync(
             return Err(anyhow::anyhow!("Indexes cannot exist within a tree"));
         }
 
-        headers.insert(current_hash.clone(), header.clone());
+        headers.insert(current_hash.clone(), header);
 
         if header.object_type == ObjectType::Blob {
             continue;
@@ -158,7 +156,7 @@ pub fn pipe(reader: &mut dyn Read, writer: &mut dyn Write) -> anyhow::Result<()>
             break;
         }
 
-        writer.write(&buffer[..read])?;
+        writer.write_all(&buffer[..read])?;
     }
 
     Ok(())

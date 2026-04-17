@@ -335,7 +335,7 @@ pub struct StoreEntryData {
     pub hash: Hash,
 }
 
-impl<'a> ArchiveEntryData for StoreEntryData {
+impl ArchiveEntryData for StoreEntryData {
     fn turn_into_vec(self) -> Vec<u8> {
         let mut object = futures::executor::block_on(self.store.get_object(&self.hash))
             .expect("Object to be available in store");
@@ -359,6 +359,7 @@ impl<T> ArchiveBody<T>
 where
     T: ArchiveEntryData,
 {
+    #[allow(clippy::wrong_self_convention)]
     fn to_data(self, writer: &mut impl Write) -> anyhow::Result<()> {
         writer.write_all(&(self.header.len() as u64).to_be_bytes())?;
         for entry in &self.header {
@@ -418,7 +419,7 @@ where
 
         let mut counter: u64 = 0;
 
-        header_entries.sort_by(|a, b| a.index.cmp(&b.index));
+        header_entries.sort_by_key(|a| a.index);
         assert!(header_entries[0].index == 0);
 
         let mut entries: Vec<RawEntryData> = Vec::with_capacity(header_entries.len());
@@ -430,7 +431,7 @@ where
             reader.read_exact(&mut data[..])?;
 
             let mut hasher = Sha512::new();
-            hasher.write(&data)?;
+            hasher.write_all(&data)?;
             assert!(Hash::from(hasher) == entry.hash);
 
             entries.push(RawEntryData(data.to_vec()));

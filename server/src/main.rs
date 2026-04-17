@@ -92,6 +92,7 @@ struct ServerState {
     store: Store,
 }
 
+#[allow(dead_code)]
 enum ErrorResult {
     HashDoesntMatch,
     LengthDoesntMatch,
@@ -99,6 +100,7 @@ enum ErrorResult {
 }
 
 impl ErrorResult {
+    #[allow(dead_code)]
     fn get_response(&self) -> (StatusCode, String) {
         match self {
             ErrorResult::HashDoesntMatch => (
@@ -239,7 +241,7 @@ async fn get_object(
         .await
         .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))?;
 
-    let Header { object_type, size } = object.header.clone();
+    let Header { object_type, size } = object.header;
 
     let reader_stream = futures::stream::unfold(object, |mut reader| async move {
         let mut buffer = vec![0u8; 8192];
@@ -321,12 +323,12 @@ async fn get_bundle(
         header: HEADER,
         compression: common::archive::CompressionAlgorithm::None,
         hash: index_hash.clone(),
-        index: index,
+        index,
         body: ArchiveBody {
             header: header_entries,
             entries: headers
-                .iter()
-                .map(|(hash, _header)| StoreEntryData {
+                .keys()
+                .map(|hash| StoreEntryData {
                     store: store.clone(),
                     hash: hash.clone(),
                 })
@@ -354,7 +356,7 @@ async fn get_bundle(
         .unwrap(),
     );
 
-    return Ok(response);
+    Ok(response)
 }
 
 #[derive(Parser)]
