@@ -484,11 +484,8 @@ impl Object for Blob {
         let mut reader = BufReader::new(f);
 
         let mut buf: [u8; 1024] = [0; 1024];
-        loop {
-            let Ok(bytes_read) = reader.read(&mut buf) else {
-                break;
-            };
 
+        while let Ok(bytes_read) = reader.read(&mut buf) {
             if bytes_read == 0 {
                 break;
             }
@@ -1004,12 +1001,7 @@ fn unpack_archive(cache: &Path, path: &Path) -> anyhow::Result<()> {
         writer.write_all(&index_data)?;
     }
 
-    for (header, entry) in archive
-        .body
-        .header
-        .into_iter()
-        .zip(archive.body.entries.into_iter())
-    {
+    for (header, entry) in archive.body.header.into_iter().zip(archive.body.entries) {
         let path = header.hash.get_path(cache);
         let _ = create_dir_all(path.parent().unwrap());
 
