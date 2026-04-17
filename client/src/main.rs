@@ -13,10 +13,10 @@ use common::{
 use sha2::{Digest, Sha512};
 use std::{
     collections::HashMap,
-    fs::{create_dir, create_dir_all, read_dir, File},
+    fs::{File, create_dir, create_dir_all, read_dir},
     io::{BufRead, BufReader, BufWriter, Read, Write},
     ops::Deref,
-    path::PathBuf,
+    path::{Path, PathBuf},
     str::from_utf8,
 };
 use ureq::SendBody;
@@ -65,7 +65,7 @@ trait Object {
     fn get_object_type(&self) -> ObjectType;
     fn get_hash(&self) -> Hash;
     fn get_prefix(&self) -> String;
-    fn write_to(&self, path: &PathBuf);
+    fn write_to(&self, path: &Path);
 
     // fn from_file(cache: &PathBuf, file: &PathBuf) -> Self;
 
@@ -167,7 +167,7 @@ impl<'a> CacheObject<'a> {
             hash: self.hash.clone(),
             inner: Index {
                 timestamp: timestamp.into(),
-                tree: tree_object.to_tree(Mode::Tree, &""),
+                tree: tree_object.to_tree(Mode::Tree, ""),
             },
         }
     }
@@ -206,9 +206,9 @@ impl<'a> CacheObject<'a> {
 
             let hash = Hash::from(hash);
 
-            let object_file = hash.get_path(&self.cache);
+            let object_file = hash.get_path(self.cache);
 
-            let cache_object = CacheObject::from_file(&self.cache, &object_file);
+            let cache_object = CacheObject::from_file(self.cache, &object_file);
 
             vec.push(match cache_object.object_type {
                 ObjectType::Blob => TreeObject::Blob(cache_object.to_blob(mode, name)),
@@ -252,7 +252,7 @@ impl<'a> CacheObject<'a> {
 
 impl<'a> Object for CacheObject<'a> {
     fn get_object_type(&self) -> ObjectType {
-        self.object_type.clone()
+        self.object_type
     }
 
     fn get_hash(&self) -> Hash {
@@ -263,7 +263,7 @@ impl<'a> Object for CacheObject<'a> {
         format!("{} {}\0", self.object_type.to_str(), self.size)
     }
 
-    fn write_to(&self, _: &PathBuf) {
+    fn write_to(&self, _: &Path) {
         unimplemented!("Should probably fix this")
     }
 }
@@ -308,7 +308,7 @@ impl Object for Index {
         format!("{} {}\0", INDEX_KEY, self.get_body().len())
     }
 
-    fn write_to(&self, path: &PathBuf) {
+    fn write_to(&self, path: &Path) {
         let mut file = File::create(path).unwrap();
 
         file.write_all(self.get_prefix().as_bytes()).unwrap();
@@ -354,7 +354,7 @@ impl Tree {
         let mut value = Vec::new();
 
         for object in self.contents.iter() {
-            value.extend_from_slice(&mut object.to_tree_bytes());
+            value.extend_from_slice(&object.to_tree_bytes());
         }
 
         value
@@ -363,7 +363,7 @@ impl Tree {
     fn from_dir(path: &PathBuf) -> Self {
         assert!(path.is_dir());
 
-        let mut contents: Vec<TreeObject> = std::fs::read_dir(&path)
+        let mut contents: Vec<TreeObject> = std::fs::read_dir(path)
             .expect("Failed to read directory")
             .map(|entry| {
                 let path = entry.expect("Failed to read directory entry").path();
@@ -416,7 +416,7 @@ impl Object for Tree {
         Hash::from(hasher)
     }
 
-    fn write_to(&self, path: &PathBuf) {
+    fn write_to(&self, path: &Path) {
         let mut file = File::create(path).unwrap();
 
         file.write_all(self.get_prefix().as_bytes()).unwrap();
@@ -448,7 +448,7 @@ struct Blob {
 }
 
 impl Blob {
-    fn from_path(path: &PathBuf) -> Self {
+    fn from_path(path: &Path) -> Self {
         assert!(path.is_file());
 
         Self {
@@ -456,7 +456,7 @@ impl Blob {
             mode: Mode::Normal,
             path: path.file_name().unwrap().to_string_lossy().to_string(),
             size: path.metadata().unwrap().len(),
-            file: path.clone(),
+            file: path.to_path_buf(),
         }
     }
 }
@@ -499,7 +499,7 @@ impl Object for Blob {
         Hash::from(hasher)
     }
 
-    fn write_to(&self, path: &PathBuf) {
+    fn write_to(&self, path: &Path) {
         let mut file = File::create(path).unwrap();
 
         file.write_all(self.get_prefix().as_bytes()).unwrap();
@@ -540,9 +540,9 @@ impl TreeObject {
 fn get_bytes_from_thing<T: WithPath>(object: &T, hash: &Hash) -> Vec<u8> {
     let mut path = Vec::new();
 
-    path.extend_from_slice(&mut object.get_mode().to_string().as_bytes());
+    path.extend_from_slice(object.get_mode().to_string().as_bytes());
     path.push(b' ');
-    path.extend_from_slice(&mut object.get_path_component().as_bytes());
+    path.extend_from_slice(object.get_path_component().as_bytes());
     path.push(0);
     path.extend_from_slice(&hash.hash);
 
@@ -550,7 +550,7 @@ fn get_bytes_from_thing<T: WithPath>(object: &T, hash: &Hash) -> Vec<u8> {
 }
 
 impl<T: Object> Hashed<T> {
-    fn write_if_not_exists(&self, dir: &PathBuf) {
+    fn write_if_not_exists(&self, dir: &Path) {
         let path = self.hash.get_path(dir);
         let dir = path.parent().unwrap();
 
@@ -574,7 +574,7 @@ fn write_tree_to_folder(dir: &PathBuf, tree: &Hashed<Tree>) {
 
     for element in tree.contents.iter() {
         match element {
-            TreeObject::Tree(tree) => write_tree_to_folder(dir, &tree),
+            TreeObject::Tree(tree) => write_tree_to_folder(dir, tree),
             TreeObject::Blob(blob) => blob.write_if_not_exists(dir),
         }
     }
@@ -585,7 +585,7 @@ fn get_total_size(index: &Hashed<Tree>) -> u128 {
 
     for element in &index.contents {
         total += match element {
-            TreeObject::Tree(tree) => get_total_size(&tree),
+            TreeObject::Tree(tree) => get_total_size(tree),
             TreeObject::Blob(blob) => blob.size as u128,
         }
     }
@@ -600,7 +600,7 @@ fn commit_directory(cache: &PathBuf, path: &PathBuf) {
     if cache.exists() {
         assert!(cache.is_dir());
     } else {
-        create_dir(&cache).unwrap();
+        create_dir(cache).unwrap();
     }
 
     let Ok(path) = path.canonicalize() else {
@@ -614,7 +614,7 @@ fn commit_directory(cache: &PathBuf, path: &PathBuf) {
         get_total_size(&index.tree)
     );
 
-    write_index_to_folder(&cache, &index);
+    write_index_to_folder(cache, &index);
 
     println!("{}", index.hash);
 }
@@ -646,11 +646,11 @@ fn restore_directory(cache: &PathBuf, path: &PathBuf, index: Hash, validate: boo
     }
 }
 
-fn validate_tree(tree: &Tree, path: &PathBuf) {
+fn validate_tree(tree: &Tree, path: &Path) {
     for item in tree.contents.iter() {
         if let TreeObject::Tree(tree) = item {
             let tree_path = path.join(&tree.path);
-            validate_tree(&tree, &tree_path);
+            validate_tree(tree, &tree_path);
             continue;
         }
 
@@ -666,14 +666,14 @@ fn validate_tree(tree: &Tree, path: &PathBuf) {
     }
 }
 
-fn write_tree(tree: &Tree, path: &PathBuf) {
+fn write_tree(tree: &Tree, path: &Path) {
     for item in tree.contents.iter() {
         if let TreeObject::Tree(tree) = item {
             let tree_path = path.join(&tree.path);
 
             create_dir(&tree_path).expect("Directory creation to work");
 
-            write_tree(&tree, &tree_path);
+            write_tree(tree, &tree_path);
             continue;
         }
 
@@ -696,12 +696,12 @@ fn write_tree(tree: &Tree, path: &PathBuf) {
             if num == 0 {
                 break;
             }
-            writer.write(&data[..num]).unwrap();
+            writer.write_all(&data[..num]).unwrap();
         }
     }
 }
 
-fn cat_object(cache: &PathBuf, hash: &Hash) {
+fn cat_object(cache: &Path, hash: &Hash) {
     let object_path = hash.get_path(cache);
 
     let file = File::open(&object_path).unwrap();
@@ -715,7 +715,7 @@ fn cat_object(cache: &PathBuf, hash: &Hash) {
         if num == 0 {
             break;
         }
-        stdout.write(&data[..num]).unwrap();
+        stdout.write_all(&data[..num]).unwrap();
     }
     println!();
 }
@@ -764,7 +764,7 @@ fn pull_tree(cache: &PathBuf, url: &String, tree_hash: &Hash) {
 
     // tree already exists locally so we can skip downloading it
     if !tree_path.exists() {
-        let Some(Header { object_type, .. }) = download_object(&tree_hash, &tree_path, url) else {
+        let Some(Header { object_type, .. }) = download_object(tree_hash, &tree_path, url) else {
             eprintln!("Unable to download object with hash {tree_hash}");
             return;
         };
@@ -892,7 +892,7 @@ fn download_object(hash: &Hash, file: &PathBuf, url: &String) -> Option<Header> 
 
     let header = Header::new(object_type, object_size);
 
-    writer.write(header.to_string().as_bytes()).unwrap();
+    writer.write_all(header.to_string().as_bytes()).unwrap();
 
     let mut data: [u8; 1024] = [0; 1024];
     let mut reader = response.body_mut().as_reader();
@@ -901,15 +901,15 @@ fn download_object(hash: &Hash, file: &PathBuf, url: &String) -> Option<Header> 
             break;
         }
 
-        writer.write(&data[..num]).unwrap();
+        writer.write_all(&data[..num]).unwrap();
     }
 
-    return Some(header);
+    Some(header)
 }
 
 fn pack_archive(
-    cache: &PathBuf,
-    path: &PathBuf,
+    cache: &Path,
+    path: &Path,
     index_hash: &Hash,
     compression: CompressionAlgorithm,
 ) -> anyhow::Result<()> {
@@ -928,7 +928,7 @@ fn pack_archive(
         let (header, body) = read_header_and_body(&data).expect("File to be correctly formatted");
         assert!(header.object_type == ObjectType::Index);
 
-        common::object_body::Index::from_data(&body)
+        common::object_body::Index::from_data(body)
     };
 
     let mut headers: HashMap<Hash, Header> = HashMap::new();
@@ -959,9 +959,7 @@ fn pack_archive(
         index,
         body: ArchiveBody {
             header: header_entries,
-            entries: headers
-                .into_iter()
-                .map(|(hash, _header)| FileEntryData(hash.get_path(cache)))
+            entries: headers.into_keys().map(|hash| FileEntryData(hash.get_path(cache)))
                 .collect(),
         },
     };
@@ -974,7 +972,7 @@ fn pack_archive(
     Ok(())
 }
 
-fn unpack_archive(cache: &PathBuf, path: &PathBuf) -> anyhow::Result<()> {
+fn unpack_archive(cache: &Path, path: &Path) -> anyhow::Result<()> {
     assert!(path.exists() && path.is_file());
 
     let file = File::open(path)?;
@@ -990,8 +988,8 @@ fn unpack_archive(cache: &PathBuf, path: &PathBuf) -> anyhow::Result<()> {
     let index_header = Header::new(ObjectType::Index, index_data.len() as u64);
 
     let mut hasher = Sha512::new();
-    hasher.write(&index_header.to_string().as_bytes())?;
-    hasher.write(&index_data)?;
+    hasher.write_all(index_header.to_string().as_bytes())?;
+    hasher.write_all(&index_data)?;
     assert!(Hash::from(hasher) == archive.hash);
 
     let path = archive.hash.get_path(cache);
@@ -1000,8 +998,8 @@ fn unpack_archive(cache: &PathBuf, path: &PathBuf) -> anyhow::Result<()> {
     {
         let index_file = File::create(path)?;
         let mut writer = BufWriter::new(index_file);
-        writer.write(&index_header.to_string().as_bytes())?;
-        writer.write(&index_data)?;
+        writer.write_all(index_header.to_string().as_bytes())?;
+        writer.write_all(&index_data)?;
     }
 
     for (header, entry) in archive
@@ -1016,7 +1014,7 @@ fn unpack_archive(cache: &PathBuf, path: &PathBuf) -> anyhow::Result<()> {
         let file = File::create(path)?;
         let mut writer = BufWriter::new(file);
 
-        writer.write(&entry.turn_into_vec())?;
+        writer.write_all(&entry.turn_into_vec())?;
     }
 
     Ok(())

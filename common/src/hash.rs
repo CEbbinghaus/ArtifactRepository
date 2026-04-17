@@ -5,7 +5,7 @@ use sha2::digest::FixedOutput;
 
 use sha2::Sha512;
 use std::fmt::{self, Debug, Display};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::str::FromStr;
 // use std::hash::Hash;
 
@@ -26,9 +26,7 @@ impl Hash {
         &self.hash_string
     }
 
-    pub fn from_string(value: &String) -> Option<Self> {
-        let value = value.as_str();
-
+    pub fn from_string(value: &str) -> Option<Self> {
         if value.len() != 128 {
             return None;
         }
@@ -45,12 +43,12 @@ impl Hash {
         })
     }
 
-    pub fn get_path(&self, cache_dir: &PathBuf) -> PathBuf {
+    pub fn get_path(&self, cache_dir: &Path) -> PathBuf {
         let (dir, file) = self.get_parts();
         cache_dir.join(dir).join(file)
     }
 
-    pub fn from_path(file: &PathBuf) -> Option<Self> {
+    pub fn from_path(file: &Path) -> Option<Self> {
         let filename = file.file_name()?;
         let directory = file.parent()?.file_name()?;
 
@@ -62,7 +60,7 @@ impl Hash {
             return None;
         }
 
-        Some(Self::try_from(directory.to_str()?.to_owned() + filename.to_str()?).ok()?)
+        Self::try_from(directory.to_str()?.to_owned() + filename.to_str()?).ok()
     }
 }
 
@@ -183,6 +181,20 @@ impl<'de> Deserialize<'de> for Hash {
 
             fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
                 formatter.write_str("Sha512 hex string Hash")
+            }
+
+            fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
+            where
+                E: serde::de::Error,
+            {
+                if value.len() != 128 {
+                    return Err(de::Error::invalid_length(
+                        value.len(),
+                        &"A hex string with 128 characters",
+                    ));
+                }
+
+                value.try_into().map_err(de::Error::custom)
             }
 
             fn visit_string<E>(self, value: String) -> Result<Self::Value, E>
