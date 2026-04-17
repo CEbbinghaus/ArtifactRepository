@@ -115,7 +115,6 @@ impl CompressionLevel {
     fn is_valid_for_algorithm(level: i32, algorithm: CompressionAlgorithm) -> bool {
         match algorithm {
             CompressionAlgorithm::None => true,
-            // how about the negative values?
             CompressionAlgorithm::Zstd => (-22..=22).contains(&level),
             CompressionAlgorithm::Deflate => (0..=9).contains(&level),
             CompressionAlgorithm::LZMA2 => (0..=9).contains(&level),
