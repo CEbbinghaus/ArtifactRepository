@@ -16,12 +16,12 @@ pub use crate::primitives::{Mode, ObjectType};
 use crate::{object_body::Object as ObjectTrait, store::Store};
 
 pub mod archive;
-mod constants;
-mod hash;
-mod header;
-mod object;
+pub mod constants;
+pub mod hash;
+pub mod header;
+pub mod object;
 pub mod object_body;
-mod primitives;
+pub mod primitives;
 pub mod store;
 
 pub fn read_slice_until_byte(data: &[u8], byte: u8) -> Option<&[u8]> {
