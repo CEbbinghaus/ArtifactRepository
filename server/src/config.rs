@@ -164,7 +164,6 @@ impl Provider for Cli {
 
             if self.quiet > 0 || self.verbose > 0 {
                 let final_verbose = (self.verbose as i8).saturating_sub(self.quiet as i8);
-                
 
                 logging_dict.insert(
                     "level".to_string(),
@@ -187,7 +186,10 @@ impl Provider for Cli {
                 );
             }
 
-            dict.insert("logging".to_string(), figment::value::Value::from(logging_dict));
+            dict.insert(
+                "logging".to_string(),
+                figment::value::Value::from(logging_dict),
+            );
         }
 
         Ok(Profile::Default.collect(dict))
@@ -232,9 +234,7 @@ mod tests {
         assert!(
             matches!(&config.store, Some(StoreConfig::Fs { root }) if root == "/tmp/test-store")
         );
-        assert!(
-            matches!(&config.logging.format, Some(OutputFormat::Plain))
-        );
+        assert!(matches!(&config.logging.format, Some(OutputFormat::Plain)));
         assert_eq!(config.logging.level, Some(LogLevel::Trace));
     }
 }

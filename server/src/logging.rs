@@ -2,9 +2,7 @@ use tracing_subscriber::{
     filter::LevelFilter, layer::SubscriberExt, util::SubscriberInitExt, EnvFilter, Layer,
 };
 
-use crate::{
-    config::{LoggingConfig, OutputFormat},
-};
+use crate::config::{LoggingConfig, OutputFormat};
 
 pub fn configure_tracing(logging: &LoggingConfig) {
     let default_level = LevelFilter::from(Some(logging.level.unwrap_or_default().into()));
