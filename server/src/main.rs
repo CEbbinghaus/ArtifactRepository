@@ -18,8 +18,10 @@ use futures::{AsyncReadExt, TryStreamExt};
 use std::{collections::HashMap, fs::create_dir, path::PathBuf};
 use tower_http::{compression::CompressionLayer, trace::TraceLayer};
 
+use crate::config::{Config, StoreConfig};
 use crate::logging::configure_tracing;
 
+mod config;
 mod logging;
 
 // lazy_static! {
@@ -379,25 +381,34 @@ pub struct Cli {
     #[arg(long, action = clap::ArgAction::SetTrue, conflicts_with = "plain")]
     pub json: Option<bool>,
 
-    #[arg(short, long, default_value_t = 1287)]
-    pub port: u16,
+    /// Path to a TOML configuration file. CLI flags take precedence over values in the file.
+    #[arg(short, long)]
+    pub config: Option<PathBuf>,
 
-    pub store: PathBuf,
+    /// Path to the object store directory (filesystem backend). Overrides the
+    /// config file. Required unless --config specifies a `[store]` section.
+    pub store: Option<PathBuf>,
 }
 
 #[tokio::main]
-async fn main() {
+async fn main() -> anyhow::Result<()> {
     let args = Cli::parse();
+    let config = Config::load(args.config.as_deref(), &args)?;
 
-    configure_tracing(&args);
+    configure_tracing(&config.logging);
 
-    let Cli { store, port, .. } = &args;
+    let store_root: PathBuf = match &config.store {
+        Some(StoreConfig::Fs { root }) => PathBuf::from(root),
+        None => anyhow::bail!(
+            "no store configured: pass a store path as a positional arg, set [store] in --config, or set ARXSRV_STORE_BACKEND / ARXSRV_STORE_ROOT"
+        ),
+    };
 
-    if !store.exists() {
-        create_dir(store).expect("Cache directory to exist");
+    if !store_root.exists() {
+        create_dir(&store_root).expect("Cache directory to exist");
     }
 
-    let store = opendal::services::Fs::default().root(store.to_str().expect("valid path"));
+    let store = opendal::services::Fs::default().root(store_root.to_str().expect("valid path"));
 
     // read_cache(&store).await;
 
@@ -420,10 +431,9 @@ async fn main() {
         .layer(DefaultBodyLimit::disable())
         .route("/", get(|| async { "Hello, World!" }));
 
-    let listener = tokio::net::TcpListener::bind(("0.0.0.0", *port))
-        .await
-        .unwrap();
+    let listener = tokio::net::TcpListener::bind(config.server.bind).await?;
 
-    tracing::info!("Listening at http://{}", listener.local_addr().unwrap());
-    axum::serve(listener, app).await.unwrap();
+    tracing::info!("Listening at http://{}", listener.local_addr()?);
+    axum::serve(listener, app).await?;
+    Ok(())
 }

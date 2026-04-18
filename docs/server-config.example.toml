@@ -1,0 +1,28 @@
+# Example configuration for arxsrv.
+#
+# Load with:
+#     arxsrv --config docs/server-config.example.toml
+#
+# CLI flags override values set here. Environment variables handled by the
+# tracing subscriber (RUST_LOG, RUST_LOG_FORMAT) still apply on top of these.
+
+[server]
+# Address to bind to. Default: "0.0.0.0".
+bind = "0.0.0.0"
+# Port to listen on. Default: 1287. Overridden by --port.
+port = 1287
+
+[logging]
+# Default tracing level when neither RUST_LOG nor -v / -q is set.
+# One of: trace, debug, info, warn, error.
+level = "warn"
+
+# Output format to print logs / traces in. Ansi includes colors
+# One of: ansi, plain, json
+format = "json"
+
+# Store backend. Only `fs` is supported today; additional backends will land
+# in later PRs.
+[store]
+backend = "fs"
+root = "./store"

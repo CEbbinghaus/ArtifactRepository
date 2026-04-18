@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
+anyhow = "1"
 axum = { version = "0.8.4", features = ["macros"] }
 clap = { version = "4.5.51", features = ["derive", "env"] }
 common = { path = "../common" }
@@ -12,7 +13,10 @@ futures-core = "0.3.31"
 http-body = "1.0.1"
 lazy_static = "1.5.0"
 opendal = { version = "0.54.1", features = ["services-fs", "services-s3"] }
+figment = { version = "0.10", features = ["toml", "env"] }
+serde = { version = "1", features = ["derive"] }
 sha2 = "0.10.9"
+toml = "0.8"
 tokio = { version = "1.45.1", features = ["full"] }
 tokio-stream = "0.1.17"
 tokio-util = { version = "0.7.15", features = ["codec", "io", "compat"] }
