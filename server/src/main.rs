@@ -1,7 +1,7 @@
 use axum::{
     body::Body,
     debug_handler,
-    extract::{Path as AxumPath, Request, State},
+    extract::{DefaultBodyLimit, Path as AxumPath, Request, State},
     http::{HeaderMap, HeaderValue, Response, StatusCode},
     routing::{get, put},
     Router,
@@ -14,10 +14,13 @@ use common::{
     store::{Store, StoreObject},
     Hash, Header, ObjectType,
 };
-use std::{collections::HashMap, fs::create_dir, path::PathBuf};
-use tower_http::compression::CompressionLayer;
-
 use futures::{AsyncReadExt, TryStreamExt};
+use std::{collections::HashMap, fs::create_dir, path::PathBuf};
+use tower_http::{compression::CompressionLayer, trace::TraceLayer};
+
+use crate::logging::configure_tracing;
+
+mod logging;
 
 // lazy_static! {
 //     static ref INDEXES: RwLock<HashSet<Hash>> = Default::default();
@@ -366,6 +369,16 @@ pub struct Cli {
     #[arg(short, long, action = clap::ArgAction::Count)]
     pub verbose: u8,
 
+    /// Decrease verbosity, and can be used multiple times
+    #[arg(short, long, action = clap::ArgAction::Count)]
+    pub quiet: u8,
+
+    #[arg(long, action = clap::ArgAction::SetTrue, conflicts_with = "json")]
+    pub plain: Option<bool>,
+
+    #[arg(long, action = clap::ArgAction::SetTrue, conflicts_with = "plain")]
+    pub json: Option<bool>,
+
     #[arg(short, long, default_value_t = 1287)]
     pub port: u16,
 
@@ -374,10 +387,14 @@ pub struct Cli {
 
 #[tokio::main]
 async fn main() {
-    let Cli { store, port, .. } = Cli::parse();
+    let args = Cli::parse();
+
+    configure_tracing(&args);
+
+    let Cli { store, port, .. } = &args;
 
     if !store.exists() {
-        create_dir(&store).expect("Cache directory to exist");
+        create_dir(store).expect("Cache directory to exist");
     }
 
     let store = opendal::services::Fs::default().root(store.to_str().expect("valid path"));
@@ -399,12 +416,14 @@ async fn main() {
             store: Store::from_builder(store).expect("S"),
         })
         .layer(comression_layer)
+        .layer(TraceLayer::new_for_http())
+        .layer(DefaultBodyLimit::disable())
         .route("/", get(|| async { "Hello, World!" }));
 
-    let listener = tokio::net::TcpListener::bind(("0.0.0.0", port))
+    let listener = tokio::net::TcpListener::bind(("0.0.0.0", *port))
         .await
         .unwrap();
 
-    println!("Listening at http://{}", listener.local_addr().unwrap());
+    tracing::info!("Listening at http://{}", listener.local_addr().unwrap());
     axum::serve(listener, app).await.unwrap();
 }

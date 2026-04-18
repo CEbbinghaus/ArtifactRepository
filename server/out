@@ -1,0 +1,6 @@
+[2m2026-04-18T02:01:50.660703Z[0m [34mDEBUG[0m [2mopendal::services::fs::backend[0m[2m:[0m backend build started: FsBuilder { config: FsConfig { root: Some("../../../.store"), atomic_write_dir: None } }
+[2m2026-04-18T02:01:50.661400Z[0m [34mDEBUG[0m [2mopendal::services::fs::backend[0m[2m:[0m backend build started: FsBuilder { config: FsConfig { root: Some("../../../.store"), atomic_write_dir: None } }
+[2m2026-04-18T02:01:50.661480Z[0m [34mDEBUG[0m [2mopendal::services::fs::backend[0m[2m:[0m backend use root ../../../.store
+[2m2026-04-18T02:01:50.661495Z[0m [34mDEBUG[0m [2mopendal::services::fs::backend[0m[2m:[0m backend use root ../../../.store
+[2m2026-04-18T02:01:50.662168Z[0m [32m INFO[0m [2marsrv[0m[2m:[0m Listening at http://0.0.0.0:1287
+[2m2026-04-18T02:01:50.662240Z[0m [32m INFO[0m [2marsrv[0m[2m:[0m Listening at http://0.0.0.0:1287

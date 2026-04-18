@@ -5,7 +5,7 @@ edition = "2021"
 
 [dependencies]
 axum = { version = "0.8.4", features = ["macros"] }
-clap = { version = "4.5.51", features = ["derive"] }
+clap = { version = "4.5.51", features = ["derive", "env"] }
 common = { path = "../common" }
 futures = "0.3.31"
 futures-core = "0.3.31"
@@ -16,4 +16,6 @@ sha2 = "0.10.9"
 tokio = { version = "1.45.1", features = ["full"] }
 tokio-stream = "0.1.17"
 tokio-util = { version = "0.7.15", features = ["codec", "io", "compat"] }
-tower-http = { version = "0.6.6", features = ["compression-br", "compression-deflate", "compression-gzip", "compression-zstd"] }
+tower-http = { version = "0.6.6", features = ["compression-br", "compression-deflate", "compression-gzip", "compression-zstd", "trace"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
