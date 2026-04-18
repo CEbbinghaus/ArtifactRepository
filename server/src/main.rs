@@ -394,7 +394,7 @@ async fn main() {
     let Cli { store, port, .. } = &args;
 
     if !store.exists() {
-        create_dir(&store).expect("Cache directory to exist");
+        create_dir(store).expect("Cache directory to exist");
     }
 
     let store = opendal::services::Fs::default().root(store.to_str().expect("valid path"));
