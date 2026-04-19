@@ -137,6 +137,20 @@ impl Display for CompressionLevel {
     }
 }
 
+impl FromStr for CompressionLevel {
+    type Err = anyhow::Error;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "default" => Ok(CompressionLevel::Default),
+            "fast" => Ok(CompressionLevel::Fast),
+            "best" => Ok(CompressionLevel::Best),
+            s if let Ok(val) = s.parse::<i8>() => Ok(CompressionLevel::Exact(val as i32)),
+            _ => Err(anyhow!("Invalid compression level: {s}")),
+        }
+    }
+}
+
 pub struct Archive<T>
 where
     T: ArchiveEntryData,
