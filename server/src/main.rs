@@ -8,7 +8,7 @@ use axum::{
 };
 use clap::Parser;
 use common::{
-    archive::{Archive, ArchiveBody, ArchiveHeaderEntry, CompressionLevel, StoreEntryData, HEADER},
+    archive::{Archive, ArchiveBody, ArchiveHeaderEntry, StoreEntryData, HEADER},
     object_body::{Index, Object},
     read_object_into_headers,
     store::{Store, StoreObject},
@@ -95,6 +95,7 @@ mod logging;
 #[derive(Clone)]
 struct ServerState {
     store: Store,
+    config: Config,
 }
 
 #[allow(dead_code)]
@@ -184,7 +185,7 @@ impl From<std::io::Error> for ErrorResult {
 #[debug_handler]
 async fn put_object(
     AxumPath(object_hash): AxumPath<Hash>,
-    State(ServerState { store }): State<ServerState>,
+    State(ServerState { store, .. }): State<ServerState>,
     headers: HeaderMap,
     request: Request<Body>,
 ) -> Result<StatusCode, (StatusCode, String)> {
@@ -233,7 +234,7 @@ async fn put_object(
 #[debug_handler]
 async fn get_object(
     AxumPath(object_hash): AxumPath<Hash>,
-    State(ServerState { store }): State<ServerState>,
+    State(ServerState { store, .. }): State<ServerState>,
 ) -> Result<Response<Body>, (StatusCode, String)> {
     match store.exists(&object_hash).await {
         Ok(true) => Ok(()),
@@ -271,7 +272,7 @@ async fn get_object(
 #[debug_handler]
 async fn get_bundle(
     AxumPath(index_hash): AxumPath<Hash>,
-    State(ServerState { store }): State<ServerState>,
+    State(ServerState { store, config }): State<ServerState>,
 ) -> Result<Response<Body>, (StatusCode, String)> {
     match store.exists(&index_hash).await {
         Ok(true) => Ok(()),
@@ -326,7 +327,7 @@ async fn get_bundle(
 
     let archive = Archive {
         header: HEADER,
-        compression: common::archive::CompressionAlgorithm::None,
+        compression: config.archive.compression_format,
         hash: index_hash.clone(),
         index,
         body: ArchiveBody {
@@ -344,7 +345,7 @@ async fn get_bundle(
     let mut body = Vec::new();
 
     archive
-        .to_data(CompressionLevel::Fast, &mut body)
+        .to_data(config.archive.compression_level, &mut body)
         .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))?;
 
     let mut response = Response::new(Body::from(body));
@@ -397,6 +398,8 @@ async fn main() -> anyhow::Result<()> {
 
     configure_tracing(&config.logging);
 
+    let bind = config.server.bind;
+
     let store_root: PathBuf = match &config.store {
         Some(StoreConfig::Fs { root }) => PathBuf::from(root),
         None => anyhow::bail!(
@@ -425,13 +428,14 @@ async fn main() -> anyhow::Result<()> {
         .route("/bundle/{index_id}", get(get_bundle))
         .with_state(ServerState {
             store: Store::from_builder(store).expect("S"),
+            config,
         })
         .layer(comression_layer)
         .layer(TraceLayer::new_for_http())
         .layer(DefaultBodyLimit::disable())
         .route("/", get(|| async { "Hello, World!" }));
 
-    let listener = tokio::net::TcpListener::bind(config.server.bind).await?;
+    let listener = tokio::net::TcpListener::bind(bind).await?;
 
     tracing::info!("Listening at http://{}", listener.local_addr()?);
     axum::serve(listener, app).await?;
