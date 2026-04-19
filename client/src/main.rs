@@ -10,6 +10,7 @@ use common::{
     read_header_and_body, read_header_from_file, read_header_from_slice,
     read_object_into_headers_sync, Hash, Header, Mode, ObjectType, BLOB_KEY, INDEX_KEY, TREE_KEY,
 };
+use rayon::prelude::*;
 use sha2::{Digest, Sha512};
 use std::{
     collections::HashMap,
@@ -283,12 +284,18 @@ impl Index {
         )
     }
 
-    fn from_path(path: &PathBuf) -> Index {
+    fn from_path(path: &Path, cache: Option<&Path>) -> Hashed<Index> {
         assert!(path.is_dir());
-        Index {
+        let tree = Tree::from_dir(path, cache);
+        let index = Index {
             timestamp: Utc::now(),
-            tree: Hashed::from_object(Tree::from_dir(path)),
+            tree,
+        };
+        let hashed = Hashed::from_object(index);
+        if let Some(cache) = cache {
+            hashed.write_if_not_exists(cache);
         }
+        hashed
     }
 }
 
@@ -360,17 +367,21 @@ impl Tree {
         value
     }
 
-    fn from_dir(path: &PathBuf) -> Self {
+    fn from_dir(path: &Path, cache: Option<&Path>) -> Hashed<Self> {
         assert!(path.is_dir());
 
-        let mut contents: Vec<TreeObject> = std::fs::read_dir(path)
+        let entries: Vec<PathBuf> = std::fs::read_dir(path)
             .expect("Failed to read directory")
-            .map(|entry| {
-                let path = entry.expect("Failed to read directory entry").path();
+            .map(|entry| entry.expect("Failed to read directory entry").path())
+            .collect();
+
+        let mut contents: Vec<TreeObject> = entries
+            .par_iter()
+            .map(|path| {
                 if path.is_dir() {
-                    TreeObject::Tree(Hashed::from_object(Tree::from_dir(&path)))
+                    TreeObject::Tree(Tree::from_dir(path, cache))
                 } else {
-                    TreeObject::Blob(Hashed::from_object(Blob::from_path(&path)))
+                    TreeObject::Blob(Blob::hash_and_write(path, cache))
                 }
             })
             .collect();
@@ -380,14 +391,20 @@ impl Tree {
         // is deterministic across platforms and repeated runs.
         contents.sort_by(|a, b| a.path_component().cmp(b.path_component()));
 
-        Self {
+        let tree = Self {
             mode: Mode::Tree,
             contents,
             path: match path.file_name() {
                 Some(v) => v.to_string_lossy().to_string(),
                 None => panic!("{path:?} did not have a filename"),
             },
+        };
+
+        let hashed = Hashed::from_object(tree);
+        if let Some(cache) = cache {
+            hashed.write_if_not_exists(cache);
         }
+        hashed
     }
 }
 
@@ -457,6 +474,55 @@ impl Blob {
             path: path.file_name().unwrap().to_string_lossy().to_string(),
             size: path.metadata().unwrap().len(),
             file: path.to_path_buf(),
+        }
+    }
+
+    /// Hash the file and write the blob object to `cache` in a single I/O pass.
+    /// The file content is buffered in memory while being hashed, then written
+    /// to the content-addressed path. May need to reconsider this approach if it turns out
+    /// People try and archive a 10Gb file on 2Gb of RAM
+    fn hash_and_write(src: &Path, cache: Option<&Path>) -> Hashed<Self> {
+        assert!(src.is_file());
+
+        let size = src.metadata().unwrap().len();
+        let prefix = format!("{} {}\0", BLOB_KEY, size);
+
+        let mut hasher = Sha512::new();
+        hasher.write_all(prefix.as_bytes()).unwrap();
+
+        let f = File::open(src).unwrap();
+        let mut reader = BufReader::new(f);
+        let mut content = Vec::with_capacity(size as usize);
+        let mut buf: [u8; 8192] = [0; 8192];
+        loop {
+            let n = reader.read(&mut buf).unwrap();
+            if n == 0 {
+                break;
+            }
+            hasher.write_all(&buf[..n]).unwrap();
+            content.extend_from_slice(&buf[..n]);
+        }
+
+        let hash = Hash::from(hasher);
+
+        if let Some(cache) = cache {
+            let dest = hash.get_path(cache);
+            if !dest.exists() {
+                create_dir_all(dest.parent().unwrap()).unwrap();
+                let mut out = File::create(&dest).unwrap();
+                out.write_all(prefix.as_bytes()).unwrap();
+                out.write_all(&content).unwrap();
+            }
+        }
+
+        Hashed {
+            hash,
+            inner: Self {
+                mode: Mode::Normal,
+                path: src.file_name().unwrap().to_string_lossy().to_string(),
+                file: src.to_path_buf(),
+                size,
+            },
         }
     }
 }
@@ -560,23 +626,6 @@ impl<T: Object> Hashed<T> {
     }
 }
 
-fn write_index_to_folder(dir: &PathBuf, index: &Hashed<Index>) {
-    index.write_if_not_exists(dir);
-
-    write_tree_to_folder(dir, &index.tree);
-}
-
-fn write_tree_to_folder(dir: &PathBuf, tree: &Hashed<Tree>) {
-    tree.write_if_not_exists(dir);
-
-    for element in tree.contents.iter() {
-        match element {
-            TreeObject::Tree(tree) => write_tree_to_folder(dir, tree),
-            TreeObject::Blob(blob) => blob.write_if_not_exists(dir),
-        }
-    }
-}
-
 fn get_total_size(index: &Hashed<Tree>) -> u128 {
     let mut total = 0;
 
@@ -597,21 +646,19 @@ fn commit_directory(cache: &PathBuf, path: &PathBuf) {
     if cache.exists() {
         assert!(cache.is_dir());
     } else {
-        create_dir(cache).unwrap();
+        create_dir_all(cache).unwrap();
     }
 
     let Ok(path) = path.canonicalize() else {
         panic!("unable to canonicalize {path:?}");
     };
 
-    let index = Hashed::from_object(Index::from_path(&path));
+    let index = Index::from_path(&path, Some(cache));
 
     println!(
         "Finished generating Index for {} bytes of data",
         get_total_size(&index.tree)
     );
-
-    write_index_to_folder(cache, &index);
 
     println!("{}", index.hash);
 }
@@ -1099,7 +1146,7 @@ fn archive_directory(
     // start timer
     let start = std::time::Instant::now();
 
-    let hashed_index = Hashed::from_object(Index::from_path(&directory));
+    let hashed_index = Index::from_path(&directory, None);
 
     println!(
         "Finished generating Index for {} bytes of data in {} seconds",
@@ -1159,11 +1206,16 @@ fn archive_directory(
 #[derive(Parser)]
 #[command(version, about, long_about = None)]
 struct Cli {
-    #[arg(short, long, value_name = "Cache", default_value = "~/.cache/arx")]
-    cache: PathBuf,
+    #[arg(short, long, value_name = "Store", default_value = "~/.cache/arx")]
+    store: PathBuf,
 
+    //TODO: Implement tracing/logging in client
+    /// Verbose mode (-v, -vv, etc). Can be used to increase logging verbosity.
     #[arg(short, long, action = clap::ArgAction::Count)]
-    debug: u8,
+    verbose: u8,
+    /// Quiet mode (-q, -qq, etc). Can be used to decrease logging verbosity.
+    #[arg(short, long, action = clap::ArgAction::Count)]
+    quiet: u8,
 
     #[command(subcommand)]
     command: Commands,
@@ -1172,7 +1224,6 @@ struct Cli {
 #[derive(Subcommand)]
 enum Commands {
     Commit {
-        #[arg(short, long)]
         directory: PathBuf,
     },
 
@@ -1221,7 +1272,6 @@ enum Commands {
     },
 
     Unpack {
-        #[arg(long)]
         file: PathBuf,
     },
 
@@ -1241,25 +1291,29 @@ enum Commands {
 }
 
 fn main() {
-    let cli = Cli::parse();
+    let mut cli = Cli::parse();
+
+    cli.store = shellexpand::tilde(cli.store.to_str().unwrap())
+        .into_owned()
+        .into();
 
     match cli.command {
-        Commands::Commit { directory } => commit_directory(&cli.cache, &directory),
+        Commands::Commit { directory } => commit_directory(&cli.store, &directory),
         Commands::Restore {
             directory,
             index,
             validate,
-        } => restore_directory(&cli.cache, &directory, index, validate),
-        Commands::Cat { hash } => cat_object(&cli.cache, &hash),
-        Commands::Push { url, index } => push_cache(&cli.cache, &url, index),
-        Commands::Pull { url, index } => pull_cache(&cli.cache, &url, index),
+        } => restore_directory(&cli.store, &directory, index, validate),
+        Commands::Cat { hash } => cat_object(&cli.store, &hash),
+        Commands::Push { url, index } => push_cache(&cli.store, &url, index),
+        Commands::Pull { url, index } => pull_cache(&cli.store, &url, index),
         Commands::Pack {
             index,
             file,
             algorithm,
             level,
-        } => pack_archive(&cli.cache, &file, &index, algorithm, level).expect("Packing to work"),
-        Commands::Unpack { file } => unpack_archive(&cli.cache, &file).expect("Packing to work"),
+        } => pack_archive(&cli.store, &file, &index, algorithm, level).expect("Packing to work"),
+        Commands::Unpack { file } => unpack_archive(&cli.store, &file).expect("Packing to work"),
         Commands::Archive {
             directory,
             output,
@@ -1287,7 +1341,7 @@ mod tests {
         // Created in deliberately non-alphabetical order.
         let dir = make_dir_with_files(&["zebra.txt", "alpha.txt", "middle.txt"]);
 
-        let tree = Tree::from_dir(&dir.path().to_path_buf());
+        let tree = Tree::from_dir(dir.path(), None);
 
         let names: Vec<&str> = tree.contents.iter().map(|o| o.path_component()).collect();
         assert_eq!(names, vec!["alpha.txt", "middle.txt", "zebra.txt"]);
@@ -1298,8 +1352,8 @@ mod tests {
         let dir = make_dir_with_files(&["c.txt", "a.txt", "b.txt"]);
 
         let path = dir.path().to_path_buf();
-        let first = Hashed::from_object(Tree::from_dir(&path)).hash;
-        let second = Hashed::from_object(Tree::from_dir(&path)).hash;
+        let first = Tree::from_dir(&path, None).hash;
+        let second = Tree::from_dir(&path, None).hash;
 
         assert_eq!(first, second, "tree hash must be stable across runs");
     }

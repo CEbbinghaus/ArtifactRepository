@@ -12,6 +12,8 @@ sha2 = "0.10.9"
 ureq = "3.0.12"
 anyhow = "1.0.100"
 lzma-rust2 = "0.15.1"
+rayon = "1"
+shellexpand = "3.1.2"
 
 [dev-dependencies]
 tempfile = "3"
