@@ -306,6 +306,12 @@ pub trait ArchiveEntryData {
 
 pub struct RawEntryData(Vec<u8>);
 
+impl RawEntryData {
+    pub fn new(data: Vec<u8>) -> Self {
+        RawEntryData(data)
+    }
+}
+
 impl ArchiveEntryData for RawEntryData {
     fn turn_into_vec(self) -> Vec<u8> {
         self.0
@@ -343,6 +349,28 @@ impl ArchiveEntryData for FileEntryData {
         let file = File::open(self.0).expect("File to be avaliable for read");
         let mut reader = BufReader::new(file);
         let mut data = Vec::new();
+        pipe(&mut reader, &mut data).expect("reading to work");
+        data
+    }
+}
+
+/// An archive entry for a blob whose raw bytes live at `source_path` on disk —
+/// typically a file in the user's source tree, not a content-addressed object
+/// in the store. Reads the source file lazily at serialisation time and
+/// prepends the object header so the resulting bytes are identical to what a
+/// pack operation would have pulled from the store.
+pub struct SourceFileEntryData {
+    pub source_path: PathBuf,
+    pub header: crate::Header,
+}
+
+impl ArchiveEntryData for SourceFileEntryData {
+    fn turn_into_vec(self) -> Vec<u8> {
+        let file = File::open(&self.source_path).expect("source file to be readable");
+        let mut reader = BufReader::new(file);
+        let prefix = self.header.to_string();
+        let mut data = Vec::with_capacity(prefix.len() + self.header.size as usize);
+        data.extend_from_slice(prefix.as_bytes());
         pipe(&mut reader, &mut data).expect("reading to work");
         data
     }
