@@ -909,6 +909,7 @@ fn pack_archive(
     path: &Path,
     index_hash: &Hash,
     compression: CompressionAlgorithm,
+    compression_level: CompressionLevel,
 ) -> anyhow::Result<()> {
     assert!(!path.exists());
     assert!(path.parent().map(|p| p.exists() && p.is_dir()) == Some(true));
@@ -966,7 +967,7 @@ fn pack_archive(
     let arx_file = File::create(path)?;
     let mut writer = BufWriter::new(arx_file);
 
-    archive.to_data(CompressionLevel::Default, &mut writer)?;
+    archive.to_data(compression_level, &mut writer)?;
 
     Ok(())
 }
@@ -1071,8 +1072,11 @@ enum Commands {
         #[arg(long)]
         file: PathBuf,
 
-        #[arg(long)]
-        compression: CompressionAlgorithm,
+        #[arg(long, default_value_t, alias = "compression", alias = "alg")]
+        algorithm: CompressionAlgorithm,
+
+        #[arg(long, default_value_t, allow_hyphen_values = true)]
+        level: CompressionLevel,
     },
 
     Unpack {
@@ -1097,8 +1101,9 @@ fn main() {
         Commands::Pack {
             index,
             file,
-            compression,
-        } => pack_archive(&cli.cache, &file, &index, compression).expect("Packing to work"),
+            algorithm,
+            level,
+        } => pack_archive(&cli.cache, &file, &index, algorithm, level).expect("Packing to work"),
         Commands::Unpack { file } => unpack_archive(&cli.cache, &file).expect("Packing to work"),
     }
 }

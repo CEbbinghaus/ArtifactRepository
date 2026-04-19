@@ -10,6 +10,7 @@ use std::{
 use anyhow::anyhow;
 use futures::AsyncReadExt;
 use lzma_rust2::LzmaOptions;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha512};
 
 use crate::{
@@ -22,9 +23,10 @@ use crate::{
 pub const HEADER: [u8; 4] = [b'a', b'r', b'x', b'a'];
 
 #[repr(u16)]
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq, Default)]
 pub enum CompressionAlgorithm {
     None = 0,
+    #[default]
     Zstd = 2,
     Deflate = 4,
     LZMA2 = 8,
@@ -68,11 +70,13 @@ impl TryFrom<u16> for CompressionAlgorithm {
         }
     }
 }
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq, Default)]
 pub enum CompressionLevel {
+    #[default]
     Default,
     Fast,
     Best,
+    #[serde(untagged)]
     Exact(i32),
 }
 
@@ -129,6 +133,20 @@ impl Display for CompressionLevel {
             CompressionLevel::Fast => write!(f, "fast"),
             CompressionLevel::Best => write!(f, "best"),
             CompressionLevel::Exact(i) => write!(f, "exact({i})"),
+        }
+    }
+}
+
+impl FromStr for CompressionLevel {
+    type Err = anyhow::Error;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "default" => Ok(CompressionLevel::Default),
+            "fast" => Ok(CompressionLevel::Fast),
+            "best" => Ok(CompressionLevel::Best),
+            s if let Ok(val) = s.parse::<i8>() => Ok(CompressionLevel::Exact(val as i32)),
+            _ => Err(anyhow!("Invalid compression level: {s}")),
         }
     }
 }

@@ -1,6 +1,9 @@
 use std::{collections::BTreeMap, net::SocketAddr, path::Path};
 
-use common::constants::SERVER_PORT;
+use common::{
+    archive::{CompressionAlgorithm, CompressionLevel},
+    constants::SERVER_PORT,
+};
 use figment::{
     providers::{Env, Format, Serialized},
     value::{Dict, Map},
@@ -10,19 +13,28 @@ use serde::{Deserialize, Serialize};
 
 use crate::Cli;
 
-#[derive(Debug, Deserialize, Serialize, Default)]
+#[derive(Clone, Debug, Deserialize, Serialize, Default)]
 pub struct Config {
     #[serde(default)]
     pub server: ServerConfig,
     pub store: Option<StoreConfig>,
     #[serde(default)]
     pub logging: LoggingConfig,
+    #[serde(default)]
+    pub archive: ArchiveConfig,
 }
 
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct ServerConfig {
     #[serde(default = "default_bind")]
     pub bind: SocketAddr,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, Default)]
+pub struct ArchiveConfig {
+    #[serde(default)]
+    pub compression_format: CompressionAlgorithm,
+    pub compression_level: CompressionLevel,
 }
 
 impl Default for ServerConfig {
@@ -40,14 +52,14 @@ fn default_bind() -> SocketAddr {
     ))
 }
 
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(tag = "backend")]
 pub enum StoreConfig {
     #[serde(rename = "fs")]
     Fs { root: String },
 }
 
-#[derive(Debug, Deserialize, Serialize, Default)]
+#[derive(Clone, Debug, Deserialize, Serialize, Default)]
 pub struct LoggingConfig {
     pub level: Option<LogLevel>,
     pub format: Option<OutputFormat>,
