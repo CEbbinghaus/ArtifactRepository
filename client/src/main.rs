@@ -4,7 +4,7 @@ use clap::{Parser, Subcommand};
 use common::{
     archive::{
         Archive, ArchiveBody, ArchiveEntryData, ArchiveHeaderEntry, CompressionAlgorithm,
-        CompressionLevel, FileEntryData, RawEntryData, HEADER,
+        CompressionLevel, FileEntryData, RawEntryData, SourceFileEntryData, HEADER,
     },
     object_body::Object as OtherObject,
     read_header_and_body, read_header_from_file, read_header_from_slice,
@@ -1015,10 +1015,151 @@ fn unpack_archive(cache: &Path, path: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Archive body entry: either an already-serialised byte buffer (for tree and
+/// index objects, which are small and built up in memory during the walk) or
+/// a lazy source-file read (for blobs, which can be arbitrarily large).
+enum ArchiveEntry {
+    Raw(RawEntryData, u64),
+    Source(SourceFileEntryData, u64),
+}
+
+impl ArchiveEntry {
+    fn length(&self) -> u64 {
+        match self {
+            ArchiveEntry::Raw(_, len) => *len,
+            ArchiveEntry::Source(_, len) => *len,
+        }
+    }
+}
+
+impl ArchiveEntryData for ArchiveEntry {
+    fn turn_into_vec(self) -> Vec<u8> {
+        match self {
+            ArchiveEntry::Raw(data, _) => data.turn_into_vec(),
+            ArchiveEntry::Source(data, _) => data.turn_into_vec(),
+        }
+    }
+}
+
+fn collect_archive_entries(tree: &Hashed<Tree>, entries: &mut HashMap<Hash, ArchiveEntry>) {
+    if !entries.contains_key(&tree.hash) {
+        let prefix = tree.get_prefix();
+        let body = tree.get_body();
+        let mut bytes = Vec::with_capacity(prefix.len() + body.len());
+        bytes.extend_from_slice(prefix.as_bytes());
+        bytes.extend_from_slice(&body);
+        let length = bytes.len() as u64;
+        entries.insert(
+            tree.hash.clone(),
+            ArchiveEntry::Raw(RawEntryData::new(bytes), length),
+        );
+    }
+
+    for content in &tree.contents {
+        match content {
+            TreeObject::Tree(subtree) => collect_archive_entries(subtree, entries),
+            TreeObject::Blob(blob) => {
+                if entries.contains_key(&blob.hash) {
+                    continue;
+                }
+                let header = Header::new(ObjectType::Blob, blob.size);
+                let length = header.to_string().len() as u64 + blob.size;
+                entries.insert(
+                    blob.hash.clone(),
+                    ArchiveEntry::Source(
+                        SourceFileEntryData {
+                            source_path: blob.file.clone(),
+                            header,
+                        },
+                        length,
+                    ),
+                );
+            }
+        }
+    }
+}
+
+fn archive_directory(
+    directory: &Path,
+    out_file: &Path,
+    algorithm: CompressionAlgorithm,
+    level: CompressionLevel,
+) -> anyhow::Result<()> {
+    assert!(!out_file.exists(), "output file must not already exist");
+    assert!(
+        out_file.parent().map(|p| p.exists() && p.is_dir()) == Some(true),
+        "parent of output file must exist and be a directory"
+    );
+    assert!(directory.is_dir(), "source must be a directory");
+
+    let directory = directory
+        .canonicalize()
+        .unwrap_or_else(|_| panic!("unable to canonicalize {directory:?}"));
+
+    // start timer
+    let start = std::time::Instant::now();
+
+    let hashed_index = Hashed::from_object(Index::from_path(&directory));
+
+    println!(
+        "Finished generating Index for {} bytes of data in {} seconds",
+        get_total_size(&hashed_index.tree),
+        start.elapsed().as_secs_f64()
+    );
+
+    // Collect trees + blobs, deduping by hash. Index lives in the archive
+    // header, not in body entries.
+    let mut entries: HashMap<Hash, ArchiveEntry> = HashMap::new();
+    collect_archive_entries(&hashed_index.tree, &mut entries);
+
+    let mut offset: u64 = 0;
+    let mut header_entries: Vec<ArchiveHeaderEntry> = Vec::with_capacity(entries.len());
+    let mut body_entries: Vec<ArchiveEntry> = Vec::with_capacity(entries.len());
+    for (hash, entry) in entries {
+        let length = entry.length();
+        header_entries.push(ArchiveHeaderEntry {
+            hash: hash.clone(),
+            index: offset,
+            length,
+        });
+        body_entries.push(entry);
+        offset += length;
+    }
+
+    let archive_index = common::object_body::Index {
+        tree: hashed_index.tree.hash.clone(),
+        timestamp: hashed_index.timestamp,
+        metadata: HashMap::new(),
+    };
+
+    let archive = Archive {
+        header: HEADER,
+        compression: algorithm,
+        hash: hashed_index.hash.clone(),
+        index: archive_index,
+        body: ArchiveBody {
+            header: header_entries,
+            entries: body_entries,
+        },
+    };
+
+    let out = File::create(out_file)?;
+    let mut writer = BufWriter::new(out);
+    archive.to_data(level, &mut writer)?;
+
+    println!(
+        "Finished writing archive in {} seconds",
+        start.elapsed().as_secs_f64()
+    );
+
+    println!("{}", hashed_index.hash);
+    Ok(())
+}
+
 #[derive(Parser)]
 #[command(version, about, long_about = None)]
 struct Cli {
-    #[arg(short, long, value_name = "Cache")]
+    #[arg(short, long, value_name = "Cache", default_value = "~/.cache/arx")]
     cache: PathBuf,
 
     #[arg(short, long, action = clap::ArgAction::Count)]
@@ -1083,6 +1224,20 @@ enum Commands {
         #[arg(long)]
         file: PathBuf,
     },
+
+    /// Build an archive directly from a source directory, bypassing the local store.
+    Archive {
+        directory: PathBuf,
+
+        #[arg(short, long, default_value = "archive.arx")]
+        output: PathBuf,
+
+        #[arg(long, default_value_t, alias = "compression", alias = "alg")]
+        algorithm: CompressionAlgorithm,
+
+        #[arg(long, default_value_t, allow_hyphen_values = true)]
+        level: CompressionLevel,
+    },
 }
 
 fn main() {
@@ -1105,6 +1260,12 @@ fn main() {
             level,
         } => pack_archive(&cli.cache, &file, &index, algorithm, level).expect("Packing to work"),
         Commands::Unpack { file } => unpack_archive(&cli.cache, &file).expect("Packing to work"),
+        Commands::Archive {
+            directory,
+            output,
+            algorithm,
+            level,
+        } => archive_directory(&directory, &output, algorithm, level).expect("Archiving to work"),
     }
 }
 
@@ -1141,5 +1302,80 @@ mod tests {
         let second = Hashed::from_object(Tree::from_dir(&path)).hash;
 
         assert_eq!(first, second, "tree hash must be stable across runs");
+    }
+
+    #[test]
+    fn archive_produces_parseable_output_with_expected_shape() {
+        let src = make_dir_with_files(&["alpha.txt", "beta.txt", "gamma.txt"]);
+        let out_dir = TempDir::new().unwrap();
+        let out = out_dir.path().join("out.arx");
+
+        archive_directory(
+            src.path(),
+            &out,
+            CompressionAlgorithm::None,
+            CompressionLevel::Default,
+        )
+        .expect("archive to succeed");
+
+        // Reopen and parse.
+        let f = File::open(&out).unwrap();
+        let mut reader = BufReader::new(f);
+        let archive = Archive::<RawEntryData>::from_data(&mut reader).expect("archive to parse");
+
+        // Archive hash must match the SHA-512 of the index header + body bytes —
+        // the same integrity invariant `unpack_archive` enforces when restoring
+        // into a store. This catches mismatches between archive.hash and
+        // archive.index without needing a separate reference build.
+        let index_data = archive.index.to_data();
+        let index_header = Header::new(ObjectType::Index, index_data.len() as u64);
+        let mut hasher = Sha512::new();
+        hasher
+            .write_all(index_header.to_string().as_bytes())
+            .unwrap();
+        hasher.write_all(&index_data).unwrap();
+        assert_eq!(
+            archive.hash,
+            Hash::from(hasher),
+            "archive hash must equal sha512(index header + body)"
+        );
+
+        // Body has 1 tree + 3 blobs = 4 entries (index is in the archive header, not body).
+        assert_eq!(
+            archive.body.entries.len(),
+            4,
+            "expected 1 tree + 3 blob entries"
+        );
+        assert_eq!(archive.body.header.len(), 4);
+    }
+
+    #[test]
+    fn archive_dedups_identical_file_contents() {
+        // Two files with the same content → one blob entry in the archive.
+        let src = TempDir::new().unwrap();
+        std::fs::write(src.path().join("first.txt"), b"shared content").unwrap();
+        std::fs::write(src.path().join("second.txt"), b"shared content").unwrap();
+
+        let out_dir = TempDir::new().unwrap();
+        let out = out_dir.path().join("out.arx");
+
+        archive_directory(
+            src.path(),
+            &out,
+            CompressionAlgorithm::None,
+            CompressionLevel::Default,
+        )
+        .expect("archive to succeed");
+
+        let f = File::open(&out).unwrap();
+        let mut reader = BufReader::new(f);
+        let archive = Archive::<RawEntryData>::from_data(&mut reader).expect("archive to parse");
+
+        // 1 tree + 1 deduped blob = 2 body entries.
+        assert_eq!(
+            archive.body.entries.len(),
+            2,
+            "duplicate-content files must share a single blob entry"
+        );
     }
 }
