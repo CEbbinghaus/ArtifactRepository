@@ -1072,7 +1072,7 @@ enum Commands {
         #[arg(long)]
         file: PathBuf,
 
-        #[arg(long, default_value_t, alias="compression", alias="alg")]
+        #[arg(long, default_value_t, alias = "compression", alias = "alg")]
         algorithm: CompressionAlgorithm,
 
         #[arg(long, default_value_t, allow_hyphen_values = true)]
