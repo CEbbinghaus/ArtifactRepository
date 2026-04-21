@@ -1,9 +1,9 @@
 use std::{
-    collections::HashMap,
-    fs::File,
-    io::{BufRead, BufReader, Read, Write},
-    path::Path,
-    str::from_utf8,
+	collections::HashMap,
+	fs::File,
+	io::{BufRead, BufReader, Read, Write},
+	path::Path,
+	str::from_utf8,
 };
 
 use futures::AsyncReadExt;
@@ -25,139 +25,139 @@ pub mod primitives;
 pub mod store;
 
 pub fn read_slice_until_byte(data: &[u8], byte: u8) -> Option<&[u8]> {
-    let position = data.iter().position(|v| *v == byte)?;
+	let position = data.iter().position(|v| *v == byte)?;
 
-    Some(&data[..position])
+	Some(&data[..position])
 }
 
 pub fn read_header_and_body(data: &[u8]) -> Option<(Header, &[u8])> {
-    let header = read_slice_until_byte(data, 0)?;
+	let header = read_slice_until_byte(data, 0)?;
 
-    let body_index = header.len() + 1; // one extra for the 0 byte
+	let body_index = header.len() + 1; // one extra for the 0 byte
 
-    let header = read_header_from_slice(header)?;
+	let header = read_header_from_slice(header)?;
 
-    Some((header, &data[body_index..]))
+	Some((header, &data[body_index..]))
 }
 
 pub fn read_header_from_slice(slice: &[u8]) -> Option<Header> {
-    assert!(slice[slice.len() - 1] != 0);
-    let string = from_utf8(slice).ok()?;
+	assert!(slice[slice.len() - 1] != 0);
+	let string = from_utf8(slice).ok()?;
 
-    let (object_type, size) = string.split_once(' ')?;
+	let (object_type, size) = string.split_once(' ')?;
 
-    Some(Header::new(
-        ObjectType::from_str(object_type)?,
-        size.parse().ok()?,
-    ))
+	Some(Header::new(
+		ObjectType::from_str(object_type)?,
+		size.parse().ok()?,
+	))
 }
 
 pub fn read_header_from_file(reader: &mut BufReader<File>) -> Option<Header> {
-    let mut vec = Vec::new();
-    reader.read_until(b'\0', &mut vec).ok()?;
+	let mut vec = Vec::new();
+	reader.read_until(b'\0', &mut vec).ok()?;
 
-    read_header_from_slice(&vec[..vec.len() - 1])
+	read_header_from_slice(&vec[..vec.len() - 1])
 }
 
 pub async fn read_object_into_headers(
-    store: &Store,
-    headers: &mut HashMap<Hash, Header>,
-    object_hash: &Hash,
+	store: &Store,
+	headers: &mut HashMap<Hash, Header>,
+	object_hash: &Hash,
 ) -> anyhow::Result<()> {
-    let mut stack = vec![object_hash.clone()];
+	let mut stack = vec![object_hash.clone()];
 
-    while let Some(current_hash) = stack.pop() {
-        if headers.contains_key(&current_hash) {
-            continue;
-        }
+	while let Some(current_hash) = stack.pop() {
+		if headers.contains_key(&current_hash) {
+			continue;
+		}
 
-        let mut object = store.get_object(&current_hash).await?;
+		let mut object = store.get_object(&current_hash).await?;
 
-        if object.header.object_type == ObjectType::Index {
-            return Err(anyhow::anyhow!(
-                "Indexes cannot exist within a tree. Likely a hash collision 😳"
-            ));
-        }
+		if object.header.object_type == ObjectType::Index {
+			return Err(anyhow::anyhow!(
+				"Indexes cannot exist within a tree. Likely a hash collision 😳"
+			));
+		}
 
-        headers.insert(current_hash.clone(), object.header);
+		headers.insert(current_hash.clone(), object.header);
 
-        if object.header.object_type == ObjectType::Blob {
-            continue;
-        }
+		if object.header.object_type == ObjectType::Blob {
+			continue;
+		}
 
-        let mut data = Vec::new();
-        let bytes_read = object.read_to_end(&mut data).await?;
+		let mut data = Vec::new();
+		let bytes_read = object.read_to_end(&mut data).await?;
 
-        assert!(
-            bytes_read as u64 == object.header.size,
-            "Read size must match header size"
-        );
+		assert!(
+			bytes_read as u64 == object.header.size,
+			"Read size must match header size"
+		);
 
-        let tree = crate::object_body::Tree::from_data(&data);
+		let tree = crate::object_body::Tree::from_data(&data);
 
-        for entry in &tree.contents {
-            stack.push(entry.hash.clone());
-        }
-    }
+		for entry in &tree.contents {
+			stack.push(entry.hash.clone());
+		}
+	}
 
-    Ok(())
+	Ok(())
 }
 
 pub fn read_object_into_headers_sync(
-    cache: &Path,
-    headers: &mut HashMap<Hash, Header>,
-    object_hash: &Hash,
+	cache: &Path,
+	headers: &mut HashMap<Hash, Header>,
+	object_hash: &Hash,
 ) -> anyhow::Result<()> {
-    let mut stack = vec![object_hash.clone()];
+	let mut stack = vec![object_hash.clone()];
 
-    while let Some(current_hash) = stack.pop() {
-        if headers.contains_key(&current_hash) {
-            continue;
-        }
+	while let Some(current_hash) = stack.pop() {
+		if headers.contains_key(&current_hash) {
+			continue;
+		}
 
-        let object_path = current_hash.get_path(cache);
-        let file = File::open(object_path)?;
-        let mut reader = BufReader::new(file);
-        let mut data = Vec::new();
-        let bytes_read = reader.read_until(0, &mut data)?;
+		let object_path = current_hash.get_path(cache);
+		let file = File::open(object_path)?;
+		let mut reader = BufReader::new(file);
+		let mut data = Vec::new();
+		let bytes_read = reader.read_until(0, &mut data)?;
 
-        let header = read_header_from_slice(&data[..bytes_read - 1])
-            .ok_or_else(|| anyhow::anyhow!("Invalid header"))?;
+		let header = read_header_from_slice(&data[..bytes_read - 1])
+			.ok_or_else(|| anyhow::anyhow!("Invalid header"))?;
 
-        if header.object_type == ObjectType::Index {
-            return Err(anyhow::anyhow!("Indexes cannot exist within a tree"));
-        }
+		if header.object_type == ObjectType::Index {
+			return Err(anyhow::anyhow!("Indexes cannot exist within a tree"));
+		}
 
-        headers.insert(current_hash.clone(), header);
+		headers.insert(current_hash.clone(), header);
 
-        if header.object_type == ObjectType::Blob {
-            continue;
-        }
+		if header.object_type == ObjectType::Blob {
+			continue;
+		}
 
-        data.clear();
-        reader.read_to_end(&mut data)?;
+		data.clear();
+		reader.read_to_end(&mut data)?;
 
-        let tree = crate::object_body::Tree::from_data(&data);
+		let tree = crate::object_body::Tree::from_data(&data);
 
-        for entry in &tree.contents {
-            stack.push(entry.hash.clone());
-        }
-    }
+		for entry in &tree.contents {
+			stack.push(entry.hash.clone());
+		}
+	}
 
-    Ok(())
+	Ok(())
 }
 
 pub fn pipe(reader: &mut dyn Read, writer: &mut dyn Write) -> anyhow::Result<()> {
-    let mut buffer: [u8; 1024] = [0; 1024];
-    loop {
-        let read = reader.read(&mut buffer)?;
+	let mut buffer: [u8; 1024] = [0; 1024];
+	loop {
+		let read = reader.read(&mut buffer)?;
 
-        if read == 0 {
-            break;
-        }
+		if read == 0 {
+			break;
+		}
 
-        writer.write_all(&buffer[..read])?;
-    }
+		writer.write_all(&buffer[..read])?;
+	}
 
-    Ok(())
+	Ok(())
 }
