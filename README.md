@@ -1,4 +1,14 @@
-# ArtifactRepository
+<div align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="docs/assets/banner-dark.svg">
+    <source media="(prefers-color-scheme: light)" srcset="docs/assets/banner-light.svg">
+    <img alt="arx icon of cube"
+         src="docs/assets/icon.svg"
+         width="70%">
+    </picture>
+</div>
+
+# arx
 
 This project aims to create a service, commandline, package/archive format allowing for the creation and distribution of "Artifact". An Artifact is any kind of file structure with some metadata attached to it. It could represent anything, as long as it can be defined through a file hirachy.
 
