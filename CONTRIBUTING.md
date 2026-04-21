@@ -12,6 +12,15 @@ Please review and abide by our [Code of Conduct](./CODE_OF_CONDUCT.md) in all di
 
 ## Getting Started
 
+ARX is written in the [Rust](https://rust-lang.org/) Programming language, Familiarity with such is a pre-requisite for writing code. 
+
+Before submitting any changes, please ensure it meets the following requirements:
+
+* **It Builds:** the repository can be built with a single `cargo build` within the root folder
+* **It's Formatted:** all code is formatted according to the default rust formatting guidelines via `cargo fmt`
+* **It's Linted:** `cargo clippy` shows no code issues
+
+Patches can be submitted either directly via Github, or via email to [git@cebbinghaus.com](mailto:git@cebbinghaus.com)
 
 ## Documentation
 
