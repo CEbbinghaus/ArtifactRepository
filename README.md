@@ -26,7 +26,7 @@ The home of the ARX archiving system, It includes the cli, server and documentat
 
 ## Getting Help
 
-// TODO: Create Community channel
+ARX has a community [matrix channel](https://matrix.to/#/#arx:cerver.au) for any questions, feedback or socializing.
 
 ## Contributing
 
