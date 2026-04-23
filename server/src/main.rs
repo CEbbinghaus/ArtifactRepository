@@ -144,7 +144,7 @@ impl From<std::io::Error> for ErrorResult {
 
 // let file = File::create(path).await?;
 // let mut writer = BufWriter::new(file).compat_write();
-// let mut hasher = Sha512::new();
+// let mut hasher = Sha256::new();
 
 //     header.write_to(&mut hasher)?;
 //     header.write_to_async(&mut writer).await?;

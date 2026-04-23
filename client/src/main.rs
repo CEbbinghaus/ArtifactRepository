@@ -1377,10 +1377,7 @@ mod tests {
 		let mut reader = BufReader::new(f);
 		let archive = Archive::<RawEntryData>::from_data(&mut reader).expect("archive to parse");
 
-		// Archive hash must match the SHA-512 of the index header + body bytes —
-		// the same integrity invariant `unpack_archive` enforces when restoring
-		// into a store. This catches mismatches between archive.hash and
-		// archive.index without needing a separate reference build.
+		// Archive hash must match the SHA-256 of the index header + body bytes
 		let index_data = archive.index.to_data();
 		let index_header = Header::new(ObjectType::Index, index_data.len() as u64);
 		let mut hasher = Sha256::new();
