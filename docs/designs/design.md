@@ -1,6 +1,6 @@
 # Design
 
-The ArtifactRepository design is based on a SHA2-512 Merkel Tree which serves as the foundation of the Artifact. Each file within an Artifact is content addressed by its sha512 hash and directories are stored in an identical format to git. In general the object structure closely matches that of git. 
+The ArtifactRepository design is based on a SHA2-256 Merkel Tree which serves as the foundation of the Artifact. Each file within an Artifact is content addressed by its sha256 hash and directories are stored in an identical format to git. In general the object structure closely matches that of git. 
 
 The very top level of an Artifact is called an **Index** (git calls it a commit). This defines the artifact and contains any and all relevant metadata, such as the timestamp of creation. But since it simply contains any and all metadata in a simple key value format similar to HTTP headers, it allows for the same level of flexibility and metadata to be attached to an index.
 Some possibilities could include:
@@ -45,7 +45,7 @@ It is structured as follows:
 | [u8; 4]  | header / magic number               |
 | [u8; 1]  | version                             |
 | [u8; 2]  | compression method                  |
-| [u8; 64] | SHA2 512 index hash                 |
+| [u8; 32] | SHA2 256 index hash                 |
 | [u8; N]  | index data                          |
 | [u8; 1]  | null byte                           |
 | [u8; N]  | data (compressed with above method) |

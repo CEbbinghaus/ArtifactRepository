@@ -1,6 +1,6 @@
 use crate::{Hash, Header};
 use anyhow::{anyhow, Result};
-use sha2::{Digest, Sha512};
+use sha2::{Digest, Sha256};
 use std::io::{BufReader, Read, Write};
 
 pub struct Object {
@@ -10,7 +10,7 @@ pub struct Object {
 
 impl Object {
 	pub fn to_hash(&self) -> Hash {
-		let mut hasher = Sha512::new();
+		let mut hasher = Sha256::new();
 		hasher
 			.write_all(self.header.to_string().as_bytes())
 			.expect("Out of Memory");
