@@ -91,9 +91,7 @@ impl TryFrom<String> for Hash {
 
 	fn try_from(value: String) -> Result<Self, Self::Error> {
 		if value.len() != 64 {
-			return Err(anyhow!(
-				"Invalid length. Hash has to be 64 characters long"
-			));
+			return Err(anyhow!("Invalid length. Hash has to be 64 characters long"));
 		}
 
 		let mut hash = [0u8; 32];
@@ -111,9 +109,7 @@ impl TryFrom<&str> for Hash {
 
 	fn try_from(value: &str) -> Result<Self, Self::Error> {
 		if value.len() != 64 {
-			return Err(anyhow!(
-				"Invalid length. Hash has to be 64 characters long"
-			));
+			return Err(anyhow!("Invalid length. Hash has to be 64 characters long"));
 		}
 
 		let mut hash = [0u8; 32];
