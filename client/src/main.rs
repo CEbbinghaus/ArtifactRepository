@@ -11,7 +11,7 @@ use common::{
 	read_object_into_headers_sync, Hash, Header, Mode, ObjectType, BLOB_KEY, INDEX_KEY, TREE_KEY,
 };
 use rayon::prelude::*;
-use sha2::{Digest, Sha512};
+use sha2::{Digest, Sha256};
 use std::{
 	collections::HashMap,
 	fs::{create_dir, create_dir_all, read_dir, File},
@@ -202,7 +202,7 @@ impl<'a> CacheObject<'a> {
 
 			let mode = Mode::from_str(mode).expect("valid mode");
 
-			let mut hash: [u8; 64] = [0; 64];
+			let mut hash: [u8; 32] = [0; 32];
 			file.read_exact(&mut hash).expect("file to contain hash");
 
 			let hash = Hash::from(hash);
@@ -306,7 +306,7 @@ impl Object for Index {
 
 	fn get_hash(&self) -> Hash {
 		let body = self.get_body();
-		let mut hasher = Sha512::new();
+		let mut hasher = Sha256::new();
 		write!(hasher, "{}{}", self.get_prefix(), body).unwrap();
 		Hash::from(hasher)
 	}
@@ -425,7 +425,7 @@ impl Object for Tree {
 
 	fn get_hash(&self) -> Hash {
 		let body = self.get_body();
-		let mut hasher = Sha512::new();
+		let mut hasher = Sha256::new();
 		write!(hasher, "{}", self.get_prefix()).unwrap();
 		hasher
 			.write_all(&body)
@@ -487,7 +487,7 @@ impl Blob {
 		let size = src.metadata().unwrap().len();
 		let prefix = format!("{} {}\0", BLOB_KEY, size);
 
-		let mut hasher = Sha512::new();
+		let mut hasher = Sha256::new();
 		hasher.write_all(prefix.as_bytes()).unwrap();
 
 		let f = File::open(src).unwrap();
@@ -543,7 +543,7 @@ impl Object for Blob {
 	}
 
 	fn get_hash(&self) -> Hash {
-		let mut hasher = Sha512::new();
+		let mut hasher = Sha256::new();
 		hasher.write_all(self.get_prefix().as_bytes()).unwrap();
 
 		let f = File::open(&self.file).unwrap();
@@ -1034,7 +1034,7 @@ fn unpack_archive(cache: &Path, path: &Path) -> anyhow::Result<()> {
 	let index_data = archive.index.to_data();
 	let index_header = Header::new(ObjectType::Index, index_data.len() as u64);
 
-	let mut hasher = Sha512::new();
+	let mut hasher = Sha256::new();
 	hasher.write_all(index_header.to_string().as_bytes())?;
 	hasher.write_all(&index_data)?;
 	assert!(Hash::from(hasher) == archive.hash);
@@ -1383,7 +1383,7 @@ mod tests {
 		// archive.index without needing a separate reference build.
 		let index_data = archive.index.to_data();
 		let index_header = Header::new(ObjectType::Index, index_data.len() as u64);
-		let mut hasher = Sha512::new();
+		let mut hasher = Sha256::new();
 		hasher
 			.write_all(index_header.to_string().as_bytes())
 			.unwrap();
@@ -1391,7 +1391,7 @@ mod tests {
 		assert_eq!(
 			archive.hash,
 			Hash::from(hasher),
-			"archive hash must equal sha512(index header + body)"
+			"archive hash must equal Sha256(index header + body)"
 		);
 
 		// Body has 1 tree + 3 blobs = 4 entries (index is in the archive header, not body).

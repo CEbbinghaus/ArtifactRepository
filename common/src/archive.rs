@@ -11,7 +11,7 @@ use anyhow::anyhow;
 use futures::AsyncReadExt;
 use lzma_rust2::LzmaOptions;
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha512};
+use sha2::{Digest, Sha256};
 
 use crate::{
 	object_body::{Index, Object},
@@ -229,7 +229,7 @@ where
 			.try_into()
 			.map_err(|_| anyhow!("Invalid Compression"))?;
 
-		let mut hash: [u8; 64] = [0; 64];
+		let mut hash: [u8; 32] = [0; 32];
 		reader.read_exact(&mut hash)?;
 		let hash: Hash = hash.into();
 
@@ -444,7 +444,7 @@ where
 				break;
 			}
 
-			let mut hash: [u8; 64] = [0; 64];
+			let mut hash: [u8; 32] = [0; 32];
 			reader.read_exact(&mut hash)?;
 			let hash: Hash = hash.into();
 
@@ -476,7 +476,7 @@ where
 			let mut data: Vec<u8> = vec![0; amount as usize];
 			reader.read_exact(&mut data[..])?;
 
-			let mut hasher = Sha512::new();
+			let mut hasher = Sha256::new();
 			hasher.write_all(&data)?;
 			assert!(Hash::from(hasher) == entry.hash);
 
@@ -499,7 +499,7 @@ mod tests {
 	use std::collections::HashMap;
 
 	fn empty_archive(compression: CompressionAlgorithm) -> Archive<RawEntryData> {
-		let zero = Hash::from([0u8; 64]);
+		let zero = Hash::from([0u8; 32]);
 		Archive {
 			header: HEADER,
 			compression,
