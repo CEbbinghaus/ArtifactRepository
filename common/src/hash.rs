@@ -26,6 +26,10 @@ impl Hash {
 		&self.hash_string
 	}
 
+	pub fn as_path(&self) -> String {
+		format!("{}/{}", &self.hash_string[..2], &self.hash_string[2..])
+	}
+
 	pub fn from_string(value: &str) -> Option<Self> {
 		if value.len() != 64 {
 			return None;
