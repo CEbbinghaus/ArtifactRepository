@@ -2,7 +2,10 @@ use std::{collections::HashMap, io::Write, str::from_utf8};
 
 use chrono::{DateTime, Utc};
 
-use crate::{Hash, Mode};
+use crate::{
+	primitives::{FileMetadata, Timestamp},
+	Hash, Mode,
+};
 
 pub trait Object {
 	fn from_data(data: &[u8]) -> Self;
@@ -107,6 +110,8 @@ impl Object for Index {
 pub struct TreeEntry {
 	pub mode: Mode,
 	pub path: String,
+	pub timestamp: Timestamp,
+	pub metadata: FileMetadata,
 	pub hash: Hash,
 }
 
@@ -114,6 +119,7 @@ pub struct TreeEntry {
 pub struct Tree {
 	pub contents: Vec<TreeEntry>,
 }
+
 impl Object for Tree {
 	fn from_data(data: &[u8]) -> Self {
 		let mut contents = Vec::new();
@@ -138,11 +144,23 @@ impl Object for Tree {
 				.expect("mode and filename to be seperated by space");
 			let mode = Mode::from_str(mode).expect("valid mode");
 
+			let timestamp: [u8; 8] = data[position..position + 8]
+				.try_into()
+				.expect("Slice with incorrect length");
+
+			let metadata_byte = data[position + 8];
+			let metadata = FileMetadata::from_u8(metadata_byte);
+
+			let position = position + 9;
+
 			let hash =
 				Hash::try_from(&remaining[position..position + 64]).expect("Hash to be valid");
+
 			contents.push(TreeEntry {
 				hash,
 				mode,
+				timestamp: timestamp.into(),
+				metadata,
 				path: name.to_string(),
 			});
 
@@ -160,6 +178,8 @@ impl Object for Tree {
 			data.push(b' ');
 			data.write_all(entry.path.as_bytes())?;
 			data.push(0);
+			data.write_all(&entry.timestamp.as_bytes())?;
+			data.push(entry.metadata.to_u8());
 			data.write_all(&entry.hash.hash)?;
 
 			Ok(())
