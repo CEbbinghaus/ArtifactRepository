@@ -1264,7 +1264,6 @@ enum Commands {
 	},
 
 	Restore {
-		#[arg(short, long)]
 		directory: PathBuf,
 		#[arg(short, long)]
 		index: Hash,
@@ -1273,7 +1272,6 @@ enum Commands {
 	},
 
 	Cat {
-		#[arg(long)]
 		hash: Hash,
 	},
 
