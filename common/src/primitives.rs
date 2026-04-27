@@ -11,13 +11,11 @@ use std::{
 pub enum Mode {
 	Tree = 040000,
 	Normal = 100644,
-	Executable = 100755,
 	SymbolicLink = 120000,
 }
 
 const TREE_MODE: &str = "040000";
 const NORMAL_MODE: &str = "100644";
-const EXECUTABLE_MODE: &str = "100755";
 const SYMBOLIC_LINK_MODE: &str = "120000";
 
 impl Mode {
@@ -26,7 +24,6 @@ impl Mode {
 		match value {
 			TREE_MODE => Some(Mode::Tree),
 			NORMAL_MODE => Some(Mode::Normal),
-			EXECUTABLE_MODE => Some(Mode::Executable),
 			SYMBOLIC_LINK_MODE => Some(Mode::SymbolicLink),
 			_ => None,
 		}
@@ -36,7 +33,6 @@ impl Mode {
 		match self {
 			Self::Tree => TREE_MODE,
 			Self::Normal => NORMAL_MODE,
-			Self::Executable => EXECUTABLE_MODE,
 			Self::SymbolicLink => SYMBOLIC_LINK_MODE,
 		}
 	}
