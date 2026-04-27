@@ -7,6 +7,7 @@ use common::{
 		CompressionLevel, FileEntryData, RawEntryData, SourceFileEntryData, HEADER,
 	},
 	object_body::Object as OtherObject,
+	primitives::{FileMetadata, Timestamp, RWX},
 	read_header_and_body, read_header_from_file, read_header_from_slice,
 	read_object_into_headers_sync, Hash, Header, Mode, ObjectType, BLOB_KEY, INDEX_KEY, TREE_KEY,
 };
@@ -37,23 +38,6 @@ impl<T: Object> Deref for Hashed<T> {
 }
 
 impl<T: Object> Hashed<T> {
-	// fn from_hash(cache: &PathBuf, hash: Hash) -> Self {
-	//     let (dir, file) = hash.get_parts();
-
-	//     let file_path = cache.join(dir).join(file);
-
-	//     assert!(file_path.exists());
-
-	//     let reader = T::read_file_and_verify_type(&file_path);
-
-	//     drop(reader);
-
-	//     Self {
-	//         inner: T::from_file(cache, &file_path),
-	//         hash,
-	//     }
-	// }
-
 	fn from_object(value: T) -> Self {
 		Self {
 			hash: value.get_hash(),
@@ -67,30 +51,6 @@ trait Object {
 	fn get_hash(&self) -> Hash;
 	fn get_prefix(&self) -> String;
 	fn write_to(&self, path: &Path);
-
-	// fn from_file(cache: &PathBuf, file: &PathBuf) -> Self;
-
-	// fn read_file_and_verify_type(path: &PathBuf) -> BufReader<File> {
-	//     let f = File::open(file_path).unwrap();
-	//     let mut reader = BufReader::new(f);
-
-	//     let mut data = Vec::new();
-	//     reader.read_until(0, &mut data);
-
-	//     if data.last() == Some(&0) {
-	//         data.pop();
-	//     }
-
-	//     let name = String::from_utf8(data).unwrap();
-
-	//     let (typ, size) = name.split_once(' ').unwrap();
-
-	//     let object_type = ObjectType::from_str(typ);
-
-	//     assert!(object_type == T::get_object_type());
-
-	//     reader
-	// }
 }
 
 struct CacheObject<'a> {
@@ -202,6 +162,17 @@ impl<'a> CacheObject<'a> {
 
 			let mode = Mode::from_str(mode).expect("valid mode");
 
+			let mut timestamp: [u8; 8] = [0; 8];
+			file.read_exact(&mut timestamp)
+				.expect("file to contain timestamp");
+
+			let timestamp = Timestamp::from(timestamp);
+
+			let mut metadata = [0u8; 1];
+			file.read_exact(&mut metadata)
+				.expect("file to contain metadata");
+			let metadata = FileMetadata::from_u8(metadata[0]);
+
 			let mut hash: [u8; 32] = [0; 32];
 			file.read_exact(&mut hash).expect("file to contain hash");
 
@@ -212,7 +183,9 @@ impl<'a> CacheObject<'a> {
 			let cache_object = CacheObject::from_file(self.cache, &object_file);
 
 			vec.push(match cache_object.object_type {
-				ObjectType::Blob => TreeObject::Blob(cache_object.to_blob(mode, name)),
+				ObjectType::Blob => {
+					TreeObject::Blob(cache_object.to_blob(mode, timestamp, metadata, name))
+				}
 				ObjectType::Tree => TreeObject::Tree(cache_object.to_tree(mode, name)),
 				ObjectType::Index => panic!("Invalid ObjectType in tree"),
 			})
@@ -228,7 +201,13 @@ impl<'a> CacheObject<'a> {
 		}
 	}
 
-	fn to_blob(&self, mode: Mode, path: &str) -> Hashed<Blob> {
+	fn to_blob(
+		&self,
+		mode: Mode,
+		timestamp: Timestamp,
+		metadata: FileMetadata,
+		path: &str,
+	) -> Hashed<Blob> {
 		assert!(self.object_type == ObjectType::Blob);
 
 		let file = File::open(&self.file).unwrap();
@@ -246,6 +225,8 @@ impl<'a> CacheObject<'a> {
 				path: path.to_string(),
 				file: self.file.clone(),
 				size,
+				timestamp,
+				metadata,
 			},
 		}
 	}
@@ -346,6 +327,8 @@ impl Object for Index {
 
 trait WithPath {
 	fn get_path_component(&self) -> &String;
+	fn get_metadata(&self) -> &FileMetadata;
+	fn get_timestamp(&self) -> &Timestamp;
 	fn get_mode(&self) -> &Mode;
 }
 
@@ -408,6 +391,20 @@ impl Tree {
 	}
 }
 
+const ZERO_TIMESTAMP: Timestamp = Timestamp::from_nanos(0);
+const ZERO_METADATA: FileMetadata = FileMetadata {
+	user_permissions: RWX {
+		read: false,
+		write: false,
+		execute: false,
+	},
+	other_permissions: RWX {
+		read: false,
+		write: false,
+		execute: false,
+	},
+	hidden_flag: false,
+};
 impl WithPath for Tree {
 	fn get_path_component(&self) -> &String {
 		&self.path
@@ -415,6 +412,15 @@ impl WithPath for Tree {
 
 	fn get_mode(&self) -> &Mode {
 		&self.mode
+	}
+
+	fn get_metadata(&self) -> &FileMetadata {
+		// Trees don't have metadata but we need to return something so we can encode the hidden flag
+		&ZERO_METADATA
+	}
+
+	fn get_timestamp(&self) -> &Timestamp {
+		&ZERO_TIMESTAMP
 	}
 }
 
@@ -459,6 +465,8 @@ impl Object for Tree {
 #[derive(Debug)]
 struct Blob {
 	mode: Mode,
+	timestamp: Timestamp,
+	metadata: FileMetadata,
 	path: String,
 	file: PathBuf,
 	size: u64,
@@ -474,6 +482,9 @@ impl Blob {
 			path: path.file_name().unwrap().to_string_lossy().to_string(),
 			size: path.metadata().unwrap().len(),
 			file: path.to_path_buf(),
+			timestamp: Timestamp::from_system_time(path.metadata().unwrap().modified().unwrap())
+				.unwrap(),
+			metadata: FileMetadata::from(path.metadata().unwrap()),
 		}
 	}
 
@@ -484,7 +495,10 @@ impl Blob {
 	fn hash_and_write(src: &Path, cache: Option<&Path>) -> Hashed<Self> {
 		assert!(src.is_file());
 
-		let size = src.metadata().unwrap().len();
+		let metadata = src.metadata().unwrap();
+		let size = metadata.len();
+		let timestamp: Timestamp = metadata.modified().unwrap().try_into().unwrap();
+		let metadata = FileMetadata::from(metadata);
 		let prefix = format!("{} {}\0", BLOB_KEY, size);
 
 		let mut hasher = Sha256::new();
@@ -521,6 +535,8 @@ impl Blob {
 				mode: Mode::Normal,
 				path: src.file_name().unwrap().to_string_lossy().to_string(),
 				file: src.to_path_buf(),
+				timestamp,
+				metadata,
 				size,
 			},
 		}
@@ -534,6 +550,14 @@ impl WithPath for Blob {
 
 	fn get_mode(&self) -> &Mode {
 		&self.mode
+	}
+
+	fn get_metadata(&self) -> &FileMetadata {
+		&self.metadata
+	}
+
+	fn get_timestamp(&self) -> &Timestamp {
+		&self.timestamp
 	}
 }
 
@@ -607,6 +631,8 @@ fn get_bytes_from_thing<T: WithPath>(object: &T, hash: &Hash) -> Vec<u8> {
 	path.push(b' ');
 	path.extend_from_slice(object.get_path_component().as_bytes());
 	path.push(0);
+	path.extend_from_slice(&object.get_timestamp().as_bytes());
+	path.push(object.get_metadata().to_u8());
 	path.extend_from_slice(&hash.hash);
 
 	path
@@ -728,20 +754,30 @@ fn write_tree(tree: &Tree, path: &Path) {
 		let blob_path = path.join(&blob.path);
 
 		let file = File::create(blob_path).expect("File to be created");
-		let mut writer = BufWriter::new(file);
+		{
+			let mut writer = BufWriter::new(file.try_clone().unwrap());
 
-		let cache_file = File::open(&blob.file).unwrap();
-		let mut reader = BufReader::new(cache_file);
+			let cache_file = File::open(&blob.file).unwrap();
+			let mut reader = BufReader::new(cache_file);
 
-		let _ = read_header_from_file(&mut reader);
+			let _ = read_header_from_file(&mut reader);
 
-		let mut data: [u8; 1024] = [0; 1024];
-		while let Ok(num) = reader.read(&mut data) {
-			if num == 0 {
-				break;
+			let mut data: [u8; 1024] = [0; 1024];
+			while let Ok(num) = reader.read(&mut data) {
+				if num == 0 {
+					break;
+				}
+				writer.write_all(&data[..num]).unwrap();
 			}
-			writer.write_all(&data[..num]).unwrap();
 		}
+
+		let mut permissions = file.metadata().unwrap().permissions();
+
+		blob.metadata.modify_permissions(&mut permissions);
+
+		file.set_permissions(permissions).unwrap();
+
+		file.set_modified(blob.timestamp.into()).unwrap();
 	}
 }
 
