@@ -327,6 +327,7 @@ async fn get_bundle(
 
 	let archive = Archive {
 		header: HEADER,
+		version: 0,
 		compression: config.archive.compression_format,
 		hash: index_hash.clone(),
 		index,

@@ -999,6 +999,7 @@ fn pack_archive(
 
 	let archive = Archive {
 		header: HEADER,
+		version: 0,
 		compression,
 		hash: index_hash.clone(),
 		index,
@@ -1181,6 +1182,7 @@ fn archive_directory(
 
 	let archive = Archive {
 		header: HEADER,
+		version: 0,
 		compression: algorithm,
 		hash: hashed_index.hash.clone(),
 		index: archive_index,
