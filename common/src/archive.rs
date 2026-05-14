@@ -156,6 +156,7 @@ where
 	T: ArchiveEntryData,
 {
 	pub header: [u8; 4],
+	pub version: u8,
 	pub compression: CompressionAlgorithm,
 	pub hash: Hash,
 	pub index: Index,
@@ -172,6 +173,7 @@ where
 		writer: &mut impl Write,
 	) -> anyhow::Result<()> {
 		writer.write_all(&HEADER)?;
+		writer.write_all(&[self.version])?;
 		writer.write_all(&(self.compression as u16).to_be_bytes())?;
 		writer.write_all(&self.hash.hash)?;
 		writer.write_all(&self.index.to_data())?;
@@ -222,6 +224,10 @@ where
 		reader.read_exact(&mut header)?;
 		assert!(header == HEADER);
 
+		let mut version: [u8; 1] = [0; 1];
+		reader.read_exact(&mut version)?;
+		let version = version[0];
+
 		let mut compression: [u8; 2] = [0; 2];
 		reader.read_exact(&mut compression)?;
 
@@ -258,6 +264,7 @@ where
 
 		Ok(Archive {
 			header: HEADER,
+			version,
 			compression,
 			hash,
 			index,
@@ -502,6 +509,7 @@ mod tests {
 		let zero = Hash::from([0u8; 32]);
 		Archive {
 			header: HEADER,
+			version: 0,
 			compression,
 			hash: zero.clone(),
 			index: Index {
