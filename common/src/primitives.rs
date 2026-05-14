@@ -1,4 +1,4 @@
-use crate::{BLOB_KEY, INDEX_KEY, TREE_KEY};
+use crate::{BLOB_KEY, INDEX_KEY, TREE_KEY, constants::META_KEY};
 use std::{
 	fmt::Display,
 	fs::Permissions,
@@ -8,39 +8,61 @@ use std::{
 
 #[allow(clippy::zero_prefixed_literal)]
 #[derive(Debug)]
+#[repr(u8)]
 pub enum Mode {
-	Tree = 040000,
-	Normal = 100644,
-	SymbolicLink = 120000,
-}
-
-const TREE_MODE: &str = "040000";
-const NORMAL_MODE: &str = "100644";
-const SYMBOLIC_LINK_MODE: &str = "120000";
-
-impl Mode {
-	#[allow(clippy::should_implement_trait)]
-	pub fn from_str(value: &str) -> Option<Self> {
-		match value {
-			TREE_MODE => Some(Mode::Tree),
-			NORMAL_MODE => Some(Mode::Normal),
-			SYMBOLIC_LINK_MODE => Some(Mode::SymbolicLink),
-			_ => None,
-		}
-	}
-
-	pub fn as_str(&self) -> &'static str {
-		match self {
-			Self::Tree => TREE_MODE,
-			Self::Normal => NORMAL_MODE,
-			Self::SymbolicLink => SYMBOLIC_LINK_MODE,
-		}
-	}
+	Invalid = 0,
+	Tree = 1,
+	Normal = 2,
+	SymbolicLink = 3,
 }
 
 impl Display for Mode {
 	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-		write!(f, "{}", self.as_str())
+		write!(f, "{:?}", self)
+	}
+}
+
+#[derive(Debug)]
+pub struct TreeMode {
+	pub mode: Mode,
+	pub has_metadata: bool,
+}
+
+const METADATA_MASK: u8 = 0b1000_0000;
+
+impl TryFrom<u8> for TreeMode {
+	type Error = anyhow::Error;
+
+	fn try_from(mut value: u8) -> Result<Self, Self::Error> {
+		let has_metadata = value & METADATA_MASK != 0;
+		value &= !METADATA_MASK; // Clear the metadata bit
+
+		let mode = match value {
+			0 => Mode::Invalid,
+			1 => Mode::Tree,
+			2 => Mode::Normal,
+			3 => Mode::SymbolicLink,
+			_ => return Err(anyhow::anyhow!("Invalid mode value: {}", value)),
+		};
+
+		Ok(Self { mode, has_metadata })
+	}
+}
+
+impl From<&TreeMode> for u8 {
+	fn from(tree_mode: &TreeMode) -> Self {
+		let mut value = match tree_mode.mode {
+			Mode::Invalid => 0,
+			Mode::Tree => 1,
+			Mode::Normal => 2,
+			Mode::SymbolicLink => 3,
+		};
+
+		if tree_mode.has_metadata {
+			value |= METADATA_MASK;
+		}
+
+		value
 	}
 }
 
@@ -49,6 +71,7 @@ pub enum ObjectType {
 	Blob,
 	Tree,
 	Index,
+	Metadata,
 }
 
 impl ObjectType {
@@ -58,6 +81,7 @@ impl ObjectType {
 			BLOB_KEY => Some(Self::Blob),
 			TREE_KEY => Some(Self::Tree),
 			INDEX_KEY => Some(Self::Index),
+			META_KEY => Some(Self::Metadata), // Treat "meta" as an alias for "index"
 			_ => None,
 		}
 	}
@@ -67,6 +91,7 @@ impl ObjectType {
 			Self::Blob => BLOB_KEY,
 			Self::Index => INDEX_KEY,
 			Self::Tree => TREE_KEY,
+			Self::Metadata => META_KEY,
 		}
 	}
 }

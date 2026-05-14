@@ -3,8 +3,7 @@ use std::{collections::HashMap, io::Write, str::from_utf8};
 use chrono::{DateTime, Utc};
 
 use crate::{
-	primitives::{FileMetadata, Timestamp},
-	Hash, Mode,
+	Hash, Mode, primitives::{FileMetadata, Timestamp, TreeMode}
 };
 
 pub trait Object {
@@ -108,11 +107,10 @@ impl Object for Index {
 
 #[derive(Debug)]
 pub struct TreeEntry {
-	pub mode: Mode,
+	pub mode: TreeMode,
 	pub path: String,
-	pub timestamp: Timestamp,
-	pub metadata: FileMetadata,
 	pub hash: Hash,
+	pub metadata_hash: Option<Hash>,
 }
 
 #[derive(Debug)]
@@ -136,32 +134,29 @@ impl Object for Tree {
 				panic!("Entry must contain null char");
 			};
 
-			let string = from_utf8(&remaining[..position]).expect("Entry must be valid utf8");
+			let name = from_utf8(&remaining[..position]).expect("Entry must be valid utf8");
 			let position = position + 1;
 
-			let (mode, name) = string
-				.split_once(' ')
-				.expect("mode and filename to be seperated by space");
-			let mode = Mode::from_str(mode).expect("valid mode");
-
-			let timestamp: [u8; 8] = data[position..position + 8]
-				.try_into()
-				.expect("Slice with incorrect length");
-
-			let metadata_byte = data[position + 8];
-			let metadata = FileMetadata::from_u8(metadata_byte);
-
-			let position = position + 9;
+			let mode = TreeMode::try_from(data[position]).expect("valid mode");
+			let position = position + 1;
 
 			let hash =
 				Hash::try_from(&remaining[position..position + 64]).expect("Hash to be valid");
 
+			let metadata_hash = if mode.has_metadata {
+				let position = position + 64;
+				Some(
+					Hash::try_from(&remaining[position..position + 64]).expect("Hash to be valid")
+				)
+			} else {
+				None
+			};
+
 			contents.push(TreeEntry {
-				hash,
 				mode,
-				timestamp: timestamp.into(),
-				metadata,
 				path: name.to_string(),
+				hash,
+				metadata_hash,
 			});
 
 			index += position + 64;
@@ -174,13 +169,13 @@ impl Object for Tree {
 		let mut data: Vec<u8> = Vec::new();
 
 		fn write_entry(data: &mut Vec<u8>, entry: &TreeEntry) -> anyhow::Result<()> {
-			data.write_all(entry.mode.as_str().as_bytes())?;
-			data.push(b' ');
 			data.write_all(entry.path.as_bytes())?;
 			data.push(0);
-			data.write_all(&entry.timestamp.as_bytes())?;
-			data.push(entry.metadata.to_u8());
+			data.push(u8::from(&entry.mode));
 			data.write_all(&entry.hash.hash)?;
+			if let Some(metadata_hash) = &entry.metadata_hash {
+				data.write_all(&metadata_hash.hash)?;
+			}
 
 			Ok(())
 		}
@@ -191,4 +186,16 @@ impl Object for Tree {
 
 		data
 	}
+}
+
+
+#[derive(Debug)]
+pub struct Metadata {
+	modification_time: Timestamp,
+	access_time: Option<Timestamp>,
+	creation_time: Option<Timestamp>,
+
+	
+
+
 }
