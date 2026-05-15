@@ -85,7 +85,7 @@ impl CompressionLevel {
 		&self,
 		algorithm: CompressionAlgorithm,
 	) -> Result<i32, anyhow::Error> {
-		// matrix of compression levels for each algorithm. The first dimension is the algorithm, the second dimension is the level (0-3)
+		// matrix of compression levels for each algorithm. The first dimension is the algorithm, the second dimension is the level
 		const LEVELS: [[i32; 3]; 4] = [
 			[0, 0, 0],  // None
 			[3, 6, 15], // Zstd

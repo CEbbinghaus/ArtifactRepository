@@ -106,13 +106,13 @@ impl Store {
 	}
 
 	pub async fn exists(&self, hash: &Hash) -> Result<bool> {
-		Ok(self.operator.exists(hash.as_str()).await?)
+		Ok(self.operator.exists(&hash.as_path()).await?)
 	}
 
 	pub async fn get_object(&self, hash: &Hash) -> Result<StoreObject<FuturesAsyncReader>> {
 		let mut reader = self
 			.operator
-			.reader(hash.as_str())
+			.reader(&hash.as_path())
 			.await?
 			.into_futures_async_read(..)
 			.await?;
@@ -128,7 +128,7 @@ impl Store {
 	{
 		let mut writer = self
 			.operator
-			.writer(hash.as_str())
+			.writer(&hash.as_path())
 			.await?
 			.into_futures_async_write();
 
