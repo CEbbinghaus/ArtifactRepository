@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["client", "common", "server"]
+members = ["client", "common", "server", "benches"]
 
 [profile.release]
 lto = "thin"
