@@ -23,7 +23,10 @@ impl Object for Index {
     fn from_data(data: &[u8]) -> Self {
         let string_data = from_utf8(data).expect("Data to be in valid utf8 format");
 
-        assert!(&string_data[string_data.len() - 2..] == "\n\n", "Index MUST end in a double newline");
+        assert!(
+            &string_data[string_data.len() - 2..] == "\n\n",
+            "Index MUST end in a double newline"
+        );
         let string_data = &string_data[..string_data.len() - 2];
 
         let mut tree_hash: Option<Hash> = None;
@@ -81,7 +84,7 @@ impl Object for Index {
             data.push(b' ');
             data.write(value.as_bytes())?;
             data.push(b'\n');
-            
+
             Ok(())
         }
 
@@ -109,7 +112,7 @@ pub struct Tree {
     pub contents: Vec<TreeEntry>,
 }
 impl Object for Tree {
-    fn  from_data(data: &[u8]) -> Self {
+    fn from_data(data: &[u8]) -> Self {
         let mut contents = Vec::new();
 
         let mut index: usize = 0;
@@ -132,7 +135,8 @@ impl Object for Tree {
                 .expect("mode and filename to be seperated by space");
             let mode = Mode::from_str(mode).expect("valid mode");
 
-            let hash = Hash::try_from(&remaining[position..position + 64]).expect("Hash to be valid");
+            let hash =
+                Hash::try_from(&remaining[position..position + 64]).expect("Hash to be valid");
             contents.push(TreeEntry {
                 hash,
                 mode,

@@ -1,15 +1,21 @@
 use std::{
     fs::File,
-    io::{BufRead, BufReader, Read, Write},
+    io::{BufRead, BufReader, BufWriter, Read, Write},
     num::NonZero,
+    ops::Deref,
     path::PathBuf,
     str::FromStr,
 };
 
 use anyhow::{anyhow, Error};
+use async_compression::futures::*;
+use async_stream::stream;
+use auto_enums::auto_enum;
 use bytes::Bytes;
-use futures::{AsyncRead, AsyncReadExt, Stream, TryStream};
+use futures::{future, AsyncBufRead, AsyncRead, AsyncReadExt, AsyncWrite, Stream, TryStream};
+use opendal::FuturesAsyncReader;
 use sha2::{Digest, Sha512};
+use tokio::pin;
 
 use crate::{
     object_body::{Index, Object},
@@ -24,9 +30,14 @@ pub const HEADER: [u8; 4] = [b'a', b'r', b'x', b'a'];
 #[derive(Clone, Copy)]
 pub enum Compression {
     None = 0,
-    Gzip = 4,
-    Deflate = 8,
-    LZMA2 = 16,
+    Gzip = 1,
+    Deflate = 2,
+    Lzma = 3,
+    Brotli = 4,
+    Bzip2 = 5,
+    Lz4 = 6,
+    Xz = 7,
+    Zlib = 8,
 }
 
 impl FromStr for Compression {
@@ -37,8 +48,13 @@ impl FromStr for Compression {
             "none" => Ok(Compression::None),
             "gzip" => Ok(Compression::Gzip),
             "deflate" => Ok(Compression::Deflate),
-            "lzma2" => Ok(Compression::LZMA2),
-            _ => Err(anyhow!("Invalid Compression Type")),
+            "lzma" => Ok(Compression::Lzma),
+            "brotli" => Ok(Compression::Brotli),
+            "bzip2" => Ok(Compression::Bzip2),
+            "lz4" => Ok(Compression::Lz4),
+            "xz" => Ok(Compression::Xz),
+            "zlib" => Ok(Compression::Zlib),
+            unknown => Err(anyhow!("Unknown compression type {unknown}")),
         }
     }
 }
@@ -51,15 +67,56 @@ impl TryFrom<u16> for Compression {
             x if x == Compression::None as u16 => Ok(Compression::None),
             x if x == Compression::Gzip as u16 => Ok(Compression::Gzip),
             x if x == Compression::Deflate as u16 => Ok(Compression::Deflate),
-            x if x == Compression::LZMA2 as u16 => Ok(Compression::LZMA2),
+            x if x == Compression::Lzma as u16 => Ok(Compression::Lzma),
+            x if x == Compression::Brotli as u16 => Ok(Compression::Brotli),
+            x if x == Compression::Bzip2 as u16 => Ok(Compression::Bzip2),
+            x if x == Compression::Lz4 as u16 => Ok(Compression::Lz4),
+            x if x == Compression::Xz as u16 => Ok(Compression::Xz),
+            x if x == Compression::Zlib as u16 => Ok(Compression::Zlib),
             _ => Err(()),
+        }
+    }
+}
+
+impl Compression {
+    fn get_writer_for_compression<'a>(
+        &self,
+        writer: &'a mut (impl AsyncWrite + Unpin),
+    ) -> Box<dyn AsyncWrite + 'a> {
+        match self {
+            Compression::Gzip => Box::new(write::GzipEncoder::new(writer)),
+            Compression::Deflate => Box::new(write::DeflateEncoder::new(writer)),
+            Compression::Lzma => Box::new(write::LzmaEncoder::new(writer)),
+            Compression::Brotli => Box::new(write::BrotliEncoder::new(writer)),
+            Compression::Bzip2 => Box::new(write::BzEncoder::new(writer)),
+            Compression::Lz4 => Box::new(write::Lz4Encoder::new(writer)),
+            Compression::Xz => Box::new(write::XzEncoder::new(writer)),
+            Compression::Zlib => Box::new(write::ZlibEncoder::new(writer)),
+            Compression::None => unimplemented!(),
+        }
+    }
+
+    fn get_reader_for_compression<'a>(
+        &self,
+        reader: &'a mut (impl AsyncBufRead + Unpin),
+    ) -> Box<dyn AsyncRead + 'a> {
+        match self {
+            Compression::Gzip => Box::new(bufread::GzipEncoder::new(reader)),
+            Compression::Deflate => Box::new(bufread::DeflateEncoder::new(reader)),
+            Compression::Lzma => Box::new(bufread::LzmaEncoder::new(reader)),
+            Compression::Brotli => Box::new(bufread::BrotliEncoder::new(reader)),
+            Compression::Bzip2 => Box::new(bufread::BzEncoder::new(reader)),
+            Compression::Lz4 => Box::new(bufread::Lz4Encoder::new(reader)),
+            Compression::Xz => Box::new(bufread::XzEncoder::new(reader)),
+            Compression::Zlib => Box::new(bufread::ZlibEncoder::new(reader)),
+            Compression::None => unimplemented!(),
         }
     }
 }
 
 pub struct Archive<T>
 where
-    T: ArchiveEntryData,
+    T: ArchiveEntryData + Unpin,
 {
     pub header: [u8; 4],
     pub compression: Compression,
@@ -72,6 +129,16 @@ impl<T> Archive<T>
 where
     T: ArchiveEntryData,
 {
+    fn get_header_bytes(&self) -> anyhow::Result<Bytes> {
+        let mut buffer = Vec::new();
+        buffer.write_all(&HEADER)?;
+        buffer.write_all(&(self.compression as u16).to_be_bytes())?;
+        buffer.write_all(&self.hash.hash)?;
+        buffer.write_all(&self.index.to_data())?;
+        buffer.write_all(&[0])?;
+        Ok(Bytes::from(buffer))
+    }
+
     pub fn to_data<'a>(self, writer: &'a mut impl Write) -> anyhow::Result<()> {
         writer.write_all(&HEADER)?;
         writer.write_all(&(self.compression as u16).to_be_bytes())?;
@@ -93,7 +160,7 @@ where
                 self.body.to_data(&mut gz_encoder)?;
                 gz_encoder.finish()?.flush()?;
             }
-            Compression::LZMA2 => self.body.to_data(
+            Compression::Lzma => self.body.to_data(
                 &mut lzma_rust2::Lzma2WriterMt::new(
                     writer,
                     lzma_rust2::Lzma2Options {
@@ -104,9 +171,23 @@ where
                 )?
                 .auto_finish(),
             )?,
+            _ => unimplemented!(),
         }
 
         Ok(())
+    }
+
+    pub fn into_stream<'a>(self) -> impl Stream<Item = Result<Bytes, Error>> {
+        stream! {
+            yield self.get_header_bytes();
+
+            let mut body = Box::pin(&mut self.body);
+            let body = self.compression.get_reader_for_compression(&mut body);
+			
+
+
+
+        }
     }
 
     pub fn from_data<'a>(reader: &'a mut impl Read) -> anyhow::Result<Archive<RawEntryData>> {
@@ -140,7 +221,7 @@ where
             Compression::Deflate => ArchiveBody::<RawEntryData>::from_data(
                 &mut flate2::read::DeflateDecoder::new(&mut reader),
             )?,
-            Compression::LZMA2 => ArchiveBody::<RawEntryData>::from_data({
+            Compression::Lzma => ArchiveBody::<RawEntryData>::from_data({
                 &mut lzma_rust2::Lzma2ReaderMt::new(
                     &mut reader,
                     lzma_rust2::LzmaOptions::DICT_SIZE_DEFAULT,
@@ -148,6 +229,7 @@ where
                     std::thread::available_parallelism().unwrap().get() as u32,
                 )
             })?,
+            _ => unimplemented!(),
         };
 
         Ok(Archive {
@@ -184,7 +266,7 @@ where
         self: std::pin::Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Option<Self::Item>> {
-
+        use std::task::Poll::*;
     }
 }
 
@@ -196,6 +278,10 @@ pub struct ArchiveHeaderEntry {
 
 pub trait ArchiveEntryData {
     fn turn_into_vec(self) -> Vec<u8>;
+    async fn turn_into_async_reader(&mut self) -> anyhow::Result<impl AsyncBufRead + Unpin>
+    {
+        Err::<FuturesAsyncReader, _>(anyhow!("unimplemented"))
+    }
 }
 
 pub struct RawEntryData(Vec<u8>);
@@ -247,7 +333,7 @@ pub struct StoreEntryData {
     pub hash: Hash,
 }
 
-impl<'a> ArchiveEntryData for StoreEntryData {
+impl ArchiveEntryData for StoreEntryData {
     fn turn_into_vec(self) -> Vec<u8> {
         let mut object = futures::executor::block_on(self.store.get_object(&self.hash))
             .expect("Object to be available in store");
@@ -257,11 +343,87 @@ impl<'a> ArchiveEntryData for StoreEntryData {
 
         data
     }
+
+    async fn turn_into_async_reader(&mut self) -> anyhow::Result<impl AsyncBufRead + Unpin>
+    {
+        let object = self.store.get_object(&self.hash).await?;
+
+        Ok(object)
+    }
 }
+
+pub struct FuturesAsyncReaderEntryData {
+	pub async_reader: FuturesAsyncReader,
+}
+
+impl ArchiveEntryData for FuturesAsyncReaderEntryData {
+	fn turn_into_vec(mut self) -> Vec<u8> {
+		let mut data: Vec<u8> = Vec::new();
+		futures::executor::block_on(self.async_reader.read_to_end(&mut data)).expect("Reading to work");
+
+		data
+	}
+
+	async fn turn_into_async_reader(&mut self) -> anyhow::Result<impl AsyncBufRead + Unpin>
+	{
+		Ok(self.async_reader.by_ref())
+	}
+}
+
+// impl AsyncRead for StoreEntryData {
+// 	fn poll_read(
+// 		self: std::pin::Pin<&mut Self>,
+// 		cx: &mut std::task::Context<'_>,
+// 		buf: &mut [u8],
+// 	) -> std::task::Poll<std::io::Result<usize>> {
+		
+// 	}
+// }
+
+// impl AsyncBufRead for StoreEntryData {
+// 	fn poll_fill_buf(mut self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> std::task::Poll<std::io::Result<&[u8]>> {
+// 		if self.reader.is_none() {
+// 			if self.reader_fut.is_none() {
+// 				let store = self.store.clone();
+// 				let hash = self.hash.clone();
+// 				self.reader_fut = Some(Box::pin(async move {
+// 					store.get_object(&hash).await
+// 				}));
+// 			}
+			
+// 			if let Some(mut fut) = self.reader_fut.take() {
+// 				match fut.as_mut().poll(cx) {
+// 					std::task::Poll::Ready(Ok(reader)) => {
+// 						self.reader = Some(reader);
+// 					}
+// 					std::task::Poll::Ready(Err(e)) => {
+// 						return std::task::Poll::Ready(Err(std::io::Error::new(std::io::ErrorKind::Other, e)));
+// 					}
+// 					std::task::Poll::Pending => {
+// 						self.reader_fut = Some(fut);
+// 						return std::task::Poll::Pending;
+// 					}
+// 				}
+// 			}
+// 		}
+		
+// 		if let Some(ref mut reader) = self.reader {
+// 			std::pin::Pin::new(reader).poll_fill_buf(cx)
+// 		} else {
+// 			std::task::Poll::Ready(Err(std::io::Error::new(std::io::ErrorKind::Other, "No reader available")))
+// 		}
+// 	}
+
+// 	fn consume(mut self: std::pin::Pin<&mut Self>, amt: usize) {
+// 		if let Some(ref mut reader) = self.reader {
+// 			std::pin::Pin::new(reader).consume(amt);
+// 		}
+// 	}
+// }
 
 pub struct ArchiveBody<T>
 where
-    T: ArchiveEntryData,
+    T: ArchiveEntryData + Unpin,
 {
     pub header: Vec<ArchiveHeaderEntry>,
     pub entries: Vec<T>,
@@ -355,4 +517,14 @@ where
             entries,
         })
     }
+}
+
+impl<T> AsyncBufRead for ArchiveBody<T> {
+	fn poll_fill_buf(self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> std::task::Poll<std::io::Result<&[u8]>> {
+		todo!()
+	}
+
+	fn consume(self: std::pin::Pin<&mut Self>, amt: usize) {
+		todo!()
+	}
 }

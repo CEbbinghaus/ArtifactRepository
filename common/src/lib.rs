@@ -1,5 +1,9 @@
 use std::{
-    collections::HashMap, fs::File, io::{BufRead, BufReader, Read, Write}, path::PathBuf, str::from_utf8
+    collections::HashMap,
+    fs::File,
+    io::{BufRead, BufReader, Read, Write},
+    path::PathBuf,
+    str::from_utf8,
 };
 
 use futures::AsyncReadExt;
@@ -7,17 +11,17 @@ use futures::AsyncReadExt;
 pub use crate::constants::{BLOB_KEY, INDEX_KEY, TREE_KEY};
 pub use crate::hash::Hash;
 pub use crate::header::Header;
-use crate::{object_body::Object as ObjectTrait, store::Store};
-pub use crate::primitives::{Mode, ObjectType};
 pub use crate::object::Object;
+pub use crate::primitives::{Mode, ObjectType};
+use crate::{object_body::Object as ObjectTrait, store::Store};
 
-mod object;
+pub mod archive;
 mod constants;
 mod hash;
 mod header;
-mod primitives;
+mod object;
 pub mod object_body;
-pub mod archive;
+mod primitives;
 pub mod store;
 
 pub fn read_slice_until_byte<'a>(data: &'a [u8], byte: u8) -> Option<&'a [u8]> {
@@ -44,7 +48,10 @@ pub fn read_header_from_slice(slice: &[u8]) -> Option<Header> {
 
     let (object_type, size) = string.split_once(' ')?;
 
-    Some(Header::new(ObjectType::from_str(object_type)?, size.parse().ok()?))
+    Some(Header::new(
+        ObjectType::from_str(object_type)?,
+        size.parse().ok()?,
+    ))
 }
 
 pub fn read_header_from_file(reader: &mut BufReader<File>) -> Option<Header> {
@@ -69,11 +76,13 @@ pub async fn read_object_into_headers(
         let mut object = store.get_object(&current_hash).await?;
 
         if object.header.object_type == ObjectType::Index {
-            return Err(anyhow::anyhow!("Indexes cannot exist within a tree. Likely a hash collision 😳"));
+            return Err(anyhow::anyhow!(
+                "Indexes cannot exist within a tree. Likely a hash collision 😳"
+            ));
         }
 
         headers.insert(current_hash.clone(), object.header.clone());
-        
+
         if object.header.object_type == ObjectType::Blob {
             continue;
         }
@@ -81,8 +90,11 @@ pub async fn read_object_into_headers(
         let mut data = Vec::new();
         let bytes_read = object.read_to_end(&mut data).await?;
 
-        assert!(bytes_read as u64 == object.header.size, "Read size must match header size");
-    
+        assert!(
+            bytes_read as u64 == object.header.size,
+            "Read size must match header size"
+        );
+
         let tree = crate::object_body::Tree::from_data(&data);
 
         for entry in &tree.contents {
@@ -97,7 +109,7 @@ pub fn pipe<'a, 'b>(reader: &'a mut dyn Read, writer: &'b mut dyn Write) -> anyh
     let mut buffer: [u8; 1024] = [0; 1024];
     loop {
         let read = reader.read(&mut buffer)?;
-        
+
         if read == 0 {
             break;
         }

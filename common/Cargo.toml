@@ -5,6 +5,9 @@ edition = "2021"
 
 [dependencies]
 anyhow = "1.0.100"
+async-compression = { version = "0.4.33", features = ["all-algorithms", "futures-io"] }
+async-stream = "0.3.6"
+auto_enums = { version = "0.8.7", features = ["futures03", "type_analysis"] }
 bytes = "1.10.1"
 chrono = "0.4.41"
 flate2 = { version = "1.1.5", features = ["zlib-rs"] }

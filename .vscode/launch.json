@@ -1,0 +1,26 @@
+{
+	{
+		"name": "(gdb) Launch",
+		"type": "cppdbg",
+		"request": "launch",
+		"program": "${workspaceFolder}/target/debug/client",
+		"args": ["--cache ../testcache", "pull", "--hash 97b3259ed76785bc98280db39c88c8f2a9d838db5f2f5e3316ec57acd6146657ce690a187404de228af718bbd82ea9d5e246d2169512f1f6595b2da7b235c7dc", "--url http://localhost:3000"],
+		"stopAtEntry": false,
+		"cwd": "${fileDirname}",
+		"environment": [],
+		"externalConsole": false,
+		"MIMode": "gdb",
+		"setupCommands": [
+			{
+				"description": "Enable pretty-printing for gdb",
+				"text": "-enable-pretty-printing",
+				"ignoreFailures": true
+			},
+			{
+				"description": "Set Disassembly Flavor to Intel",
+				"text": "-gdb-set disassembly-flavor intel",
+				"ignoreFailures": true
+			}
+		]
+	}
+}

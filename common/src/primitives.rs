@@ -1,6 +1,5 @@
-use std::fmt::Display;
 use crate::{BLOB_KEY, INDEX_KEY, TREE_KEY};
-
+use std::fmt::Display;
 
 #[derive(Debug)]
 pub enum Mode {
@@ -38,11 +37,7 @@ impl Mode {
 
 impl Display for Mode {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "{}",
-            self.as_str()
-        )
+        write!(f, "{}", self.as_str())
     }
 }
 
